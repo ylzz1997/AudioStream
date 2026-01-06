@@ -37,9 +37,9 @@ fn ext_lower(path: &str) -> Option<String> {
 
 #[cfg(not(feature = "ffmpeg"))]
 fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
-    use audiostream::common::file::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
-    use audiostream::common::file::io::{AudioReader, AudioWriter};
-    use audiostream::common::file::wav_file::WavWriterConfig;
+    use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
+    use audiostream::common::io::{AudioReader, AudioWriter};
+    use audiostream::common::io::wav_file::WavWriterConfig;
     use audiostream::common::audio::audio::AudioFrameView;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
@@ -63,9 +63,9 @@ fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
 #[cfg(feature = "ffmpeg")]
 fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
-    use audiostream::common::file::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
-    use audiostream::common::file::io::{AudioReader, AudioWriter};
-    use audiostream::common::file::{Mp3WriterConfig, WavWriterConfig};
+    use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
+    use audiostream::common::io::{AudioReader, AudioWriter};
+    use audiostream::common::io::file::{Mp3WriterConfig, WavWriterConfig};
     use audiostream::common::audio::audio::AudioFrameView;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;

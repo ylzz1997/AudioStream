@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::codec::encoder::encoder_interface::AudioEncoder;
 
 use super::file::{AudioFileError, AudioFileResult};
-use super::io::{AudioReader, AudioWriter};
+use crate::common::io::io::{AudioReader, AudioWriter};
 
 /// ADTS 头解析出来的最小信息。
 #[derive(Clone, Copy, Debug)]

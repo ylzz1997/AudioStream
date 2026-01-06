@@ -8,7 +8,7 @@ use std::path::Path;
 use super::aac_file::{AacAdtsReader, AacAdtsWriter};
 use super::mp3_file::{Mp3Reader, Mp3Writer};
 use super::wav_file::{WavReader, WavWriter};
-use super::io::{AudioReader, AudioWriter};
+use crate::common::io::io::{AudioReader, AudioWriter};
 
 #[derive(Debug)]
 pub enum AudioFileError {

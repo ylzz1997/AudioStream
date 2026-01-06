@@ -1,5 +1,5 @@
 use super::file::{AudioFileError, AudioFileResult};
-use super::io::{AudioReader, AudioWriter};
+use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
 use std::fs::File;

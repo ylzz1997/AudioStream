@@ -1,5 +1,5 @@
 use crate::common::audio::audio::{AudioFrame, AudioFrameView};
-use crate::common::file::file::AudioFileResult;
+use crate::common::io::file::AudioFileResult;
 
 /// 写端抽象：把 PCM 帧写入某种IO（内部可走任意 codec）。
 pub trait AudioWriter {
