@@ -17,6 +17,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --features ffmpeg
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --features ffmpeg 
+    - name: Build Python bindings
+      run: maturin develop -F python -F ffmpeg
