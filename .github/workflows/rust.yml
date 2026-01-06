@@ -19,18 +19,15 @@ jobs:
     - name: Install system dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y clang pkg-config libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libswresample-dev libswscale-dev
-        sudo apt-get install -y python3-dev python3-pip python3-venv
+        sudo apt-get install -y clang pkg-config libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev libswresample-dev libswscale-dev python3-dev python3-pip python3-venv
     - name: Create Python virtual environment
       run: |
         python3 -m venv venv
         source venv/bin/activate
-        pip install maturin numpy
-    - name: Install Python dependencies
-      run: pip install maturin numpy
+        pip3 install maturin numpy
     - name: Build
       run: cargo build --features ffmpeg
     - name: Run tests
       run: cargo test --features ffmpeg 
     - name: Build Python bindings
-      run: maturin develop -F python -F ffmpeg
+      run: maturin build -F python -F ffmpeg
