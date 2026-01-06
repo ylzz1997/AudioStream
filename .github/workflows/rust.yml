@@ -24,7 +24,7 @@ jobs:
       run: |
         python3 -m venv venv
         source venv/bin/activate
-        pip3 install maturin numpy
+        pip install maturin numpy
     - name: Build
       run: cargo build --features ffmpeg
     - name: Run tests
