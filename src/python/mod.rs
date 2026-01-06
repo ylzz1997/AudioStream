@@ -506,6 +506,7 @@ pub struct Encoder {
     fifo: AudioFifo,
     enc: Box<dyn AudioEncoder>,
     out_q: VecDeque<Vec<u8>>,
+    sent_eof: bool,
 }
 
 #[pymethods]
@@ -535,6 +536,7 @@ impl Encoder {
                     fifo,
                     enc,
                     out_q: VecDeque::new(),
+                    sent_eof: false,
                 })
             }
             "mp3" => {
@@ -558,6 +560,7 @@ impl Encoder {
                     fifo,
                     enc,
                     out_q: VecDeque::new(),
+                    sent_eof: false,
                 })
             }
             "aac" => {
@@ -581,6 +584,7 @@ impl Encoder {
                     fifo,
                     enc,
                     out_q: VecDeque::new(),
+                    sent_eof: false,
                 })
             }
             _ => Err(PyValueError::new_err("unsupported codec")),
@@ -623,6 +627,19 @@ impl Encoder {
         if self.out_q.is_empty() {
             push_encoder_from_fifo(self.enc.as_mut(), &mut self.fifo, self.chunk_samples, &mut self.out_q, force)
                 .map_err(map_codec_err)?;
+        }
+
+        if force && self.out_q.is_empty() && self.fifo.available_samples() == 0 && !self.sent_eof {
+            self.enc.send_frame(None).map_err(map_codec_err)?;
+            loop {
+                match self.enc.receive_packet() {
+                    Ok(pkt) => self.out_q.push_back(pkt.data),
+                    Err(CodecError::Again) => break,
+                    Err(CodecError::Eof) => break,
+                    Err(e) => return Err(map_codec_err(e)),
+                }
+            }
+            self.sent_eof = true;
         }
 
         if let Some(data) = self.out_q.pop_front() {
