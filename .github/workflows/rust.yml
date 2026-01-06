@@ -32,4 +32,4 @@ jobs:
     - uses: PyO3/maturin-action@v1
       with:
         command: build
-        args: --release --find-interpreter
+        args: -F python -F ffmpeg
