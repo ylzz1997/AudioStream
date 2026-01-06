@@ -869,7 +869,7 @@ impl Decoder {
 }
 
 #[pymodule]
-fn audiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioFormat>()?;
     m.add_class::<WavEncoderConfigPy>()?;
     m.add_class::<WavDecoderConfigPy>()?;

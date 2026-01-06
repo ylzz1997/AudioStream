@@ -39,7 +39,7 @@ maturin develop -F python -F ffmpeg
 安装后 Python 侧可：
 
 ```python
-import audiostream as ast
+import pyaudiostream as ast
 ```
 
 ---
@@ -50,7 +50,7 @@ import audiostream as ast
 
 ```python
 import numpy as np
-import audiostream as ast
+import pyaudiostream as ast
 
 fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
 cfg = ast.Mp3EncoderConfig(fmt, chunk_samples=1152, bitrate=128_000)
@@ -73,7 +73,7 @@ while True:
 ### Decoder（编码帧 bytes → PCM numpy）
 
 ```python
-import audiostream as ast
+import pyaudiostream as ast
 
 cfg = ast.Mp3DecoderConfig(chunk_samples=1024, packet_time_base_den=48000)
 dec = ast.Decoder("mp3", cfg)
@@ -92,7 +92,7 @@ if pcm is not None:
 这个示例包含三种模式，覆盖完整链路：
 
 - **server**：提供网页 + WebSocket 广播；同时开一个 TCP ingest 端口接收“按帧”推送
-- **sender**：使用 `pyaudiostream/audiostream` 从 PCM（wav 或正弦）编码成 MP3/AAC 帧，按 framing 推给 ingest
+- **sender**：使用 `pyaudiostream` 从 PCM（wav 或正弦）编码成 MP3/AAC 帧，按 framing 推给 ingest
 - **demo**：同一进程里同时跑 server + sender（方便一条命令自测）
 
 ### 安装依赖

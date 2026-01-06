@@ -3,13 +3,13 @@ requires = ["maturin>=1.5"]
 build-backend = "maturin"
 
 [project]
-name = "audiostream"
+name = "pyaudiostream"
 version = "0.0.1"
 requires-python = ">=3.8"
 dependencies = ["numpy>=1.20"]
 
 [tool.maturin]
 features = ["python"]
-module-name = "audiostream"
+module-name = "pyaudiostream"
 
 

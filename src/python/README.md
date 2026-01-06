@@ -12,14 +12,14 @@ maturin develop -F python
 安装后：
 
 ```python
-import audiostream as ast
+import pyaudiostream as ast
 ```
 
 ### Encoder 用法
 
 ```python
 import numpy as np
-import audiostream as ast
+import pyaudiostream as ast
 
 fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
 cfg = ast.WavEncoderConfig(fmt, chunk_samples=1024)
@@ -36,7 +36,7 @@ out2 = enc.get_frame(force=True)  # 可强制 flush 不满 chunk 的残留
 
 ```python
 import numpy as np
-import audiostream as ast
+import pyaudiostream as ast
 
 # WAV/PCM 解码需要 output_format.planar=False（输入 packet 是 interleaved bytes）
 out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=False)

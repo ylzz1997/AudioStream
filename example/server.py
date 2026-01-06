@@ -15,7 +15,7 @@ import numpy as np
 
 
 def _import_ast():
-    import audiostream as ast  # type: ignore
+    import pyaudiostream as ast  # type: ignore
     return ast
 
 
@@ -528,7 +528,7 @@ def parse_args() -> StreamCfg:
     p.add_argument(
         "--seconds",
         type=float,
-        default=10.0,
+        default=0,
         help="推流时长；<=0 表示尽可能读完整个 wav（如果 --wav 指定）",
     )
     p.add_argument("--wav", default="", help="可选：16-bit PCM wav 文件路径（不填则发送正弦波）")
