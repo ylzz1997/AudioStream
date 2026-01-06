@@ -9,7 +9,7 @@ requires-python = ">=3.8"
 dependencies = ["numpy>=1.20"]
 
 [tool.maturin]
-features = ["python"]
+features = ["python", "ffmpeg"]
 module-name = "pyaudiostream"
 
 
