@@ -494,7 +494,7 @@ pub mod ffmpeg_backend {
                     self.ctx,
                     out_ptrs.as_mut_ptr(),
                     out_max as i32,
-                    in_ptrs.as_ptr(),
+                    in_ptrs.as_mut_ptr(),
                     in_nb as i32,
                 );
                 if ret < 0 {
