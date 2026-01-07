@@ -1,4 +1,10 @@
+<p align="center">
+  <img src="logo/logo.png" alt="AudioStream" width="720" />
+</p>
+
 # AudioStream
+
+---
 
 一个面向**音频流式处理**的 Rust 库，并通过 PyO3 暴露给 Python 使用：你可以把 **PCM（numpy）** 按 chunk 推给 `Encoder`，拿到 **编码后的 frame(bytes)**；或把 **编码帧(bytes)** 推给 `Decoder` 按 chunk 取回 **PCM（numpy）**。
 
