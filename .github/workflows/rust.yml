@@ -26,10 +26,10 @@ jobs:
     - name: Create Python virtual environment
       run: pip install maturin numpy
     - name: Build
-      run: cargo build --features ffmpeg
+      run: cargo build --features ffmpeg --release
     - name: Run tests
-      run: cargo test --features ffmpeg 
+      run: cargo test --features ffmpeg --release
     - uses: PyO3/maturin-action@v1
       with:
         command: build
-        args: -F python -F ffmpeg
+        args: -F python -F ffmpeg -r
