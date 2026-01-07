@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     eprintln!("用法：audiostream <in> <out>");
-    eprintln!("支持：.wav  .mp3  .adts/.aac");
+    eprintln!("支持：.wav  .mp3  .adts/.aac  .opus(Ogg Opus) ");
     eprintln!("例如：cargo run --features ffmpeg -- input.wav out.mp3");
     Ok(())
 }
@@ -39,7 +39,7 @@ fn ext_lower(path: &str) -> Option<String> {
 fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
     use audiostream::common::io::{AudioReader, AudioWriter};
-    use audiostream::common::io::wav_file::WavWriterConfig;
+    use audiostream::common::io::file::WavWriterConfig;
     use audiostream::common::audio::audio::AudioFrameView;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
@@ -63,24 +63,77 @@ fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
 #[cfg(feature = "ffmpeg")]
 fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
-    use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
+    use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
+    use audiostream::codec::processor::resample_processor::ResampleProcessor;
+    use audiostream::codec::node::dynamic_node_interface::{DynPipeline, ProcessorNode};
+    use audiostream::codec::node::node_interface::NodeBuffer;
+    use audiostream::common::io::file::{
+        AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
+    };
     use audiostream::common::io::{AudioReader, AudioWriter};
     use audiostream::common::io::file::{Mp3WriterConfig, WavWriterConfig};
     use audiostream::common::audio::audio::AudioFrameView;
+    use audiostream::common::audio::audio::{AudioFormat, SampleFormat};
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
 
+    // ---- open reader ----
     let in_cfg = match in_ext.as_str() {
         "wav" => AudioFileReadConfig::Wav,
         "mp3" => AudioFileReadConfig::Mp3,
         "aac" | "adts" => AudioFileReadConfig::AacAdts,
+        "opus" => AudioFileReadConfig::OpusOgg,
         _ => return Err(format!("unsupported input extension: {in_ext}").into()),
     };
     let mut r = AudioFileReader::open(input, in_cfg)?;
     let first = r.next_frame()?.ok_or("empty input")?;
     let fmt = first.format();
 
+    // ---- write ----
+    if out_ext == "opus" {
+        // Opus encoder 常用：48kHz + flt(packed) 或 s16；这里统一转到 f32 interleaved
+        let target_fmt = AudioFormat {
+            sample_rate: 48_000,
+            sample_format: SampleFormat::F32 { planar: false },
+            channel_layout: fmt.channel_layout,
+        };
+
+        let mut proc = ResampleProcessor::new_auto(fmt, target_fmt)?;
+        // Opus 常用 20ms@48k => 960 samples；并在 flush 时 pad 到 960
+        proc.set_output_chunker(Some(960), true)?;
+
+        let mut pipe = DynPipeline::new(vec![Box::new(ProcessorNode::new(proc))])?;
+
+        let write_cfg = AudioFileWriteConfig::OpusOgg(OpusEncoderConfig {
+            input_format: target_fmt,
+            bitrate: Some(96_000),
+        });
+
+        let mut w = AudioFileWriter::create(output, write_cfg)?;
+
+        for buf in pipe.push_and_drain(Some(NodeBuffer::Pcm(first)))? {
+            if let NodeBuffer::Pcm(of) = buf {
+                w.write_frame(&of)?;
+            }
+        }
+        while let Some(f) = r.next_frame()? {
+            for buf in pipe.push_and_drain(Some(NodeBuffer::Pcm(f)))? {
+                if let NodeBuffer::Pcm(of) = buf {
+                    w.write_frame(&of)?;
+                }
+            }
+        }
+        for buf in pipe.push_and_drain(None)? {
+            if let NodeBuffer::Pcm(of) = buf {
+                w.write_frame(&of)?;
+            }
+        }
+        w.finalize()?;
+        return Ok(());
+    }
+
+    // 非 opus 输出：沿用现有 AudioFileWriter（wav/mp3/aac）
     let out_cfg = match out_ext.as_str() {
         "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())),
         "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),

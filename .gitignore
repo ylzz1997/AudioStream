@@ -3,3 +3,4 @@ target/
 Cargo.lock
 test.py
 __pycache__
+out.*

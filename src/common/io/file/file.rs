@@ -7,6 +7,7 @@ use std::path::Path;
 
 use super::aac_file::{AacAdtsReader, AacAdtsWriter};
 use super::mp3_file::{Mp3Reader, Mp3Writer};
+use super::opus_file::{OpusOggReader, OpusOggWriter};
 use super::wav_file::{WavReader, WavWriter};
 use crate::common::io::io::{AudioReader, AudioWriter};
 
@@ -48,6 +49,8 @@ pub type AudioFileResult<T> = Result<T, AudioFileError>;
 pub enum AudioFileFormat {
     AacAdts,
     Mp3,
+    /// 标准 Ogg Opus（播放器可播放的 .opus）
+    OpusOgg,
     Wav,
 }
 
@@ -56,30 +59,37 @@ pub enum AudioFileFormat {
 pub enum CodecId {
     Aac,
     Mp3,
+    Opus,
     Pcm, // wav 等无压缩 PCM
 }
 
 pub enum AudioFileWriteConfig {
     AacAdts(crate::codec::encoder::aac_encoder::AacEncoderConfig),
     Mp3(super::mp3_file::Mp3WriterConfig),
+    /// 标准 Ogg Opus（播放器可播放的 .opus）
+    OpusOgg(crate::codec::encoder::opus_encoder::OpusEncoderConfig),
     Wav(super::wav_file::WavWriterConfig),
 }
 
 pub enum AudioFileReadConfig {
     AacAdts,
     Mp3,
+    /// 标准 Ogg Opus（播放器可播放的 .opus）
+    OpusOgg,
     Wav,
 }
 
 pub enum AudioFileWriter {
     AacAdts(AacAdtsWriter),
     Mp3(Mp3Writer),
+    OpusOgg(OpusOggWriter),
     Wav(WavWriter),
 }
 
 pub enum AudioFileReader {
     AacAdts(AacAdtsReader),
     Mp3(Mp3Reader),
+    OpusOgg(OpusOggReader),
     Wav(WavReader),
 }
 
@@ -88,6 +98,7 @@ impl AudioFileWriter {
         match cfg {
             AudioFileWriteConfig::AacAdts(enc_cfg) => Ok(Self::AacAdts(AacAdtsWriter::create(path, enc_cfg)?)),
             AudioFileWriteConfig::Mp3(cfg) => Ok(Self::Mp3(Mp3Writer::create(path, cfg)?)),
+            AudioFileWriteConfig::OpusOgg(cfg) => Ok(Self::OpusOgg(OpusOggWriter::create(path, cfg)?)),
             AudioFileWriteConfig::Wav(cfg) => Ok(Self::Wav(WavWriter::create(path, cfg)?)),
         }
     }
@@ -98,6 +109,7 @@ impl AudioFileReader {
         match cfg {
             AudioFileReadConfig::AacAdts => Ok(Self::AacAdts(AacAdtsReader::open(path)?)),
             AudioFileReadConfig::Mp3 => Ok(Self::Mp3(Mp3Reader::open(path)?)),
+            AudioFileReadConfig::OpusOgg => Ok(Self::OpusOgg(OpusOggReader::open(path)?)),
             AudioFileReadConfig::Wav => Ok(Self::Wav(WavReader::open(path)?)),
         }
     }
@@ -108,6 +120,7 @@ impl AudioWriter for AudioFileWriter {
         match self {
             AudioFileWriter::AacAdts(w) => w.write_frame(frame),
             AudioFileWriter::Mp3(w) => w.write_frame(frame),
+            AudioFileWriter::OpusOgg(w) => w.write_frame(frame),
             AudioFileWriter::Wav(w) => w.write_frame(frame),
         }
     }
@@ -116,6 +129,7 @@ impl AudioWriter for AudioFileWriter {
         match self {
             AudioFileWriter::AacAdts(w) => w.finalize(),
             AudioFileWriter::Mp3(w) => w.finalize(),
+            AudioFileWriter::OpusOgg(w) => w.finalize(),
             AudioFileWriter::Wav(w) => w.finalize(),
         }
     }
@@ -126,6 +140,7 @@ impl AudioReader for AudioFileReader {
         match self {
             AudioFileReader::AacAdts(r) => r.next_frame(),
             AudioFileReader::Mp3(r) => r.next_frame(),
+            AudioFileReader::OpusOgg(r) => r.next_frame(),
             AudioFileReader::Wav(r) => r.next_frame(),
         }
     }
