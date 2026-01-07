@@ -4,8 +4,6 @@
 
 # AudioStream
 
----
-
 一个面向**音频流式处理**的 Rust 库，并通过 PyO3 暴露给 Python 使用：你可以把 **PCM（numpy）** 按 chunk 推给 `Encoder`，拿到 **编码后的 frame(bytes)**；或把 **编码帧(bytes)** 推给 `Decoder` 按 chunk 取回 **PCM（numpy）**。
 
 目前 Python 侧最常用的场景是：
