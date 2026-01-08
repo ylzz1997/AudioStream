@@ -145,7 +145,7 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
                 channel_layout: fmt.channel_layout,
             };
 
-            let mut proc = ResampleProcessor::new_auto(fmt, target_fmt)?;
+            let mut proc = ResampleProcessor::new(fmt, target_fmt)?;
             // Opus 常用 20ms@48k => 960 samples；并在 flush 时 pad 到 960
             proc.set_output_chunker(Some(960), true)?;
             resampler = Some(proc);
@@ -155,10 +155,22 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
                 bitrate: Some(96_000),
             })
         }
+        "flac" => {
+            // FFmpeg FLAC encoder 常见只支持 s16/s32（packed）。我们统一转成 s16 packed，避免输入是 fltp（WAV reader 默认输出）时失败。
+            let target_fmt = AudioFormat {
+                sample_rate: fmt.sample_rate,
+                sample_format: SampleFormat::I16 { planar: false },
+                channel_layout: fmt.channel_layout,
+            };
+            if fmt != target_fmt {
+                let proc = ResampleProcessor::new(fmt, target_fmt)?;
+                resampler = Some(proc);
+            }
+            AudioFileWriteConfig::Flac(audiostream::common::io::file::FlacWriterConfig::new(target_fmt))
+        }
         "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())),
         "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),
         "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) }),
-        "flac" => AudioFileWriteConfig::Flac(audiostream::common::io::file::FlacWriterConfig::new(fmt)),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
     let mut w = AudioFileWriter::create(output, out_cfg)?;

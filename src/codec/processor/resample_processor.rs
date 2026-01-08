@@ -96,7 +96,7 @@ impl ResampleProcessor {
     /// 自动选择后端：
     /// - 有 ffmpeg：优先 ffmpeg
     /// - 否则：linear
-    pub fn new_auto(in_fmt: AudioFormat, out_fmt: AudioFormat) -> CodecResult<Self> {
+    pub fn new(in_fmt: AudioFormat, out_fmt: AudioFormat) -> CodecResult<Self> {
         #[cfg(feature = "ffmpeg")]
         {
             // swresample 覆盖面更好：允许更多采样率/采样格式组合

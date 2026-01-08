@@ -13,12 +13,12 @@ pub struct IdentityProcessor {
 
 impl IdentityProcessor {
     /// 接受任意输入格式（不做格式约束）。
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> CodecResult<Self> {
+        Ok(Self {
             expected_fmt: None,
             out_q: VecDeque::new(),
             flushed: false,
-        }
+        })
     }
 
     /// 约束输入格式必须等于 `expected_fmt`（否则报错）。
@@ -61,7 +61,7 @@ impl IdentityProcessor {
 
 impl Default for IdentityProcessor {
     fn default() -> Self {
-        Self::new()
+        Self::new().unwrap()
     }
 }
 

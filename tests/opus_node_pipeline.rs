@@ -69,7 +69,7 @@ fn opus_pipeline_dynamic_and_static() {
     };
 
     // -------- dynamic pipeline --------
-    let mut resample = ResampleProcessor::new_auto(in_fmt, mid_fmt).unwrap();
+    let mut resample = ResampleProcessor::new(in_fmt, mid_fmt).unwrap();
     // Opus 常用 20ms@48k => 960 samples；flush 时补齐尾巴，避免非法帧长
     resample.set_output_chunker(Some(960), true).unwrap();
     let enc = OpusEncoder::new(OpusEncoderConfig {
@@ -129,7 +129,7 @@ fn opus_pipeline_dynamic_and_static() {
     assert!(got_samples > 0);
 
     // -------- static pipeline --------
-    let mut resample = ResampleProcessor::new_auto(in_fmt, mid_fmt).unwrap();
+    let mut resample = ResampleProcessor::new(in_fmt, mid_fmt).unwrap();
     resample.set_output_chunker(Some(960), true).unwrap();
     let enc = OpusEncoder::new(OpusEncoderConfig {
         input_format: mid_fmt,
