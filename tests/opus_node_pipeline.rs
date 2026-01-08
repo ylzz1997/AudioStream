@@ -2,9 +2,9 @@
 
 use audiostream::codec::decoder::opus_decoder::OpusDecoder;
 use audiostream::codec::encoder::opus_encoder::{OpusEncoder, OpusEncoderConfig};
-use audiostream::codec::node::dynamic_node_interface::{DecoderNode, DynPipeline, EncoderNode, ProcessorNode};
-use audiostream::codec::node::node_interface::NodeBuffer;
-use audiostream::codec::node::static_node_interface::{
+use audiostream::pipeline::node::dynamic_node_interface::{DecoderNode, DynPipeline, EncoderNode, ProcessorNode};
+use audiostream::pipeline::node::node_interface::NodeBuffer;
+use audiostream::pipeline::node::static_node_interface::{
     DecoderStaticNode, EncoderStaticNode, Pipeline3, ProcessorStaticNode,
 };
 use audiostream::codec::processor::resample_processor::ResampleProcessor;

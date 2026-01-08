@@ -65,8 +65,8 @@ fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error:
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
     use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
     use audiostream::codec::processor::resample_processor::ResampleProcessor;
-    use audiostream::codec::node::dynamic_node_interface::{DynPipeline, ProcessorNode};
-    use audiostream::codec::node::node_interface::NodeBuffer;
+    use audiostream::pipeline::node::dynamic_node_interface::{DynPipeline, ProcessorNode};
+    use audiostream::pipeline::node::node_interface::NodeBuffer;
     use audiostream::common::io::file::{
         AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
     };

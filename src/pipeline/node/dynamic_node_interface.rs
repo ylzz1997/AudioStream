@@ -3,9 +3,9 @@
 use crate::codec::decoder::decoder_interface::AudioDecoder;
 use crate::codec::encoder::encoder_interface::AudioEncoder;
 use crate::codec::error::{CodecError, CodecResult};
-use crate::codec::node::node_interface::{NodeBuffer, NodeBufferKind};
 use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::AudioFrameView;
+use crate::pipeline::node::node_interface::{NodeBuffer, NodeBufferKind};
 
 /// 动态 node：输入/输出都是 `NodeBuffer`，用 `CodecError::{Again,Eof}` 表达背压/结束。
 pub trait DynNode: Send {
