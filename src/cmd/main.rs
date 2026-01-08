@@ -65,8 +65,8 @@ fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error:
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
     use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
     use audiostream::codec::processor::resample_processor::ResampleProcessor;
-    use audiostream::pipeline::node::dynamic_node_interface::{DynPipeline, ProcessorNode};
-    use audiostream::pipeline::node::node_interface::NodeBuffer;
+    use audiostream::codec::error::CodecError;
+    use audiostream::codec::processor::processor_interface::AudioProcessor;
     use audiostream::common::io::file::{
         AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
     };
@@ -91,60 +91,70 @@ fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error:
     let fmt = first.format();
 
     // ---- write ----
-    if out_ext == "opus" {
-        // Opus encoder 常用：48kHz + flt(packed) 或 s16；这里统一转到 f32 interleaved
-        let target_fmt = AudioFormat {
-            sample_rate: 48_000,
-            sample_format: SampleFormat::F32 { planar: false },
-            channel_layout: fmt.channel_layout,
-        };
-
-        let mut proc = ResampleProcessor::new_auto(fmt, target_fmt)?;
-        // Opus 常用 20ms@48k => 960 samples；并在 flush 时 pad 到 960
-        proc.set_output_chunker(Some(960), true)?;
-
-        let mut pipe = DynPipeline::new(vec![Box::new(ProcessorNode::new(proc))])?;
-
-        let write_cfg = AudioFileWriteConfig::OpusOgg(OpusEncoderConfig {
-            input_format: target_fmt,
-            bitrate: Some(96_000),
-        });
-
-        let mut w = AudioFileWriter::create(output, write_cfg)?;
-
-        for buf in pipe.push_and_drain(Some(NodeBuffer::Pcm(first)))? {
-            if let NodeBuffer::Pcm(of) = buf {
-                w.write_frame(&of)?;
-            }
-        }
-        while let Some(f) = r.next_frame()? {
-            for buf in pipe.push_and_drain(Some(NodeBuffer::Pcm(f)))? {
-                if let NodeBuffer::Pcm(of) = buf {
-                    w.write_frame(&of)?;
-                }
-            }
-        }
-        for buf in pipe.push_and_drain(None)? {
-            if let NodeBuffer::Pcm(of) = buf {
-                w.write_frame(&of)?;
-            }
-        }
-        w.finalize()?;
-        return Ok(());
-    }
-
-    // 非 opus 输出：沿用现有 AudioFileWriter（wav/mp3/aac）
+    // Opus 输出：需要 48k + 常见 flt(packed)；这里统一转到 f32 interleaved，并按 960 samples 分帧
+    let mut resampler: Option<ResampleProcessor> = None;
     let out_cfg = match out_ext.as_str() {
+        "opus" => {
+            let target_fmt = AudioFormat {
+                sample_rate: 48_000,
+                sample_format: SampleFormat::F32 { planar: false },
+                channel_layout: fmt.channel_layout,
+            };
+
+            let mut proc = ResampleProcessor::new_auto(fmt, target_fmt)?;
+            // Opus 常用 20ms@48k => 960 samples；并在 flush 时 pad 到 960
+            proc.set_output_chunker(Some(960), true)?;
+            resampler = Some(proc);
+
+            AudioFileWriteConfig::OpusOgg(OpusEncoderConfig {
+                input_format: target_fmt,
+                bitrate: Some(96_000),
+            })
+        }
         "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())),
         "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),
         "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) }),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
     let mut w = AudioFileWriter::create(output, out_cfg)?;
-    w.write_frame(&first)?;
+
+    // 共享写入逻辑：可选经过 ResampleProcessor（opus），否则直接写入（wav/mp3/aac）
+    let mut write_via_resampler = |f: &audiostream::common::audio::audio::AudioFrame| -> Result<(), Box<dyn std::error::Error>> {
+        let Some(proc) = resampler.as_mut() else {
+            w.write_frame(f as &dyn AudioFrameView)?;
+            return Ok(());
+        };
+
+        proc.send_frame(Some(f as &dyn AudioFrameView))?;
+        loop {
+            match proc.receive_frame() {
+                Ok(of) => w.write_frame(&of as &dyn AudioFrameView)?,
+                Err(CodecError::Again) => break,
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+        Ok(())
+    };
+
+    // first
+    write_via_resampler(&first)?;
+    // rest
     while let Some(f) = r.next_frame()? {
-        w.write_frame(&f)?;
+        write_via_resampler(&f)?;
     }
+    // flush resampler if enabled
+    if let Some(proc) = resampler.as_mut() {
+        proc.send_frame(None)?;
+        loop {
+            match proc.receive_frame() {
+                Ok(of) => w.write_frame(&of as &dyn AudioFrameView)?,
+                Err(CodecError::Eof) => break,
+                Err(CodecError::Again) => break,
+                Err(e) => return Err(Box::new(e)),
+            }
+        }
+    }
+
     w.finalize()?;
     Ok(())
 }
