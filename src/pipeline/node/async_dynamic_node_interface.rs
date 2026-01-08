@@ -1,0 +1,300 @@
+//! tokio 版本的异步（后台并行）运行时 pipeline。
+
+use crate::codec::error::{CodecError, CodecResult};
+use crate::pipeline::node::dynamic_node_interface::DynNode;
+use crate::pipeline::node::node_interface::{NodeBuffer, AsyncPipeline};
+use core::future::Future;
+use core::pin::Pin;
+use tokio::sync::mpsc;
+
+/// pipeline 内部消息：
+/// - `Ok(Some(buf))`：一条数据
+/// - `Ok(None)`：flush（输入结束）
+/// - `Err(e)`：错误（会沿链路传递到末端）
+type Msg = Result<Option<NodeBuffer>, CodecError>;
+
+fn drain_to_next(node: &mut Box<dyn DynNode>, tx_next: &mpsc::UnboundedSender<Msg>) -> Result<(), CodecError> {
+    loop {
+        match node.pull() {
+            Ok(v) => {
+                let _ = tx_next.send(Ok(Some(v)));
+            }
+            Err(CodecError::Again) => return Ok(()),
+            Err(CodecError::Eof) => return Ok(()),
+            Err(e) => {
+                let _ = tx_next.send(Err(e.clone()));
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn spawn_stage(mut node: Box<dyn DynNode>, mut rx: mpsc::UnboundedReceiver<Msg>, tx_next: mpsc::UnboundedSender<Msg>) {
+    tokio::task::spawn_blocking(move || {
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                Err(e) => {
+                    let _ = tx_next.send(Err(e));
+                    break;
+                }
+                Ok(None) => {
+                    // flush
+                    let _ = node.push(None);
+                    let _ = drain_to_next(&mut node, &tx_next);
+                    let _ = tx_next.send(Ok(None));
+                    break;
+                }
+                Ok(Some(buf)) => match node.push(Some(buf)) {
+                    Ok(()) | Err(CodecError::Again) => {
+                        let _ = drain_to_next(&mut node, &tx_next);
+                    }
+                    Err(CodecError::Eof) => {
+                        let _ = tx_next.send(Ok(None));
+                        break;
+                    }
+                    Err(e) => {
+                        let _ = tx_next.send(Err(e));
+                        break;
+                    }
+                },
+            }
+        }
+        // 上游断开：视为 flush
+        let _ = tx_next.send(Ok(None));
+    });
+}
+
+fn spawn_last_stage(
+    mut node: Box<dyn DynNode>,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    out_tx: mpsc::UnboundedSender<Result<NodeBuffer, CodecError>>,
+) {
+    tokio::task::spawn_blocking(move || {
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                Err(e) => {
+                    let _ = out_tx.send(Err(e));
+                    return;
+                }
+                Ok(None) => {
+                    let _ = node.push(None);
+                    // flush 后尽可能 drain 到 Eof
+                    loop {
+                        match node.pull() {
+                            Ok(v) => {
+                                let _ = out_tx.send(Ok(v));
+                            }
+                            Err(CodecError::Again) => continue,
+                            Err(CodecError::Eof) => {
+                                let _ = out_tx.send(Err(CodecError::Eof));
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = out_tx.send(Err(e));
+                                return;
+                            }
+                        }
+                    }
+                }
+                Ok(Some(buf)) => match node.push(Some(buf)) {
+                    Ok(()) | Err(CodecError::Again) => {
+                        loop {
+                            match node.pull() {
+                                Ok(v) => {
+                                    let _ = out_tx.send(Ok(v));
+                                }
+                                Err(CodecError::Again) => break,
+                                Err(CodecError::Eof) => {
+                                    let _ = out_tx.send(Err(CodecError::Eof));
+                                    return;
+                                }
+                                Err(e) => {
+                                    let _ = out_tx.send(Err(e));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(CodecError::Eof) => {
+                        let _ = out_tx.send(Err(CodecError::Eof));
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = out_tx.send(Err(e));
+                        return;
+                    }
+                },
+            }
+        }
+        // 上游断开：视为结束
+        let _ = out_tx.send(Err(CodecError::Eof));
+    });
+}
+
+/// Async 异步运行时 pipeline：push 后后台并行流转，末端通过 get/try_get 输出。
+pub struct AsyncDynPipeline {
+    in_tx: mpsc::UnboundedSender<Msg>,
+    out_rx: mpsc::UnboundedReceiver<Result<NodeBuffer, CodecError>>,
+}
+
+impl AsyncDynPipeline {
+    pub fn new(nodes: Vec<Box<dyn DynNode>>) -> Result<Self, CodecError> {
+        if nodes.is_empty() {
+            return Err(CodecError::InvalidData("pipeline requires at least 1 node"));
+        }
+        // 基础校验：相邻节点 output_kind == input_kind
+        for i in 0..(nodes.len() - 1) {
+            let ok = nodes[i].output_kind() == nodes[i + 1].input_kind();
+            if !ok {
+                return Err(CodecError::InvalidData("pipeline node kind mismatch"));
+            }
+        }
+
+        let (in_tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+
+        let mut iter = nodes.into_iter();
+        let mut current = iter
+            .next()
+            .ok_or(CodecError::InvalidState("pipeline requires at least 1 node"))?;
+
+        while let Some(next_node) = iter.next() {
+            let (tx_next, rx_next) = mpsc::unbounded_channel::<Msg>();
+            spawn_stage(current, rx, tx_next);
+            current = next_node;
+            rx = rx_next;
+        }
+
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Result<NodeBuffer, CodecError>>();
+        spawn_last_stage(current, rx, out_tx);
+
+        Ok(Self { in_tx, out_rx })
+    }
+}
+
+
+impl AsyncPipeline for AsyncDynPipeline {
+    type In = NodeBuffer;
+    type Out = NodeBuffer;
+
+    fn push_frame(&self, buf: NodeBuffer) -> CodecResult<()> {
+        self.in_tx
+            .send(Ok(Some(buf)))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+
+    fn flush(&self) -> CodecResult<()> {
+        self.in_tx
+            .send(Ok(None))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+
+    /// 非阻塞取末端输出。
+    fn try_get_frame(&mut self) -> CodecResult<NodeBuffer> {
+        match self.out_rx.try_recv() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::error::TryRecvError::Empty) => Err(CodecError::Again),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(CodecError::Eof),
+        }
+    }
+
+    /// 异步等待一个末端输出。
+    fn get_frame<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CodecResult<NodeBuffer>> + Send + 'a>> {
+        Box::pin(async move {
+            match self.out_rx.recv().await {
+                Some(Ok(v)) => Ok(v),
+                Some(Err(e)) => Err(e),
+                None => Err(CodecError::Eof),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::packet::CodecPacket;
+    use crate::common::audio::audio::Rational;
+    use crate::pipeline::node::dynamic_node_interface::DynNode;
+    use crate::pipeline::node::node_interface::{NodeBuffer, NodeBufferKind};
+    use std::collections::VecDeque;
+
+    struct PacketEchoNode {
+        q: VecDeque<NodeBuffer>,
+        flushed: bool,
+    }
+
+    impl PacketEchoNode {
+        fn new() -> Self {
+            Self {
+                q: VecDeque::new(),
+                flushed: false,
+            }
+        }
+    }
+
+    impl DynNode for PacketEchoNode {
+        fn name(&self) -> &'static str {
+            "packet-echo"
+        }
+        fn input_kind(&self) -> NodeBufferKind {
+            NodeBufferKind::Packet
+        }
+        fn output_kind(&self) -> NodeBufferKind {
+            NodeBufferKind::Packet
+        }
+        fn push(&mut self, input: Option<NodeBuffer>) -> CodecResult<()> {
+            match input {
+                None => {
+                    self.flushed = true;
+                    Ok(())
+                }
+                Some(NodeBuffer::Packet(p)) => {
+                    // echo: prefix 0xAA
+                    let mut d = vec![0xAA];
+                    d.extend_from_slice(&p.data);
+                    let mut out = CodecPacket::new(d, p.time_base);
+                    out.pts = p.pts;
+                    out.duration = p.duration;
+                    self.q.push_back(NodeBuffer::Packet(out));
+                    Ok(())
+                }
+                Some(_) => Err(CodecError::InvalidData("expects packet")),
+            }
+        }
+        fn pull(&mut self) -> CodecResult<NodeBuffer> {
+            if let Some(v) = self.q.pop_front() {
+                return Ok(v);
+            }
+            if self.flushed {
+                return Err(CodecError::Eof);
+            }
+            Err(CodecError::Again)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn async_dyn_pipeline_push_then_get() {
+        let nodes: Vec<Box<dyn DynNode>> = vec![Box::new(PacketEchoNode::new()), Box::new(PacketEchoNode::new())];
+        let mut p = AsyncDynPipeline::new(nodes).unwrap();
+
+        let tb = Rational::new(1, 1);
+        p.push_frame(NodeBuffer::Packet(CodecPacket::new(vec![1, 2, 3], tb)))
+            .unwrap();
+        p.push_frame(NodeBuffer::Packet(CodecPacket::new(vec![4], tb))).unwrap();
+        p.flush().unwrap();
+
+        let mut outs = Vec::new();
+        loop {
+            match p.get_frame().await {
+                Ok(NodeBuffer::Packet(pkt)) => outs.push(pkt.data),
+                Err(CodecError::Eof) => break,
+                Err(e) => panic!("unexpected err: {e:?}"),
+                _ => panic!("unexpected kind"),
+            }
+        }
+        assert_eq!(outs, vec![vec![0xAA, 0xAA, 1, 2, 3], vec![0xAA, 0xAA, 4]]);
+    }
+}
+
+

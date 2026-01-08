@@ -6,6 +6,7 @@ use crate::codec::error::{CodecError, CodecResult};
 use crate::codec::packet::CodecPacket;
 use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView};
+use std::collections::VecDeque;
 
 /// 静态 node：In/Out 在类型层面固定，`pull()` 以 `CodecError::{Again,Eof}` 表示背压/结束。
 pub trait StaticNode {
@@ -101,6 +102,66 @@ impl<D: AudioDecoder> StaticNode for DecoderStaticNode<D> {
 
     fn pull(&mut self) -> CodecResult<Self::Out> {
         self.d.receive_frame()
+    }
+}
+
+/// Identity 静态节点：把输入原样 move 到输出（零拷贝，不做任何处理）。
+///
+/// 适合用于：
+/// - 静态 pipeline 中“占位/透传”一段，便于后续插入 processor/filter。
+/// - 统一使用 `StaticNode` 的 `push/pull + Again/Eof + flush(None)` 驱动语义。
+pub struct IdentityStaticNode<T> {
+    q: VecDeque<T>,
+    flushed: bool,
+}
+
+impl<T> IdentityStaticNode<T> {
+    pub fn new() -> Self {
+        Self {
+            q: VecDeque::new(),
+            flushed: false,
+        }
+    }
+}
+
+impl<T> Default for IdentityStaticNode<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> StaticNode for IdentityStaticNode<T> {
+    type In = T;
+    type Out = T;
+
+    fn name(&self) -> &'static str {
+        "identity"
+    }
+
+    fn push(&mut self, input: Option<Self::In>) -> CodecResult<()> {
+        if self.flushed {
+            return Err(CodecError::InvalidState("already flushed"));
+        }
+        match input {
+            None => {
+                self.flushed = true;
+                Ok(())
+            }
+            Some(v) => {
+                self.q.push_back(v);
+                Ok(())
+            }
+        }
+    }
+
+    fn pull(&mut self) -> CodecResult<Self::Out> {
+        if let Some(v) = self.q.pop_front() {
+            return Ok(v);
+        }
+        if self.flushed {
+            return Err(CodecError::Eof);
+        }
+        Err(CodecError::Again)
     }
 }
 

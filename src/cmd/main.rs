@@ -1,11 +1,12 @@
 #[cfg(not(feature = "ffmpeg"))]
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 {
         eprintln!("当前未启用 ffmpeg feature：只支持 WAV->WAV（PCM）测试。");
         eprintln!("如需 AAC/MP3：cargo run --features ffmpeg -- <in> <out>");
-        // 仍然允许 wav->wav 走纯 Rust 路径
-        if let Err(e) = transcode_no_ffmpeg(&args[1], &args[2]) {
+        // wav->wav 也统一走异步 pipeline（后台线程驱动）。
+        if let Err(e) = transcode_no_ffmpeg(&args[1], &args[2]).await {
             eprintln!("transcode failed: {e}");
             std::process::exit(1);
         }
@@ -16,10 +17,11 @@ fn main() {
 }
 
 #[cfg(feature = "ffmpeg")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() == 3 {
-        transcode_ffmpeg(&args[1], &args[2])?;
+        transcode_ffmpeg(&args[1], &args[2]).await?;
         return Ok(());
     }
     eprintln!("用法：audiostream <in> <out>");
@@ -36,11 +38,15 @@ fn ext_lower(path: &str) -> Option<String> {
 }
 
 #[cfg(not(feature = "ffmpeg"))]
-fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
+async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
     use audiostream::common::io::{AudioReader, AudioWriter};
     use audiostream::common::io::file::WavWriterConfig;
     use audiostream::common::audio::audio::AudioFrameView;
+    use audiostream::codec::error::CodecError;
+    use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
+    use audiostream::pipeline::node::dynamic_node_interface::IdentityNode;
+    use audiostream::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -52,21 +58,55 @@ fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     let fmt = first.format();
     let mut w = AudioFileWriter::create(output, AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())))
         .map_err(|e| format!("{e:?}"))?;
-    w.write_frame(&first).map_err(|e| format!("{e:?}"))?;
+
+    // 统一走异步 pipeline：这里无需处理时，用 identity 节点零拷贝搬运。
+    let nodes = vec![Box::new(IdentityNode::new(NodeBufferKind::Pcm)) as Box<dyn audiostream::pipeline::node::dynamic_node_interface::DynNode>];
+    let mut p = AsyncDynPipeline::new(nodes).map_err(|e| format!("{e:?}"))?;
+
+    // first
+    p.push_frame(NodeBuffer::Pcm(first)).map_err(|e| format!("{e:?}"))?;
+    loop {
+        match p.try_get_frame() {
+            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
+            Ok(_) => return Err("unexpected node buffer kind".into()),
+            Err(CodecError::Again) => break,
+            Err(e) => return Err(format!("{e:?}")),
+        }
+    }
+
+    // rest
     while let Some(f) = r.next_frame().map_err(|e| format!("{e:?}"))? {
-        w.write_frame(&f).map_err(|e| format!("{e:?}"))?;
+        p.push_frame(NodeBuffer::Pcm(f)).map_err(|e| format!("{e:?}"))?;
+        loop {
+            match p.try_get_frame() {
+                Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
+                Ok(_) => return Err("unexpected node buffer kind".into()),
+                Err(CodecError::Again) => break,
+                Err(e) => return Err(format!("{e:?}")),
+            }
+        }
+    }
+
+    // flush
+    p.flush().map_err(|e| format!("{e:?}"))?;
+    loop {
+        match p.get_frame().await {
+            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
+            Ok(_) => return Err("unexpected node buffer kind".into()),
+            Err(CodecError::Eof) => break,
+            Err(e) => return Err(format!("{e:?}")),
+        }
     }
     w.finalize().map_err(|e| format!("{e:?}"))?;
     Ok(())
 }
 
 #[cfg(feature = "ffmpeg")]
-fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
     use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
     use audiostream::codec::processor::resample_processor::ResampleProcessor;
     use audiostream::codec::error::CodecError;
-    use audiostream::codec::processor::processor_interface::AudioProcessor;
     use audiostream::common::io::file::{
         AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
     };
@@ -74,6 +114,9 @@ fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error:
     use audiostream::common::io::file::{Mp3WriterConfig, WavWriterConfig};
     use audiostream::common::audio::audio::AudioFrameView;
     use audiostream::common::audio::audio::{AudioFormat, SampleFormat};
+    use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
+    use audiostream::pipeline::node::dynamic_node_interface::{IdentityNode, ProcessorNode, DynNode};
+    use audiostream::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -118,40 +161,49 @@ fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error:
     };
     let mut w = AudioFileWriter::create(output, out_cfg)?;
 
-    // 共享写入逻辑：可选经过 ResampleProcessor（opus），否则直接写入（wav/mp3/aac）
-    let mut write_via_resampler = |f: &audiostream::common::audio::audio::AudioFrame| -> Result<(), Box<dyn std::error::Error>> {
-        let Some(proc) = resampler.as_mut() else {
-            w.write_frame(f as &dyn AudioFrameView)?;
-            return Ok(());
-        };
+    // 构建异步 pipeline：
+    // - opus：插入 ResampleProcessor
+    // - 其它：走 identity（零拷贝搬运），但依旧统一遵循 pipeline 驱动逻辑
+    let mut nodes: Vec<Box<dyn DynNode>> = Vec::new();
+    if let Some(proc) = resampler {
+        nodes.push(Box::new(ProcessorNode::new(proc)));
+    } else {
+        nodes.push(Box::new(IdentityNode::new(NodeBufferKind::Pcm)));
+    }
+    let mut p = AsyncDynPipeline::new(nodes)?;
 
-        proc.send_frame(Some(f as &dyn AudioFrameView))?;
+    // first
+    p.push_frame(NodeBuffer::Pcm(first))?;
+    loop {
+        match p.try_get_frame() {
+            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
+            Ok(_) => return Err("unexpected node buffer kind".into()),
+            Err(CodecError::Again) => break,
+            Err(e) => return Err(Box::new(e)),
+        }
+    }
+
+    // rest
+    while let Some(f) = r.next_frame()? {
+        p.push_frame(NodeBuffer::Pcm(f))?;
         loop {
-            match proc.receive_frame() {
-                Ok(of) => w.write_frame(&of as &dyn AudioFrameView)?,
+            match p.try_get_frame() {
+                Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
+                Ok(_) => return Err("unexpected node buffer kind".into()),
                 Err(CodecError::Again) => break,
                 Err(e) => return Err(Box::new(e)),
             }
         }
-        Ok(())
-    };
-
-    // first
-    write_via_resampler(&first)?;
-    // rest
-    while let Some(f) = r.next_frame()? {
-        write_via_resampler(&f)?;
     }
-    // flush resampler if enabled
-    if let Some(proc) = resampler.as_mut() {
-        proc.send_frame(None)?;
-        loop {
-            match proc.receive_frame() {
-                Ok(of) => w.write_frame(&of as &dyn AudioFrameView)?,
-                Err(CodecError::Eof) => break,
-                Err(CodecError::Again) => break,
-                Err(e) => return Err(Box::new(e)),
-            }
+
+    // flush pipeline
+    p.flush()?;
+    loop {
+        match p.get_frame().await {
+            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
+            Ok(_) => return Err("unexpected node buffer kind".into()),
+            Err(CodecError::Eof) => break,
+            Err(e) => return Err(Box::new(e)),
         }
     }
 

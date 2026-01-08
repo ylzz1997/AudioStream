@@ -6,6 +6,9 @@
 
 use crate::codec::packet::CodecPacket;
 use crate::common::audio::audio::AudioFrame;
+use crate::codec::error::CodecResult;
+use core::future::Future;
+use core::pin::Pin;
 
 /// node 之间传递的数据类型（运行时版 pipeline 用）。
 #[derive(Debug)]
@@ -29,4 +32,12 @@ impl NodeBuffer {
     }
 }
 
+pub trait AsyncPipeline {
+    type In: Send + 'static;
+    type Out: Send + 'static;
 
+    fn push_frame(&self, frame: Self::In) -> CodecResult<()>;
+    fn flush(&self) -> CodecResult<()>;
+    fn try_get_frame(&mut self) -> CodecResult<Self::Out>;
+    fn get_frame<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CodecResult<Self::Out>> + Send + 'a>>;
+}
