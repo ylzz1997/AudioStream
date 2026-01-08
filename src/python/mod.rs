@@ -9,11 +9,15 @@
 
 use crate::codec::decoder::aac_decoder::AacDecoder;
 use crate::codec::decoder::decoder_interface::AudioDecoder;
+use crate::codec::decoder::flac_decoder::FlacDecoder;
 use crate::codec::decoder::mp3_decoder::Mp3Decoder;
+use crate::codec::decoder::opus_decoder::OpusDecoder;
 use crate::codec::decoder::wav_decoder::WavDecoder;
 use crate::codec::encoder::aac_encoder::{AacEncoder, AacEncoderConfig};
 use crate::codec::encoder::encoder_interface::AudioEncoder;
+use crate::codec::encoder::flac_encoder::{FlacEncoder, FlacEncoderConfig};
 use crate::codec::encoder::mp3_encoder::{Mp3Encoder, Mp3EncoderConfig};
+use crate::codec::encoder::opus_encoder::{OpusEncoder, OpusEncoderConfig};
 use crate::codec::encoder::wav_encoder::{WavEncoder, WavEncoderConfig};
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
@@ -28,6 +32,22 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict};
 
 use std::collections::VecDeque;
+use tokio::runtime::Runtime;
+
+use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
+use crate::pipeline::node::dynamic_node_interface::{DynNode, IdentityNode, ProcessorNode};
+use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
+
+use crate::codec::processor::resample_processor::ResampleProcessor;
+use crate::common::audio::audio::AudioFrameViewMut;
+use crate::runner::audio_sink::AudioSink;
+use crate::runner::audio_source::AudioSource;
+use crate::runner::async_runner_interface::AsyncRunner as RsAsyncRunner;
+use crate::runner::auto_runner::AutoRunner;
+use crate::runner::error::{RunnerError, RunnerResult};
+use crate::common::io::file as rs_file;
+use crate::common::io::file::{AudioFileError, AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
+use crate::common::io::io::{AudioReader, AudioWriter};
 
 fn map_codec_err(e: CodecError) -> PyErr {
     match e {
@@ -72,6 +92,8 @@ fn codec_from_str(s: &str) -> Option<&'static str> {
         "wav" | "pcm" => Some("wav"),
         "mp3" => Some("mp3"),
         "aac" => Some("aac"),
+        "opus" => Some("opus"),
+        "flac" => Some("flac"),
         _ => None,
     }
 }
@@ -309,6 +331,119 @@ impl AacDecoderConfigPy {
     }
 }
 
+#[pyclass(name = "OpusEncoderConfig")]
+#[derive(Clone)]
+pub struct OpusEncoderConfigPy {
+    #[pyo3(get)]
+    pub input_format: AudioFormat,
+    #[pyo3(get)]
+    pub chunk_samples: usize,
+    #[pyo3(get)]
+    pub bitrate: Option<u32>,
+}
+
+#[pymethods]
+impl OpusEncoderConfigPy {
+    #[new]
+    #[pyo3(signature = (input_format, chunk_samples, bitrate=Some(96_000)))]
+    fn new(input_format: AudioFormat, chunk_samples: usize, bitrate: Option<u32>) -> PyResult<Self> {
+        if chunk_samples == 0 {
+            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+        }
+        Ok(Self {
+            input_format,
+            chunk_samples,
+            bitrate,
+        })
+    }
+}
+
+#[pyclass(name = "FlacEncoderConfig")]
+#[derive(Clone)]
+pub struct FlacEncoderConfigPy {
+    #[pyo3(get)]
+    pub input_format: AudioFormat,
+    #[pyo3(get)]
+    pub chunk_samples: usize,
+    /// 0..=12（FFmpeg backend 常见语义）；None=默认
+    #[pyo3(get)]
+    pub compression_level: Option<i32>,
+}
+
+#[pymethods]
+impl FlacEncoderConfigPy {
+    #[new]
+    #[pyo3(signature = (input_format, chunk_samples, compression_level=None))]
+    fn new(input_format: AudioFormat, chunk_samples: usize, compression_level: Option<i32>) -> PyResult<Self> {
+        if chunk_samples == 0 {
+            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+        }
+        Ok(Self {
+            input_format,
+            chunk_samples,
+            compression_level,
+        })
+    }
+}
+
+#[pyclass(name = "OpusDecoderConfig")]
+#[derive(Clone)]
+pub struct OpusDecoderConfigPy {
+    #[pyo3(get)]
+    pub chunk_samples: usize,
+    #[pyo3(get)]
+    pub packet_time_base_den: i32,
+    /// 可选：Opus extradata（通常为 OpusHead；raw packet 流时可能需要）。
+    #[pyo3(get)]
+    pub extradata: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl OpusDecoderConfigPy {
+    #[new]
+    #[pyo3(signature = (chunk_samples, packet_time_base_den=48000, extradata=None))]
+    fn new(chunk_samples: usize, packet_time_base_den: i32, extradata: Option<Vec<u8>>) -> PyResult<Self> {
+        if chunk_samples == 0 {
+            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+        }
+        if packet_time_base_den <= 0 {
+            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+        }
+        Ok(Self {
+            chunk_samples,
+            packet_time_base_den,
+            extradata,
+        })
+    }
+}
+
+#[pyclass(name = "FlacDecoderConfig")]
+#[derive(Clone)]
+pub struct FlacDecoderConfigPy {
+    #[pyo3(get)]
+    pub chunk_samples: usize,
+    #[pyo3(get)]
+    pub packet_time_base_den: i32,
+}
+
+#[pymethods]
+impl FlacDecoderConfigPy {
+    #[new]
+    #[pyo3(signature = (chunk_samples, packet_time_base_den=48000))]
+    fn new(chunk_samples: usize, packet_time_base_den: i32) -> PyResult<Self> {
+        if chunk_samples == 0 {
+            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+        }
+        if packet_time_base_den <= 0 {
+            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+        }
+        Ok(Self {
+            chunk_samples,
+            packet_time_base_den,
+        })
+    }
+}
+
 fn ascontig_cast_2d<'py>(
     py: Python<'py>,
     pcm: &Bound<'py, PyAny>,
@@ -364,6 +499,23 @@ fn ndarray_to_frame_planar<'py, T: Copy + Element>(
 
 fn packet_time_base_from_den(den: i32) -> Rational {
     Rational::new(1, den)
+}
+
+fn map_runner_err(e: crate::runner::error::RunnerError) -> PyErr {
+    match e {
+        crate::runner::error::RunnerError::Codec(ce) => map_codec_err(ce),
+        crate::runner::error::RunnerError::Io(ioe) => PyRuntimeError::new_err(ioe.to_string()),
+        crate::runner::error::RunnerError::InvalidData(msg) => PyValueError::new_err(msg),
+        crate::runner::error::RunnerError::InvalidState(msg) => PyRuntimeError::new_err(msg),
+    }
+}
+
+fn pyerr_to_runner_err(e: PyErr) -> RunnerError {
+    RunnerError::Codec(CodecError::Other(e.to_string()))
+}
+
+fn map_file_err(e: AudioFileError) -> PyErr {
+    PyRuntimeError::new_err(e.to_string())
 }
 
 fn push_encoder_from_fifo(enc: &mut dyn AudioEncoder, fifo: &mut AudioFifo, chunk_samples: usize, out_q: &mut VecDeque<Vec<u8>>, force: bool) -> Result<(), CodecError> {
@@ -497,6 +649,706 @@ fn frame_to_numpy<'py>(py: Python<'py>, frame: &crate::common::audio::audio::Aud
     }
 }
 
+fn node_kind_to_str(k: NodeBufferKind) -> &'static str {
+    match k {
+        NodeBufferKind::Pcm => "pcm",
+        NodeBufferKind::Packet => "packet",
+    }
+}
+
+fn node_kind_from_str(s: &str) -> Option<NodeBufferKind> {
+    match s.to_ascii_lowercase().as_str() {
+        "pcm" => Some(NodeBufferKind::Pcm),
+        "packet" => Some(NodeBufferKind::Packet),
+        _ => None,
+    }
+}
+
+#[pyclass(name = "Packet")]
+#[derive(Clone)]
+pub struct PacketPy {
+    #[pyo3(get)]
+    pub data: Vec<u8>,
+    #[pyo3(get)]
+    pub time_base_num: i32,
+    #[pyo3(get)]
+    pub time_base_den: i32,
+    #[pyo3(get)]
+    pub pts: Option<i64>,
+    #[pyo3(get)]
+    pub duration: Option<i64>,
+}
+
+#[pymethods]
+impl PacketPy {
+    #[new]
+    #[pyo3(signature = (data, time_base_num=1, time_base_den=48000, pts=None, duration=None))]
+    fn new(data: Vec<u8>, time_base_num: i32, time_base_den: i32, pts: Option<i64>, duration: Option<i64>) -> PyResult<Self> {
+        if time_base_den == 0 || time_base_num == 0 {
+            return Err(PyValueError::new_err("time_base_num/time_base_den 必须非 0"));
+        }
+        Ok(Self {
+            data,
+            time_base_num,
+            time_base_den,
+            pts,
+            duration,
+        })
+    }
+}
+
+impl PacketPy {
+    fn to_rs(&self) -> CodecPacket {
+        CodecPacket {
+            data: self.data.clone(),
+            time_base: Rational::new(self.time_base_num, self.time_base_den),
+            pts: self.pts,
+            dts: None,
+            duration: self.duration,
+            flags: PacketFlags::empty(),
+        }
+    }
+}
+
+/// Python 侧 NodeBuffer（pcm 或 packet），用于动态 pipeline/runner 交互。
+#[pyclass(name = "NodeBuffer")]
+pub struct NodeBufferPy {
+    inner: Option<NodeBuffer>,
+}
+
+#[pymethods]
+impl NodeBufferPy {
+    /// 构造 PCM buffer：numpy shape=(channels, samples)，且 format.planar 必须为 True。
+    #[staticmethod]
+    #[pyo3(signature = (pcm, format, pts=None))]
+    fn pcm(py: Python<'_>, pcm: &Bound<'_, PyAny>, format: AudioFormat, pts: Option<i64>) -> PyResult<Self> {
+        if !format.planar {
+            return Err(PyValueError::new_err("NodeBuffer.pcm: format.planar 必须为 True（numpy shape=(channels,samples)）"));
+        }
+        let rs_fmt = format.to_rs()?;
+        let st = format.sample_type_rs()?;
+        let dtype_name = match st {
+            SampleType::U8 => "uint8",
+            SampleType::I16 => "int16",
+            SampleType::I32 => "int32",
+            SampleType::I64 => "int64",
+            SampleType::F32 => "float32",
+            SampleType::F64 => "float64",
+        };
+        let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
+        let mut frame = match st {
+            SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, rs_fmt)?,
+            SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, rs_fmt)?,
+            SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, rs_fmt)?,
+            SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, rs_fmt)?,
+            SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, rs_fmt)?,
+            SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, rs_fmt)?,
+        };
+        if let Some(p) = pts {
+            frame.set_pts(Some(p));
+        }
+        Ok(Self {
+            inner: Some(NodeBuffer::Pcm(frame)),
+        })
+    }
+
+    /// 构造 Packet buffer。
+    #[staticmethod]
+    fn packet(pkt: PacketPy) -> PyResult<Self> {
+        Ok(Self {
+            inner: Some(NodeBuffer::Packet(pkt.to_rs())),
+        })
+    }
+
+    #[getter]
+    fn kind(&self) -> PyResult<&'static str> {
+        let Some(inner) = &self.inner else {
+            return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
+        };
+        Ok(node_kind_to_str(inner.kind()))
+    }
+
+    /// 如果是 pcm，返回 numpy ndarray（shape=(channels,samples)）；否则返回 None。
+    fn as_pcm(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let Some(inner) = &self.inner else {
+            return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
+        };
+        match inner {
+            NodeBuffer::Pcm(f) => Ok(Some(frame_to_numpy(py, f)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// 如果是 packet，返回 Packet；否则返回 None。
+    fn as_packet(&self) -> PyResult<Option<PacketPy>> {
+        let Some(inner) = &self.inner else {
+            return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
+        };
+        match inner {
+            NodeBuffer::Packet(p) => Ok(Some(PacketPy {
+                data: p.data.clone(),
+                time_base_num: p.time_base.num,
+                time_base_den: p.time_base.den,
+                pts: p.pts,
+                duration: p.duration,
+            })),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl NodeBufferPy {
+    fn take_inner(&mut self) -> PyResult<NodeBuffer> {
+        self.inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"))
+    }
+}
+
+#[pyclass(name = "DynNode")]
+pub struct DynNodePy {
+    inner: Option<Box<dyn DynNode>>,
+    in_kind: NodeBufferKind,
+    out_kind: NodeBufferKind,
+    name: &'static str,
+}
+
+impl DynNodePy {
+    fn new_boxed(node: Box<dyn DynNode>) -> Self {
+        let name = node.name();
+        let in_kind = node.input_kind();
+        let out_kind = node.output_kind();
+        Self {
+            inner: Some(node),
+            in_kind,
+            out_kind,
+            name,
+        }
+    }
+
+    fn take_inner(&mut self) -> PyResult<Box<dyn DynNode>> {
+        self.inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("DynNode 已被移动（不可再次使用）"))
+    }
+}
+
+#[pymethods]
+impl DynNodePy {
+    #[getter]
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    #[getter]
+    fn input_kind(&self) -> &'static str {
+        node_kind_to_str(self.in_kind)
+    }
+
+    #[getter]
+    fn output_kind(&self) -> &'static str {
+        node_kind_to_str(self.out_kind)
+    }
+}
+
+/// 让 `Box<dyn AudioEncoder>` 能接到运行时 pipeline：实现一个 DynNode 适配器。
+struct BoxedEncoderNode {
+    e: Box<dyn AudioEncoder>,
+}
+
+impl DynNode for BoxedEncoderNode {
+    fn name(&self) -> &'static str {
+        self.e.name()
+    }
+
+    fn input_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Pcm
+    }
+
+    fn output_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Packet
+    }
+
+    fn push(&mut self, input: Option<NodeBuffer>) -> crate::codec::error::CodecResult<()> {
+        match input {
+            None => self.e.send_frame(None),
+            Some(NodeBuffer::Pcm(f)) => self.e.send_frame(Some(&f as &dyn AudioFrameView)),
+            Some(_) => Err(CodecError::InvalidData("encoder expects PCM input")),
+        }
+    }
+
+    fn pull(&mut self) -> crate::codec::error::CodecResult<NodeBuffer> {
+        self.e.receive_packet().map(NodeBuffer::Packet)
+    }
+}
+
+/// 让 `Box<dyn AudioDecoder>` 能接到运行时 pipeline：实现一个 DynNode 适配器。
+struct BoxedDecoderNode {
+    d: Box<dyn AudioDecoder>,
+}
+
+impl DynNode for BoxedDecoderNode {
+    fn name(&self) -> &'static str {
+        self.d.name()
+    }
+
+    fn input_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Packet
+    }
+
+    fn output_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Pcm
+    }
+
+    fn push(&mut self, input: Option<NodeBuffer>) -> crate::codec::error::CodecResult<()> {
+        match input {
+            None => self.d.send_packet(None),
+            Some(NodeBuffer::Packet(p)) => self.d.send_packet(Some(p)),
+            Some(_) => Err(CodecError::InvalidData("decoder expects Packet input")),
+        }
+    }
+
+    fn pull(&mut self) -> crate::codec::error::CodecResult<NodeBuffer> {
+        self.d.receive_frame().map(NodeBuffer::Pcm)
+    }
+}
+
+/// 创建一个 identity 节点（pcm 或 packet）。
+#[pyfunction]
+fn make_identity_node(kind: &str) -> PyResult<DynNodePy> {
+    let k = node_kind_from_str(kind).ok_or_else(|| PyValueError::new_err("kind 仅支持: pcm/packet"))?;
+    Ok(DynNodePy::new_boxed(Box::new(IdentityNode::new(k))))
+}
+
+/// 创建一个 resample 节点（PCM->PCM）。
+///
+/// - `in_format/out_format`：必须完整匹配（包括 planar/sample_type/channels 等）
+/// - `out_chunk_samples`：可选，启用输出重分帧（例如 Opus 前常设 960@48k）
+/// - `pad_final`：flush 时是否补 0 到 `out_chunk_samples`
+#[pyfunction]
+#[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
+fn make_resample_node(in_format: AudioFormat, out_format: AudioFormat, out_chunk_samples: Option<usize>, pad_final: bool) -> PyResult<DynNodePy> {
+    let in_fmt = in_format.to_rs()?;
+    let out_fmt = out_format.to_rs()?;
+    let mut p = ResampleProcessor::new(in_fmt, out_fmt).map_err(map_codec_err)?;
+    p.set_output_chunker(out_chunk_samples, pad_final).map_err(map_codec_err)?;
+    Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
+}
+
+/// 创建一个 encoder 节点（PCM->Packet）。注意：此处的 config 里 `chunk_samples` 会被忽略（由上游分帧决定）。
+#[pyfunction]
+fn make_encoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) -> PyResult<DynNodePy> {
+    let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac/opus/flac"))?;
+    let enc: Box<dyn AudioEncoder> = match codec_norm {
+        "wav" => {
+            let cfg = config.extract::<WavEncoderConfigPy>()?;
+            let input_format = cfg.input_format.to_rs()?;
+            Box::new(WavEncoder::new(WavEncoderConfig { input_format }).map_err(map_codec_err)?)
+        }
+        "mp3" => {
+            let cfg = config.extract::<Mp3EncoderConfigPy>()?;
+            let input_format = cfg.input_format.to_rs()?;
+            Box::new(Mp3Encoder::new(Mp3EncoderConfig { input_format, bitrate: cfg.bitrate }).map_err(map_codec_err)?)
+        }
+        "aac" => {
+            let cfg = config.extract::<AacEncoderConfigPy>()?;
+            let input_format = cfg.input_format.to_rs()?;
+            Box::new(AacEncoder::new(AacEncoderConfig { input_format, bitrate: cfg.bitrate }).map_err(map_codec_err)?)
+        }
+        "opus" => {
+            let cfg = config.extract::<OpusEncoderConfigPy>()?;
+            let input_format = cfg.input_format.to_rs()?;
+            Box::new(OpusEncoder::new(OpusEncoderConfig { input_format, bitrate: cfg.bitrate }).map_err(map_codec_err)?)
+        }
+        "flac" => {
+            let cfg = config.extract::<FlacEncoderConfigPy>()?;
+            let input_format = cfg.input_format.to_rs()?;
+            Box::new(FlacEncoder::new(FlacEncoderConfig { input_format, compression_level: cfg.compression_level }).map_err(map_codec_err)?)
+        }
+        _ => return Err(PyValueError::new_err("unsupported codec")),
+    };
+    Ok(DynNodePy::new_boxed(Box::new(BoxedEncoderNode { e: enc })))
+}
+
+/// 创建一个 decoder 节点（Packet->PCM）。注意：此处的 config 里 `chunk_samples` 会被忽略（由下游取帧决定）。
+#[pyfunction]
+fn make_decoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) -> PyResult<DynNodePy> {
+    let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac/opus/flac"))?;
+    let dec: Box<dyn AudioDecoder> = match codec_norm {
+        "wav" => {
+            let cfg = config.extract::<WavDecoderConfigPy>()?;
+            let out_fmt = cfg.output_format.to_rs()?;
+            Box::new(WavDecoder::new(out_fmt).map_err(map_codec_err)?)
+        }
+        "mp3" => Box::new(Mp3Decoder::new().map_err(map_codec_err)?),
+        "aac" => Box::new(AacDecoder::new().map_err(map_codec_err)?),
+        "opus" => {
+            let cfg = config.extract::<OpusDecoderConfigPy>()?;
+            if let Some(ed) = cfg.extradata.as_ref() {
+                Box::new(OpusDecoder::new_with_extradata(ed).map_err(map_codec_err)?)
+            } else {
+                Box::new(OpusDecoder::new().map_err(map_codec_err)?)
+            }
+        }
+        "flac" => Box::new(FlacDecoder::new().map_err(map_codec_err)?),
+        _ => return Err(PyValueError::new_err("unsupported codec")),
+    };
+    Ok(DynNodePy::new_boxed(Box::new(BoxedDecoderNode { d: dec })))
+}
+
+/// Python 侧 AsyncDynPipeline（动态节点列表）。
+#[pyclass(name = "AsyncDynPipeline")]
+pub struct AsyncDynPipelinePy {
+    rt: Runtime,
+    p: AsyncDynPipeline,
+    in_kind: NodeBufferKind,
+    out_kind: NodeBufferKind,
+}
+
+#[pymethods]
+impl AsyncDynPipelinePy {
+    #[new]
+    fn new(py: Python<'_>, nodes: Vec<Py<DynNodePy>>) -> PyResult<Self> {
+        if nodes.is_empty() {
+            return Err(PyValueError::new_err("nodes 不能为空"));
+        }
+        // 取出节点（move）
+        let mut boxed: Vec<Box<dyn DynNode>> = Vec::with_capacity(nodes.len());
+        let mut in_kind: Option<NodeBufferKind> = None;
+        let mut out_kind: Option<NodeBufferKind> = None;
+        for (i, n) in nodes.into_iter().enumerate() {
+            let mut nb = n.bind(py).borrow_mut();
+            let node_in = nb.in_kind;
+            let node_out = nb.out_kind;
+            if i == 0 {
+                in_kind = Some(node_in);
+            }
+            out_kind = Some(node_out);
+            boxed.push(nb.take_inner()?);
+        }
+
+        let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
+        let _guard = rt.enter();
+        let p = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
+
+        Ok(Self {
+            rt,
+            p,
+            in_kind: in_kind.unwrap(),
+            out_kind: out_kind.unwrap(),
+        })
+    }
+
+    #[getter]
+    fn input_kind(&self) -> &'static str {
+        node_kind_to_str(self.in_kind)
+    }
+
+    #[getter]
+    fn output_kind(&self) -> &'static str {
+        node_kind_to_str(self.out_kind)
+    }
+
+    fn push(&mut self, py: Python<'_>, buf: Py<NodeBufferPy>) -> PyResult<()> {
+        let mut b = buf.bind(py).borrow_mut();
+        let inner = b.take_inner()?;
+        if inner.kind() != self.in_kind {
+            return Err(PyValueError::new_err("NodeBuffer kind 与 pipeline input_kind 不匹配"));
+        }
+        self.p.push_frame(inner).map_err(map_codec_err)
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.p.flush().map_err(map_codec_err)
+    }
+
+    fn try_get(&mut self) -> PyResult<Option<NodeBufferPy>> {
+        match self.p.try_get_frame() {
+            Ok(v) => Ok(Some(NodeBufferPy { inner: Some(v) })),
+            Err(CodecError::Again) => Ok(None),
+            Err(CodecError::Eof) => Ok(None),
+            Err(e) => Err(map_codec_err(e)),
+        }
+    }
+
+    /// 阻塞等待一个输出（直到拿到一帧或 EOF）。
+    fn get(&mut self, py: Python<'_>) -> PyResult<Option<NodeBufferPy>> {
+        // Python 侧这是同步阻塞调用：释放 GIL，避免卡住其它 Python 线程
+        let fut = self.p.get_frame();
+        let res = py.allow_threads(|| {
+            let _guard = self.rt.enter();
+            self.rt.block_on(fut)
+        });
+        match res {
+            Ok(v) => Ok(Some(NodeBufferPy { inner: Some(v) })),
+            Err(CodecError::Eof) => Ok(None),
+            Err(e) => Err(map_codec_err(e)),
+        }
+    }
+}
+
+/// 让 Python 对象实现 AudioSource：要求提供 `pull() -> Optional[NodeBuffer]`。
+struct PyCallbackSource {
+    obj: Py<PyAny>,
+}
+
+impl AudioSource for PyCallbackSource {
+    type Out = NodeBuffer;
+
+    fn name(&self) -> &'static str {
+        "py-callback-source"
+    }
+
+    fn pull(&mut self) -> RunnerResult<Option<Self::Out>> {
+        Python::with_gil(|py| {
+            let o = self.obj.bind(py);
+            let ret = o.call_method0("pull").map_err(pyerr_to_runner_err)?;
+            if ret.is_none() {
+                return Ok(None);
+            }
+            let nb_py: Py<NodeBufferPy> = ret.extract().map_err(|_| {
+                RunnerError::InvalidData("Python source.pull() 必须返回 NodeBuffer 或 None")
+            })?;
+            let mut nb = nb_py.bind(py).borrow_mut();
+            let inner = nb.take_inner().map_err(|e| pyerr_to_runner_err(e))?;
+            Ok(Some(inner))
+        })
+    }
+}
+
+/// 让 Python 对象实现 AudioSink：要求提供 `push(buf: NodeBuffer)` + `finalize()`。
+struct PyCallbackSink {
+    obj: Py<PyAny>,
+}
+
+impl AudioSink for PyCallbackSink {
+    type In = NodeBuffer;
+
+    fn name(&self) -> &'static str {
+        "py-callback-sink"
+    }
+
+    fn push(&mut self, input: Self::In) -> RunnerResult<()> {
+        Python::with_gil(|py| {
+            let o = self.obj.bind(py);
+            let nb = Py::new(py, NodeBufferPy { inner: Some(input) }).map_err(pyerr_to_runner_err)?;
+            o.call_method1("push", (nb,)).map_err(pyerr_to_runner_err)?;
+            Ok(())
+        })
+    }
+
+    fn finalize(&mut self) -> RunnerResult<()> {
+        Python::with_gil(|py| {
+            let o = self.obj.bind(py);
+            o.call_method0("finalize").map_err(pyerr_to_runner_err)?;
+            Ok(())
+        })
+    }
+}
+
+/// Python 侧 AsyncDynRunner（动态节点列表 + Python Source/Sink）。
+///
+/// - `source` 需要实现：`pull() -> Optional[NodeBuffer]`
+/// - `sink` 需要实现：`push(buf: NodeBuffer)` / `finalize()`
+#[pyclass(name = "AsyncDynRunner")]
+pub struct AsyncDynRunnerPy {
+    rt: Runtime,
+    runner: AutoRunner<AsyncDynPipeline, PyCallbackSource, PyCallbackSink>,
+}
+
+#[pymethods]
+impl AsyncDynRunnerPy {
+    #[new]
+    fn new(py: Python<'_>, source: Py<PyAny>, nodes: Vec<Py<DynNodePy>>, sink: Py<PyAny>) -> PyResult<Self> {
+        if nodes.is_empty() {
+            return Err(PyValueError::new_err("nodes 不能为空"));
+        }
+        // move nodes
+        let mut boxed: Vec<Box<dyn DynNode>> = Vec::with_capacity(nodes.len());
+        for n in nodes.into_iter() {
+            let mut nb = n.bind(py).borrow_mut();
+            boxed.push(nb.take_inner()?);
+        }
+
+        let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
+        let _guard = rt.enter();
+        let pipeline = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
+        let runner = AutoRunner::new(
+            PyCallbackSource { obj: source },
+            pipeline,
+            PyCallbackSink { obj: sink },
+        );
+        Ok(Self { rt, runner })
+    }
+
+    /// 同步阻塞执行到完成（释放 GIL）。
+    fn run(&mut self, py: Python<'_>) -> PyResult<()> {
+        let res = py.allow_threads(|| {
+            let _guard = self.rt.enter();
+            self.rt.block_on(self.runner.execute())
+        });
+        res.map_err(map_runner_err)
+    }
+}
+
+fn file_format_from_str(s: &str) -> Option<&'static str> {
+    match s.to_ascii_lowercase().as_str() {
+        "wav" => Some("wav"),
+        "mp3" => Some("mp3"),
+        "aac" | "aac_adts" | "adts" => Some("aac_adts"),
+        "flac" => Some("flac"),
+        "opus" | "opus_ogg" | "ogg_opus" => Some("opus_ogg"),
+        _ => None,
+    }
+}
+
+/// Python 侧 AudioFileReader：可作为 `AsyncDynRunner` 的 source（实现 pull()）。
+#[pyclass(name = "AudioFileReader", unsendable)]
+pub struct AudioFileReaderPy {
+    r: RsAudioFileReader,
+}
+
+#[pymethods]
+impl AudioFileReaderPy {
+    #[new]
+    fn new(path: String, format: &str) -> PyResult<Self> {
+        let fmt = file_format_from_str(format).ok_or_else(|| PyValueError::new_err("format 仅支持: wav/mp3/aac_adts/flac/opus_ogg"))?;
+        let cfg = match fmt {
+            "wav" => AudioFileReadConfig::Wav,
+            "mp3" => AudioFileReadConfig::Mp3,
+            "aac_adts" => AudioFileReadConfig::AacAdts,
+            "flac" => AudioFileReadConfig::Flac,
+            "opus_ogg" => AudioFileReadConfig::OpusOgg,
+            _ => return Err(PyValueError::new_err("unsupported format")),
+        };
+        let r = RsAudioFileReader::open(path, cfg).map_err(map_file_err)?;
+        Ok(Self { r })
+    }
+
+    /// 读取下一帧 PCM（numpy），EOF 返回 None。
+    fn next_frame(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        match AudioReader::next_frame(&mut self.r).map_err(map_file_err)? {
+            Some(f) => Ok(Some(frame_to_numpy(py, &f)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `AsyncDynRunner` 兼容：pull() -> Optional[NodeBuffer]（输出为 PCM）。
+    fn pull(&mut self, _py: Python<'_>) -> PyResult<Option<NodeBufferPy>> {
+        match AudioReader::next_frame(&mut self.r).map_err(map_file_err)? {
+            Some(f) => Ok(Some(NodeBufferPy { inner: Some(NodeBuffer::Pcm(f)) })),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Python 侧 AudioFileWriter：可作为 `AsyncDynRunner` 的 sink（实现 push/finalize）。
+#[pyclass(name = "AudioFileWriter", unsendable)]
+pub struct AudioFileWriterPy {
+    w: RsAudioFileWriter,
+    input_format: RsAudioFormat,
+    sample_type: SampleType,
+}
+
+#[pymethods]
+impl AudioFileWriterPy {
+    /// 创建文件写端：
+    ///
+    /// - wav: 写 PCM16LE wav（内部可接受 f32/i16 等并转换）
+    /// - mp3/aac/flac/opus_ogg: 依赖 FFmpeg backend（feature=ffmpeg）
+    #[new]
+    #[pyo3(signature = (path, format, input_format, bitrate=None, compression_level=None))]
+    fn new(path: String, format: &str, input_format: AudioFormat, bitrate: Option<u32>, compression_level: Option<i32>) -> PyResult<Self> {
+        let fmt = file_format_from_str(format).ok_or_else(|| PyValueError::new_err("format 仅支持: wav/mp3/aac_adts/flac/opus_ogg"))?;
+        let rs_fmt = input_format.to_rs()?;
+        let st = input_format.sample_type_rs()?;
+
+        let cfg = match fmt {
+            "wav" => {
+                let ch = rs_fmt.channels();
+                AudioFileWriteConfig::Wav(rs_file::WavWriterConfig::pcm16le(rs_fmt.sample_rate, ch))
+            }
+            "mp3" => {
+                let mut c = rs_file::Mp3WriterConfig::new(rs_fmt);
+                if let Some(br) = bitrate {
+                    c.encoder.bitrate = Some(br);
+                }
+                AudioFileWriteConfig::Mp3(c)
+            }
+            "aac_adts" => {
+                let c = AacEncoderConfig { input_format: rs_fmt, bitrate };
+                AudioFileWriteConfig::AacAdts(c)
+            }
+            "flac" => {
+                let c = rs_file::FlacWriterConfig { input_format: rs_fmt, compression_level };
+                AudioFileWriteConfig::Flac(c)
+            }
+            "opus_ogg" => {
+                // Opus Ogg writer 目前要求：48k + packed/interleaved
+                if rs_fmt.sample_rate != 48_000 {
+                    return Err(PyValueError::new_err("opus_ogg writer 需要 48kHz input_format（请先重采样）"));
+                }
+                if rs_fmt.sample_format.is_planar() {
+                    return Err(PyValueError::new_err("opus_ogg writer 需要 interleaved samples（input_format.planar=False）"));
+                }
+                let c = OpusEncoderConfig { input_format: rs_fmt, bitrate };
+                AudioFileWriteConfig::OpusOgg(c)
+            }
+            _ => return Err(PyValueError::new_err("unsupported format")),
+        };
+
+        let w = RsAudioFileWriter::create(path, cfg).map_err(map_file_err)?;
+        Ok(Self {
+            w,
+            input_format: rs_fmt,
+            sample_type: st,
+        })
+    }
+
+    /// 直接写入一帧 PCM（numpy shape=(channels,samples)，要求 input_format.planar=True）。
+    fn write_pcm(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>) -> PyResult<()> {
+        if !self.input_format.is_planar() {
+            return Err(PyValueError::new_err("write_pcm 仅支持 input_format.planar=True（numpy shape=(channels,samples)）"));
+        }
+        let dtype_name = match self.sample_type {
+            SampleType::U8 => "uint8",
+            SampleType::I16 => "int16",
+            SampleType::I32 => "int32",
+            SampleType::I64 => "int64",
+            SampleType::F32 => "float32",
+            SampleType::F64 => "float64",
+        };
+        let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
+        let frame = match self.sample_type {
+            SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
+            SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
+            SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
+            SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
+            SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
+            SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+        };
+        AudioWriter::write_frame(&mut self.w, &frame as &dyn AudioFrameView).map_err(map_file_err)?;
+        Ok(())
+    }
+
+    /// `AsyncDynRunner` 兼容：push(buf: NodeBuffer)（仅支持 PCM）。
+    fn push(&mut self, py: Python<'_>, buf: Py<NodeBufferPy>) -> PyResult<()> {
+        let mut b = buf.bind(py).borrow_mut();
+        let inner = b.take_inner()?;
+        match inner {
+            NodeBuffer::Pcm(f) => {
+                AudioWriter::write_frame(&mut self.w, &f as &dyn AudioFrameView).map_err(map_file_err)?;
+                Ok(())
+            }
+            NodeBuffer::Packet(_) => Err(PyValueError::new_err("AudioFileWriter.push 仅支持 PCM（NodeBuffer kind=pcm）")),
+        }
+    }
+
+    fn finalize(&mut self) -> PyResult<()> {
+        AudioWriter::finalize(&mut self.w).map_err(map_file_err)
+    }
+}
+
 #[pyclass]
 pub struct Encoder {
     codec: String,
@@ -512,11 +1364,11 @@ pub struct Encoder {
 #[pymethods]
 impl Encoder {
     /// 创建编码器：
-    /// - codec: "wav" | "mp3" | "aac"
+    /// - codec: "wav" | "mp3" | "aac" | "opus" | "flac"
     /// - config: 对应的 *EncoderConfigPy
     #[new]
     fn new(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac"))?;
+        let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac/opus/flac"))?;
 
         match codec_norm {
             "wav" => {
@@ -578,6 +1430,58 @@ impl Encoder {
                 let enc = Box::new(AacEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
                 Ok(Self {
                     codec: "aac".into(),
+                    chunk_samples: cfg.chunk_samples,
+                    input_format,
+                    sample_type,
+                    fifo,
+                    enc,
+                    out_q: VecDeque::new(),
+                    sent_eof: false,
+                })
+            }
+            "opus" => {
+                let cfg = config.extract::<OpusEncoderConfigPy>()?;
+                if !cfg.input_format.planar {
+                    return Err(PyValueError::new_err(
+                        "Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True",
+                    ));
+                }
+                let input_format = cfg.input_format.to_rs()?;
+                let sample_type = cfg.input_format.sample_type_rs()?;
+                let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
+                let enc_cfg = OpusEncoderConfig {
+                    input_format,
+                    bitrate: cfg.bitrate,
+                };
+                let enc = Box::new(OpusEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
+                Ok(Self {
+                    codec: "opus".into(),
+                    chunk_samples: cfg.chunk_samples,
+                    input_format,
+                    sample_type,
+                    fifo,
+                    enc,
+                    out_q: VecDeque::new(),
+                    sent_eof: false,
+                })
+            }
+            "flac" => {
+                let cfg = config.extract::<FlacEncoderConfigPy>()?;
+                if !cfg.input_format.planar {
+                    return Err(PyValueError::new_err(
+                        "Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True",
+                    ));
+                }
+                let input_format = cfg.input_format.to_rs()?;
+                let sample_type = cfg.input_format.sample_type_rs()?;
+                let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
+                let enc_cfg = FlacEncoderConfig {
+                    input_format,
+                    compression_level: cfg.compression_level,
+                };
+                let enc = Box::new(FlacEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
+                Ok(Self {
+                    codec: "flac".into(),
                     chunk_samples: cfg.chunk_samples,
                     input_format,
                     sample_type,
@@ -703,11 +1607,11 @@ pub struct Decoder {
 #[pymethods]
 impl Decoder {
     /// 创建解码器：
-    /// - codec: "wav" | "mp3" | "aac"
+    /// - codec: "wav" | "mp3" | "aac" | "opus" | "flac"
     /// - config: 对应的 *DecoderConfigPy
     #[new]
     fn new(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac"))?;
+        let codec_norm = codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac/opus/flac"))?;
 
         match codec_norm {
             "wav" => {
@@ -751,6 +1655,34 @@ impl Decoder {
                 let dec = Box::new(AacDecoder::new().map_err(map_codec_err)?) as Box<dyn AudioDecoder>;
                 Ok(Self {
                     codec: "aac".into(),
+                    chunk_samples: cfg.chunk_samples,
+                    packet_time_base,
+                    dec,
+                    fifo: None,
+                })
+            }
+            "opus" => {
+                let cfg = config.extract::<OpusDecoderConfigPy>()?;
+                let packet_time_base = packet_time_base_from_den(cfg.packet_time_base_den);
+                let dec: Box<dyn AudioDecoder> = if let Some(ed) = cfg.extradata.as_ref() {
+                    Box::new(OpusDecoder::new_with_extradata(ed).map_err(map_codec_err)?)
+                } else {
+                    Box::new(OpusDecoder::new().map_err(map_codec_err)?)
+                };
+                Ok(Self {
+                    codec: "opus".into(),
+                    chunk_samples: cfg.chunk_samples,
+                    packet_time_base,
+                    dec,
+                    fifo: None,
+                })
+            }
+            "flac" => {
+                let cfg = config.extract::<FlacDecoderConfigPy>()?;
+                let packet_time_base = packet_time_base_from_den(cfg.packet_time_base_den);
+                let dec = Box::new(FlacDecoder::new().map_err(map_codec_err)?) as Box<dyn AudioDecoder>;
+                Ok(Self {
+                    codec: "flac".into(),
                     chunk_samples: cfg.chunk_samples,
                     packet_time_base,
                     dec,
@@ -877,8 +1809,23 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AacEncoderConfigPy>()?;
     m.add_class::<Mp3DecoderConfigPy>()?;
     m.add_class::<AacDecoderConfigPy>()?;
+    m.add_class::<OpusEncoderConfigPy>()?;
+    m.add_class::<FlacEncoderConfigPy>()?;
+    m.add_class::<OpusDecoderConfigPy>()?;
+    m.add_class::<FlacDecoderConfigPy>()?;
     m.add_class::<Encoder>()?;
     m.add_class::<Decoder>()?;
+    m.add_class::<PacketPy>()?;
+    m.add_class::<NodeBufferPy>()?;
+    m.add_class::<DynNodePy>()?;
+    m.add_class::<AsyncDynPipelinePy>()?;
+    m.add_class::<AsyncDynRunnerPy>()?;
+    m.add_class::<AudioFileReaderPy>()?;
+    m.add_class::<AudioFileWriterPy>()?;
+    m.add_function(wrap_pyfunction!(make_identity_node, m)?)?;
+    m.add_function(wrap_pyfunction!(make_resample_node, m)?)?;
+    m.add_function(wrap_pyfunction!(make_encoder_node, m)?)?;
+    m.add_function(wrap_pyfunction!(make_decoder_node, m)?)?;
     Ok(())
 }
 
