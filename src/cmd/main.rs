@@ -40,13 +40,16 @@ fn ext_lower(path: &str) -> Option<String> {
 #[cfg(not(feature = "ffmpeg"))]
 async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
-    use audiostream::common::io::{AudioReader, AudioWriter};
-    use audiostream::common::io::file::WavWriterConfig;
+    use audiostream::common::io::AudioReader;
     use audiostream::common::audio::audio::AudioFrameView;
-    use audiostream::codec::error::CodecError;
+    use audiostream::common::io::file::WavWriterConfig;
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::IdentityNode;
-    use audiostream::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
+    use audiostream::pipeline::node::node_interface::NodeBufferKind;
+    use audiostream::runner::async_runner_interface::AsyncRunner;
+    use audiostream::runner::audio_sink::PcmSink;
+    use audiostream::runner::audio_source::{PcmSource, PrependSource};
+    use audiostream::runner::auto_runner::AutoRunner;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -61,43 +64,16 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
 
     // 统一走异步 pipeline：这里无需处理时，用 identity 节点零拷贝搬运。
     let nodes = vec![Box::new(IdentityNode::new(NodeBufferKind::Pcm)) as Box<dyn audiostream::pipeline::node::dynamic_node_interface::DynNode>];
-    let mut p = AsyncDynPipeline::new(nodes).map_err(|e| format!("{e:?}"))?;
+    let p = AsyncDynPipeline::new(nodes).map_err(|e| format!("{e:?}"))?;
 
-    // first
-    p.push_frame(NodeBuffer::Pcm(first)).map_err(|e| format!("{e:?}"))?;
-    loop {
-        match p.try_get_frame() {
-            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
-            Ok(_) => return Err("unexpected node buffer kind".into()),
-            Err(CodecError::Again) => break,
-            Err(e) => return Err(format!("{e:?}")),
-        }
-    }
-
-    // rest
-    while let Some(f) = r.next_frame().map_err(|e| format!("{e:?}"))? {
-        p.push_frame(NodeBuffer::Pcm(f)).map_err(|e| format!("{e:?}"))?;
-        loop {
-            match p.try_get_frame() {
-                Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
-                Ok(_) => return Err("unexpected node buffer kind".into()),
-                Err(CodecError::Again) => break,
-                Err(e) => return Err(format!("{e:?}")),
-            }
-        }
-    }
-
-    // flush
-    p.flush().map_err(|e| format!("{e:?}"))?;
-    loop {
-        match p.get_frame().await {
-            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView).map_err(|e| format!("{e:?}"))?,
-            Ok(_) => return Err("unexpected node buffer kind".into()),
-            Err(CodecError::Eof) => break,
-            Err(e) => return Err(format!("{e:?}")),
-        }
-    }
-    w.finalize().map_err(|e| format!("{e:?}"))?;
+    // 先读一帧用于拿格式：用 PrependSource 把它“塞回”source，再由 runner 统一驱动。
+    let source = PcmSource::new(PrependSource::new(r, vec![first]));
+    let sink = PcmSink::new(w);
+    let mut runner = AutoRunner::new(source, p, sink);
+    runner
+        .execute()
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     Ok(())
 }
 
@@ -106,17 +82,19 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
     use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
     use audiostream::codec::processor::resample_processor::ResampleProcessor;
-    use audiostream::codec::error::CodecError;
     use audiostream::common::io::file::{
         AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
     };
-    use audiostream::common::io::{AudioReader, AudioWriter};
+    use audiostream::common::io::AudioReader;
     use audiostream::common::io::file::{Mp3WriterConfig, WavWriterConfig};
-    use audiostream::common::audio::audio::AudioFrameView;
-    use audiostream::common::audio::audio::{AudioFormat, SampleFormat};
+    use audiostream::common::audio::audio::{AudioFormat, AudioFrameView, SampleFormat};
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::{IdentityNode, ProcessorNode, DynNode};
-    use audiostream::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
+    use audiostream::pipeline::node::node_interface::NodeBufferKind;
+    use audiostream::runner::async_runner_interface::AsyncRunner;
+    use audiostream::runner::audio_sink::PcmSink;
+    use audiostream::runner::audio_source::{PcmSource, PrependSource};
+    use audiostream::runner::auto_runner::AutoRunner;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -173,7 +151,7 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
         "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) }),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
-    let mut w = AudioFileWriter::create(output, out_cfg)?;
+    let w = AudioFileWriter::create(output, out_cfg)?;
 
     let mut nodes: Vec<Box<dyn DynNode>> = Vec::new();
     if let Some(proc) = resampler {
@@ -181,43 +159,11 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
     } else {
         nodes.push(Box::new(IdentityNode::new(NodeBufferKind::Pcm)));
     }
-    let mut p = AsyncDynPipeline::new(nodes)?;
+    let p = AsyncDynPipeline::new(nodes)?;
 
-    // first
-    p.push_frame(NodeBuffer::Pcm(first))?;
-    loop {
-        match p.try_get_frame() {
-            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
-            Ok(_) => return Err("unexpected node buffer kind".into()),
-            Err(CodecError::Again) => break,
-            Err(e) => return Err(Box::new(e)),
-        }
-    }
-
-    // rest
-    while let Some(f) = r.next_frame()? {
-        p.push_frame(NodeBuffer::Pcm(f))?;
-        loop {
-            match p.try_get_frame() {
-                Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
-                Ok(_) => return Err("unexpected node buffer kind".into()),
-                Err(CodecError::Again) => break,
-                Err(e) => return Err(Box::new(e)),
-            }
-        }
-    }
-
-    // flush pipeline
-    p.flush()?;
-    loop {
-        match p.get_frame().await {
-            Ok(NodeBuffer::Pcm(of)) => w.write_frame(&of as &dyn AudioFrameView)?,
-            Ok(_) => return Err("unexpected node buffer kind".into()),
-            Err(CodecError::Eof) => break,
-            Err(e) => return Err(Box::new(e)),
-        }
-    }
-
-    w.finalize()?;
+    let source = PcmSource::new(PrependSource::new(r, vec![first]));
+    let sink = PcmSink::new(w);
+    let mut runner = AutoRunner::new(source, p, sink);
+    runner.execute().await.map_err(|e| format!("{e}"))?;
     Ok(())
 }
