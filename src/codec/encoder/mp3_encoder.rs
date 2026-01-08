@@ -78,11 +78,11 @@ impl AudioEncoder for Mp3Encoder {
 mod ffmpeg_backend {
     use super::*;
     use core::ptr;
-    use std::ffi::{CStr, CString};
+    use std::ffi::CString;
 
     extern crate ffmpeg_sys_next as ff;
     use crate::common::audio::audio::{Rational, SampleFormat};
-    use libc;
+    use crate::common::ffmpeg_util::map_ff_err;
 
     pub struct Mp3Encoder {
         cfg: Mp3EncoderConfig,
@@ -94,33 +94,6 @@ mod ffmpeg_backend {
 
     fn tb_from_avr(tb: ff::AVRational) -> Rational {
         Rational::new(tb.num, tb.den)
-    }
-
-    fn ff_err_to_string(err: i32) -> String {
-        let mut buf = [0u8; 256];
-        unsafe {
-            ff::av_strerror(err, buf.as_mut_ptr() as *mut i8, buf.len());
-        }
-        let cstr = match CStr::from_bytes_until_nul(&buf) {
-            Ok(s) => s,
-            Err(_) => return format!("ffmpeg error {err}"),
-        };
-        cstr.to_string_lossy().into_owned()
-    }
-
-    fn map_ff_err(err: i32) -> CodecError {
-        #[cfg(unix)]
-        let is_again = err == ff::AVERROR(libc::EAGAIN) || err == ff::AVERROR(libc::EWOULDBLOCK);
-        #[cfg(windows)]
-        let is_again = err == ff::AVERROR(libc::WSAEWOULDBLOCK);
-
-        if is_again {
-            return CodecError::Again;
-        }
-        if err == ff::AVERROR_EOF {
-            return CodecError::Eof;
-        }
-        CodecError::Other(ff_err_to_string(err))
     }
 
     fn map_sample_format(sf: SampleFormat) -> CodecResult<ff::AVSampleFormat> {

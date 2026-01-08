@@ -21,7 +21,7 @@ js-sys = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 
 [features]
-default = []
+default = ["ffmpeg"]
 ffmpeg = ["dep:ffmpeg-sys-next"]
 python = ["dep:pyo3", "dep:numpy"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]

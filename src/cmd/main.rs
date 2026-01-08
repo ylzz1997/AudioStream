@@ -25,7 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     eprintln!("用法：audiostream <in> <out>");
-    eprintln!("支持：.wav  .mp3  .adts/.aac  .opus(Ogg Opus) ");
+    eprintln!("支持：.wav  .mp3  .adts/.aac  .opus(Ogg Opus)  .flac");
     eprintln!("例如：cargo run --features ffmpeg -- input.wav out.mp3");
     Ok(())
 }
@@ -127,6 +127,7 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
         "mp3" => AudioFileReadConfig::Mp3,
         "aac" | "adts" => AudioFileReadConfig::AacAdts,
         "opus" => AudioFileReadConfig::OpusOgg,
+        "flac" => AudioFileReadConfig::Flac,
         _ => return Err(format!("unsupported input extension: {in_ext}").into()),
     };
     let mut r = AudioFileReader::open(input, in_cfg)?;
@@ -157,13 +158,11 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
         "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())),
         "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),
         "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) }),
+        "flac" => AudioFileWriteConfig::Flac(audiostream::common::io::file::FlacWriterConfig::new(fmt)),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
     let mut w = AudioFileWriter::create(output, out_cfg)?;
 
-    // 构建异步 pipeline：
-    // - opus：插入 ResampleProcessor
-    // - 其它：走 identity（零拷贝搬运），但依旧统一遵循 pipeline 驱动逻辑
     let mut nodes: Vec<Box<dyn DynNode>> = Vec::new();
     if let Some(proc) = resampler {
         nodes.push(Box::new(ProcessorNode::new(proc)));

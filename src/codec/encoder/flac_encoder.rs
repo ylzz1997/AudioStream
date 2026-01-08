@@ -1,65 +1,45 @@
-//! Opus 编码器实现（流式 send_frame/receive_packet）。
-//!
-//! 说明：
-//! - Opus 生态里通常以 **48kHz** 作为内部时钟（packet duration/时间戳也常按 48kHz samples 计）。
-//! - 因此本 `OpusEncoder` **仍然要求输入为 48kHz**（库内部目前不在 encoder 里做隐式重采样）。
-
 use crate::codec::encoder::encoder_interface::AudioEncoder;
 use crate::codec::error::{CodecError, CodecResult};
 use crate::codec::packet::CodecPacket;
-use crate::common::audio::audio::{AudioFormat, AudioFrameView, Rational};
+use crate::common::audio::audio::{AudioFormat, AudioFrameView};
 
-/// Opus 编码配置（最小集合）。
+/// FLAC 编码器（FFmpeg backend 为主）。
+///
+/// - `not(feature="ffmpeg")`：占位实现
+/// - `feature="ffmpeg"`：libavcodec（flac encoder）
 #[derive(Clone, Debug)]
-pub struct OpusEncoderConfig {
+pub struct FlacEncoderConfig {
     pub input_format: AudioFormat,
-    pub bitrate: Option<u32>,
+    /// FLAC 压缩等级（FFmpeg 通常是 0..=12；越大越慢/更小）。
+    pub compression_level: Option<i32>,
 }
 
-impl OpusEncoderConfig {
+impl FlacEncoderConfig {
     pub fn new(input_format: AudioFormat) -> Self {
         Self {
             input_format,
-            bitrate: None,
+            compression_level: None,
         }
     }
 }
 
-/// Opus 编码器。
-///
-/// - `not(feature="ffmpeg")`：占位实现（无外部依赖）
-/// - `feature="ffmpeg"`：FFmpeg backend（libavcodec，优先 libopus）
 #[cfg(not(feature = "ffmpeg"))]
-pub struct OpusEncoder {
-    cfg: OpusEncoderConfig,
+pub struct FlacEncoder {
+    cfg: FlacEncoderConfig,
     flushed: bool,
 }
 
 #[cfg(not(feature = "ffmpeg"))]
-impl OpusEncoder {
-    pub fn new(cfg: OpusEncoderConfig) -> CodecResult<Self> {
-        if cfg.input_format.sample_rate != 48_000 {
-            return Err(CodecError::InvalidData(
-                "Opus encoder requires 48kHz input (no resample layer yet)",
-            ));
-        }
+impl FlacEncoder {
+    pub fn new(cfg: FlacEncoderConfig) -> CodecResult<Self> {
         Ok(Self { cfg, flushed: false })
-    }
-
-    /// 读取 encoder 的 extradata（FFmpeg backend 下通常是 OpusHead；占位实现为 None）。
-    pub fn extradata(&self) -> Option<Vec<u8>> {
-        None
-    }
-
-    fn unsupported() -> CodecError {
-        CodecError::Unsupported("Opus encoder backend not linked (enable FFmpeg backend in your environment)")
     }
 }
 
 #[cfg(not(feature = "ffmpeg"))]
-impl AudioEncoder for OpusEncoder {
+impl AudioEncoder for FlacEncoder {
     fn name(&self) -> &'static str {
-        "opus(placeholder)"
+        "flac(placeholder)"
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
@@ -67,12 +47,8 @@ impl AudioEncoder for OpusEncoder {
     }
 
     fn preferred_frame_samples(&self) -> Option<usize> {
-        // Opus 常见 20ms = 960 samples@48k（每声道）
-        Some(960)
-    }
-
-    fn lookahead_samples(&self) -> usize {
-        0
+        // FLAC 可变帧长；这里不给强约束
+        None
     }
 
     fn send_frame(&mut self, frame: Option<&dyn AudioFrameView>) -> CodecResult<()> {
@@ -83,7 +59,7 @@ impl AudioEncoder for OpusEncoder {
             self.flushed = true;
             return Ok(());
         }
-        Err(Self::unsupported())
+        Err(CodecError::Unsupported("FLAC encoder requires ffmpeg feature"))
     }
 
     fn receive_packet(&mut self) -> CodecResult<CodecPacket> {
@@ -99,11 +75,6 @@ impl AudioEncoder for OpusEncoder {
     }
 }
 
-pub fn default_opus_packet_time_base() -> Rational {
-    // Opus 标准时间基一般按 48kHz 计（samples）。
-    Rational::new(1, 48_000)
-}
-
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg_backend {
     use super::*;
@@ -111,18 +82,16 @@ mod ffmpeg_backend {
     use std::ffi::CString;
 
     extern crate ffmpeg_sys_next as ff;
-    use crate::common::audio::audio::SampleFormat;
+    use crate::common::audio::audio::{Rational, SampleFormat};
     use crate::common::ffmpeg_util::map_ff_err;
 
-    /// Opus 编码器（FFmpeg backend）。
-    pub struct OpusEncoder {
-        cfg: OpusEncoderConfig,
+    pub struct FlacEncoder {
+        cfg: FlacEncoderConfig,
         flushed: bool,
         ctx: *mut ff::AVCodecContext,
-        frame_samples: Option<usize>,
     }
 
-    unsafe impl Send for OpusEncoder {}
+    unsafe impl Send for FlacEncoder {}
 
     fn tb_from_avr(tb: ff::AVRational) -> Rational {
         Rational::new(tb.num, tb.den)
@@ -147,30 +116,14 @@ mod ffmpeg_backend {
         Ok(av)
     }
 
-    fn find_encoder_by_name(names: &[&str]) -> Result<*const ff::AVCodec, CodecError> {
-        unsafe {
-            for &n in names {
-                let name = CString::new(n).map_err(|_| CodecError::InvalidData("codec name contains NUL"))?;
-                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
-                if !codec.is_null() {
-                    return Ok(codec);
-                }
-            }
-        }
-        Err(CodecError::Unsupported("FFmpeg Opus encoder not found (try libopus)"))
-    }
-
-    impl OpusEncoder {
-        pub fn new(cfg: OpusEncoderConfig) -> CodecResult<Self> {
-            if cfg.input_format.sample_rate != 48_000 {
-                return Err(CodecError::InvalidData(
-                    "Opus encoder requires 48kHz input (no resample layer yet)",
-                ));
-            }
-
+    impl FlacEncoder {
+        pub fn new(cfg: FlacEncoderConfig) -> CodecResult<Self> {
             unsafe {
-                // 优先 libopus（常见），其次尝试 native opus encoder（如果存在）。
-                let codec = find_encoder_by_name(&["libopus", "opus"])?;
+                let name = CString::new("flac").map_err(|_| CodecError::InvalidData("codec name contains NUL"))?;
+                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
+                if codec.is_null() {
+                    return Err(CodecError::Unsupported("FFmpeg FLAC encoder not found"));
+                }
 
                 let ctx = ff::avcodec_alloc_context3(codec);
                 if ctx.is_null() {
@@ -191,12 +144,13 @@ mod ffmpeg_backend {
                 }
 
                 (*ctx).sample_fmt = map_sample_format(cfg.input_format.sample_format)?;
-                if let Some(br) = cfg.bitrate {
-                    (*ctx).bit_rate = br as i64;
+                (*ctx).time_base = ff::AVRational {
+                    num: 1,
+                    den: (*ctx).sample_rate,
+                };
+                if let Some(level) = cfg.compression_level {
+                    (*ctx).compression_level = level;
                 }
-
-                // 对 Opus：常用 time_base = 1/48000（samples）
-                (*ctx).time_base = ff::AVRational { num: 1, den: 48_000 };
 
                 let ret = ff::avcodec_open2(ctx, codec, ptr::null_mut());
                 if ret < 0 {
@@ -204,17 +158,10 @@ mod ffmpeg_backend {
                     return Err(map_ff_err(ret));
                 }
 
-                let fs = if (*ctx).frame_size > 0 {
-                    Some((*ctx).frame_size as usize)
-                } else {
-                    None
-                };
-
                 Ok(Self {
                     cfg,
                     flushed: false,
                     ctx,
-                    frame_samples: fs,
                 })
             }
         }
@@ -223,7 +170,7 @@ mod ffmpeg_backend {
             unsafe { tb_from_avr((*self.ctx).time_base) }
         }
 
-        /// 读取 FFmpeg encoder 的 extradata（通常是 OpusHead）。
+        /// 返回 encoder extradata（对 FLAC 来说通常是 STREAMINFO 等元数据）。
         pub fn extradata(&self) -> Option<Vec<u8>> {
             unsafe {
                 let size = (*self.ctx).extradata_size as usize;
@@ -236,7 +183,7 @@ mod ffmpeg_backend {
         }
     }
 
-    impl Drop for OpusEncoder {
+    impl Drop for FlacEncoder {
         fn drop(&mut self) {
             unsafe {
                 if !self.ctx.is_null() {
@@ -246,9 +193,9 @@ mod ffmpeg_backend {
         }
     }
 
-    impl AudioEncoder for OpusEncoder {
+    impl AudioEncoder for FlacEncoder {
         fn name(&self) -> &'static str {
-            "opus(ffmpeg)"
+            "flac(ffmpeg)"
         }
 
         fn input_format(&self) -> Option<AudioFormat> {
@@ -256,11 +203,8 @@ mod ffmpeg_backend {
         }
 
         fn preferred_frame_samples(&self) -> Option<usize> {
-            self.frame_samples.or(Some(960))
-        }
-
-        fn lookahead_samples(&self) -> usize {
-            0
+            // FLAC 一般是可变帧长；FFmpeg 可能给 0
+            None
         }
 
         fn send_frame(&mut self, frame: Option<&dyn AudioFrameView>) -> CodecResult<()> {
@@ -268,7 +212,6 @@ mod ffmpeg_backend {
                 if self.flushed {
                     return Err(CodecError::InvalidState("already flushed"));
                 }
-
                 if frame.is_none() {
                     let ret = ff::avcodec_send_frame(self.ctx, ptr::null());
                     if ret < 0 {
@@ -290,7 +233,6 @@ mod ffmpeg_backend {
                 if avf.is_null() {
                     return Err(CodecError::Other("av_frame_alloc failed".into()));
                 }
-
                 (*avf).nb_samples = frame.nb_samples() as i32;
                 (*avf).format = (*self.ctx).sample_fmt as i32;
                 (*avf).sample_rate = (*self.ctx).sample_rate;
@@ -307,25 +249,25 @@ mod ffmpeg_backend {
                 }
 
                 let bps = fmt.sample_format.bytes_per_sample();
+                let channels = fmt.channels() as usize;
                 if fmt.is_planar() {
-                    let ch = fmt.channels() as usize;
-                    for i in 0..ch {
-                        let src = frame.plane(i).ok_or(CodecError::InvalidData("missing plane"))?;
-                        let expected = frame.nb_samples() * bps;
+                    let expected = frame.nb_samples() * bps;
+                    for ch in 0..channels {
+                        let src = frame.plane(ch).ok_or(CodecError::InvalidData("missing plane"))?;
                         if src.len() != expected {
                             ff::av_frame_free(&mut (avf as *mut _));
                             return Err(CodecError::InvalidData("unexpected plane size"));
                         }
-                        let dst = (*avf).data[i] as *mut u8;
+                        let dst = (*avf).data[ch] as *mut u8;
                         if dst.is_null() {
                             ff::av_frame_free(&mut (avf as *mut _));
-                            return Err(CodecError::InvalidData("ffmpeg frame plane is null"));
+                            return Err(CodecError::InvalidData("ffmpeg plane is null"));
                         }
                         ptr::copy_nonoverlapping(src.as_ptr(), dst, expected);
                     }
                 } else {
+                    let expected = frame.nb_samples() * channels * bps;
                     let src = frame.plane(0).ok_or(CodecError::InvalidData("missing plane 0"))?;
-                    let expected = frame.nb_samples() * (fmt.channels() as usize) * bps;
                     if src.len() != expected {
                         ff::av_frame_free(&mut (avf as *mut _));
                         return Err(CodecError::InvalidData("unexpected interleaved plane size"));
@@ -333,13 +275,12 @@ mod ffmpeg_backend {
                     let dst = (*avf).data[0] as *mut u8;
                     if dst.is_null() {
                         ff::av_frame_free(&mut (avf as *mut _));
-                        return Err(CodecError::InvalidData("ffmpeg frame data[0] is null"));
+                        return Err(CodecError::InvalidData("ffmpeg data[0] is null"));
                     }
                     ptr::copy_nonoverlapping(src.as_ptr(), dst, expected);
                 }
 
                 (*avf).pts = frame.pts().unwrap_or(i64::MIN);
-
                 let ret = ff::avcodec_send_frame(self.ctx, avf);
                 ff::av_frame_free(&mut (avf as *mut _));
                 if ret < 0 {
@@ -355,7 +296,6 @@ mod ffmpeg_backend {
                 if pkt.is_null() {
                     return Err(CodecError::Other("av_packet_alloc failed".into()));
                 }
-
                 let ret = ff::avcodec_receive_packet(self.ctx, pkt);
                 if ret < 0 {
                     ff::av_packet_free(&mut (pkt as *mut _));
@@ -378,7 +318,6 @@ mod ffmpeg_backend {
                     duration: if (*pkt).duration <= 0 { None } else { Some((*pkt).duration) },
                     flags: crate::codec::packet::PacketFlags::empty(),
                 };
-
                 ff::av_packet_free(&mut (pkt as *mut _));
                 Ok(out)
             }
@@ -395,6 +334,4 @@ mod ffmpeg_backend {
 }
 
 #[cfg(feature = "ffmpeg")]
-pub use ffmpeg_backend::*;
-
-
+pub use ffmpeg_backend::FlacEncoder;
