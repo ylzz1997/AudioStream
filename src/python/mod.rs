@@ -21,6 +21,8 @@ use crate::codec::encoder::opus_encoder::{OpusEncoder, OpusEncoderConfig};
 use crate::codec::encoder::wav_encoder::{WavEncoder, WavEncoderConfig};
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
+use crate::codec::processor::identity_processor::IdentityProcessor;
+use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::{
     AudioError, AudioFormat as RsAudioFormat, AudioFrameView, ChannelLayout, Rational, SampleFormat, SampleType,
 };
@@ -497,6 +499,42 @@ fn ndarray_to_frame_planar<'py, T: Copy + Element>(
     .map_err(map_audio_err)
 }
 
+fn ndarray_to_frame_interleaved<'py, T: Copy + Element>(
+    arr_any: &Bound<'py, PyAny>,
+    fmt: RsAudioFormat,
+) -> PyResult<crate::common::audio::audio::AudioFrame> {
+    // 约定：interleaved numpy shape = (samples, channels)
+    let arr = arr_any.downcast::<PyArray2<T>>()?;
+    let ro = arr.readonly();
+    let view = ro.as_array();
+    let ns = view.shape()[0];
+    let ch = view.shape()[1];
+    if ch != fmt.channels() as usize {
+        return Err(PyValueError::new_err("pcm 的 channels 维度与 format.channels 不一致"));
+    }
+
+    let bps = fmt.sample_format.bytes_per_sample();
+    let bytes_len = ns * ch * bps;
+    let mut out = vec![0u8; bytes_len];
+
+    let slice = view
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("pcm 需要是 C contiguous 的 (samples, channels)"))?;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, out.as_mut_ptr(), bytes_len);
+    }
+
+    crate::common::audio::audio::AudioFrame::from_planes(
+        fmt,
+        ns,
+        Rational::new(1, fmt.sample_rate as i32),
+        None,
+        vec![out],
+    )
+    .map_err(map_audio_err)
+}
+
 fn packet_time_base_from_den(den: i32) -> Rational {
     Rational::new(1, den)
 }
@@ -518,7 +556,13 @@ fn map_file_err(e: AudioFileError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
-fn push_encoder_from_fifo(enc: &mut dyn AudioEncoder, fifo: &mut AudioFifo, chunk_samples: usize, out_q: &mut VecDeque<Vec<u8>>, force: bool) -> Result<(), CodecError> {
+fn push_encoder_from_fifo(
+    enc: &mut dyn AudioEncoder,
+    fifo: &mut AudioFifo,
+    chunk_samples: usize,
+    out_q: &mut VecDeque<CodecPacket>,
+    force: bool,
+) -> Result<(), CodecError> {
     loop {
         if fifo.available_samples() >= chunk_samples {
             // 正常 pop 一个 chunk
@@ -529,7 +573,7 @@ fn push_encoder_from_fifo(enc: &mut dyn AudioEncoder, fifo: &mut AudioFifo, chun
             enc.send_frame(Some(&frame))?;
             loop {
                 match enc.receive_packet() {
-                    Ok(pkt) => out_q.push_back(pkt.data),
+                    Ok(pkt) => out_q.push_back(pkt),
                     Err(CodecError::Again) => break,
                     Err(e) => return Err(e),
                 }
@@ -555,7 +599,7 @@ fn push_encoder_from_fifo(enc: &mut dyn AudioEncoder, fifo: &mut AudioFifo, chun
         enc.send_frame(Some(&frame))?;
         loop {
             match enc.receive_packet() {
-                Ok(pkt) => out_q.push_back(pkt.data),
+                Ok(pkt) => out_q.push_back(pkt),
                 Err(CodecError::Again) => break,
                 Err(e) => return Err(e),
             }
@@ -591,7 +635,7 @@ fn ensure_planar_frame(frame: crate::common::audio::audio::AudioFrame) -> Result
     crate::common::audio::audio::AudioFrame::from_planes(planar_fmt, ns, frame.time_base(), frame.pts(), planes)
 }
 
-fn frame_to_numpy<'py>(py: Python<'py>, frame: &crate::common::audio::audio::AudioFrame) -> PyResult<PyObject> {
+fn frame_to_numpy_planar<'py>(py: Python<'py>, frame: &crate::common::audio::audio::AudioFrame) -> PyResult<PyObject> {
     let fmt = *frame.format_ref();
     let ch = fmt.channels() as usize;
     let ns = frame.nb_samples();
@@ -649,6 +693,89 @@ fn frame_to_numpy<'py>(py: Python<'py>, frame: &crate::common::audio::audio::Aud
     }
 }
 
+fn frame_to_numpy_interleaved<'py>(py: Python<'py>, frame: &crate::common::audio::audio::AudioFrame) -> PyResult<PyObject> {
+    // 约定：interleaved numpy shape = (samples, channels)
+    let fmt = *frame.format_ref();
+    let ch = fmt.channels() as usize;
+    let ns = frame.nb_samples();
+    let st = fmt.sample_format.sample_type();
+
+    let np = py.import_bound("numpy")?;
+    let dtype_name = match st {
+        SampleType::U8 => "uint8",
+        SampleType::I16 => "int16",
+        SampleType::I32 => "int32",
+        SampleType::I64 => "int64",
+        SampleType::F32 => "float32",
+        SampleType::F64 => "float64",
+    };
+    let dtype = np.getattr(dtype_name)?;
+    let arr_any = np.getattr("empty")?.call1(((ns, ch), dtype))?;
+
+    macro_rules! fill_interleaved {
+        ($t:ty) => {{
+            let arr_t = arr_any.downcast::<PyArray2<$t>>()?;
+            let mut rw = unsafe { arr_t.as_array_mut() };
+            if fmt.is_planar() {
+                for s in 0..ns {
+                    for c in 0..ch {
+                        let src_b = frame.plane(c).ok_or_else(|| PyRuntimeError::new_err("missing plane"))?;
+                        let src = unsafe { std::slice::from_raw_parts(src_b.as_ptr() as *const $t, ns) };
+                        rw[[s, c]] = src[s];
+                    }
+                }
+            } else {
+                let src_b = frame.plane(0).ok_or_else(|| PyRuntimeError::new_err("missing plane 0"))?;
+                let src = unsafe { std::slice::from_raw_parts(src_b.as_ptr() as *const $t, ns * ch) };
+                for s in 0..ns {
+                    for c in 0..ch {
+                        rw[[s, c]] = src[s * ch + c];
+                    }
+                }
+            }
+            Ok::<PyObject, PyErr>(arr_t.to_object(py))
+        }};
+    }
+
+    match st {
+        SampleType::U8 => fill_interleaved!(u8),
+        SampleType::I16 => fill_interleaved!(i16),
+        SampleType::I32 => fill_interleaved!(i32),
+        SampleType::I64 => fill_interleaved!(i64),
+        SampleType::F32 => fill_interleaved!(f32),
+        SampleType::F64 => fill_interleaved!(f64),
+    }
+}
+
+fn frame_to_numpy<'py>(py: Python<'py>, frame: &crate::common::audio::audio::AudioFrame, planar: bool) -> PyResult<PyObject> {
+    if planar {
+        frame_to_numpy_planar(py, frame)
+    } else {
+        frame_to_numpy_interleaved(py, frame)
+    }
+}
+
+fn sample_type_to_str(st: SampleType) -> &'static str {
+    match st {
+        SampleType::U8 => "u8",
+        SampleType::I16 => "i16",
+        SampleType::I32 => "i32",
+        SampleType::I64 => "i64",
+        SampleType::F32 => "f32",
+        SampleType::F64 => "f64",
+    }
+}
+
+fn audio_format_from_rs(fmt: RsAudioFormat) -> AudioFormat {
+    AudioFormat {
+        sample_rate: fmt.sample_rate,
+        channels: fmt.channels(),
+        sample_type: sample_type_to_str(fmt.sample_format.sample_type()).to_string(),
+        planar: fmt.is_planar(),
+        channel_layout_mask: fmt.channel_layout.mask,
+    }
+}
+
 fn node_kind_to_str(k: NodeBufferKind) -> &'static str {
     match k {
         NodeBufferKind::Pcm => "pcm",
@@ -676,14 +803,27 @@ pub struct PacketPy {
     #[pyo3(get)]
     pub pts: Option<i64>,
     #[pyo3(get)]
+    pub dts: Option<i64>,
+    #[pyo3(get)]
     pub duration: Option<i64>,
+    /// 原始 flags bitmask（当前库内部 flags 还很小集合；先透传 u32）。
+    #[pyo3(get)]
+    pub flags: u32,
 }
 
 #[pymethods]
 impl PacketPy {
     #[new]
-    #[pyo3(signature = (data, time_base_num=1, time_base_den=48000, pts=None, duration=None))]
-    fn new(data: Vec<u8>, time_base_num: i32, time_base_den: i32, pts: Option<i64>, duration: Option<i64>) -> PyResult<Self> {
+    #[pyo3(signature = (data, time_base_num=1, time_base_den=48000, pts=None, dts=None, duration=None, flags=0))]
+    fn new(
+        data: Vec<u8>,
+        time_base_num: i32,
+        time_base_den: i32,
+        pts: Option<i64>,
+        dts: Option<i64>,
+        duration: Option<i64>,
+        flags: u32,
+    ) -> PyResult<Self> {
         if time_base_den == 0 || time_base_num == 0 {
             return Err(PyValueError::new_err("time_base_num/time_base_den 必须非 0"));
         }
@@ -692,20 +832,35 @@ impl PacketPy {
             time_base_num,
             time_base_den,
             pts,
+            dts,
             duration,
+            flags,
         })
     }
 }
 
 impl PacketPy {
     fn to_rs(&self) -> CodecPacket {
+        let flags = PacketFlags::from_bits(self.flags);
         CodecPacket {
             data: self.data.clone(),
             time_base: Rational::new(self.time_base_num, self.time_base_den),
             pts: self.pts,
-            dts: None,
+            dts: self.dts,
             duration: self.duration,
-            flags: PacketFlags::empty(),
+            flags,
+        }
+    }
+
+    fn from_rs(p: &CodecPacket) -> Self {
+        Self {
+            data: p.data.clone(),
+            time_base_num: p.time_base.num,
+            time_base_den: p.time_base.den,
+            pts: p.pts,
+            dts: p.dts,
+            duration: p.duration,
+            flags: p.flags.bits(),
         }
     }
 }
@@ -718,13 +873,20 @@ pub struct NodeBufferPy {
 
 #[pymethods]
 impl NodeBufferPy {
-    /// 构造 PCM buffer：numpy shape=(channels, samples)，且 format.planar 必须为 True。
+    /// 构造 PCM buffer：
+    ///
+    /// - format.planar=True  => numpy shape=(channels, samples)
+    /// - format.planar=False => numpy shape=(samples, channels)
     #[staticmethod]
-    #[pyo3(signature = (pcm, format, pts=None))]
-    fn pcm(py: Python<'_>, pcm: &Bound<'_, PyAny>, format: AudioFormat, pts: Option<i64>) -> PyResult<Self> {
-        if !format.planar {
-            return Err(PyValueError::new_err("NodeBuffer.pcm: format.planar 必须为 True（numpy shape=(channels,samples)）"));
-        }
+    #[pyo3(signature = (pcm, format, pts=None, time_base_num=None, time_base_den=None))]
+    fn pcm(
+        py: Python<'_>,
+        pcm: &Bound<'_, PyAny>,
+        format: AudioFormat,
+        pts: Option<i64>,
+        time_base_num: Option<i32>,
+        time_base_den: Option<i32>,
+    ) -> PyResult<Self> {
         let rs_fmt = format.to_rs()?;
         let st = format.sample_type_rs()?;
         let dtype_name = match st {
@@ -736,16 +898,30 @@ impl NodeBufferPy {
             SampleType::F64 => "float64",
         };
         let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
-        let mut frame = match st {
-            SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, rs_fmt)?,
-            SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, rs_fmt)?,
-            SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, rs_fmt)?,
-            SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, rs_fmt)?,
-            SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, rs_fmt)?,
-            SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, rs_fmt)?,
+        let mut frame = if rs_fmt.is_planar() {
+            match st {
+                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, rs_fmt)?,
+                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, rs_fmt)?,
+                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, rs_fmt)?,
+                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, rs_fmt)?,
+                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, rs_fmt)?,
+                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, rs_fmt)?,
+            }
+        } else {
+            match st {
+                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, rs_fmt)?,
+                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, rs_fmt)?,
+                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, rs_fmt)?,
+                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, rs_fmt)?,
+                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, rs_fmt)?,
+                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, rs_fmt)?,
+            }
         };
         if let Some(p) = pts {
             frame.set_pts(Some(p));
+        }
+        if let (Some(n), Some(d)) = (time_base_num, time_base_den) {
+            frame.set_time_base(Rational::new(n, d)).map_err(map_audio_err)?;
         }
         Ok(Self {
             inner: Some(NodeBuffer::Pcm(frame)),
@@ -774,7 +950,24 @@ impl NodeBufferPy {
             return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
         };
         match inner {
-            NodeBuffer::Pcm(f) => Ok(Some(frame_to_numpy(py, f)?)),
+            NodeBuffer::Pcm(f) => Ok(Some(frame_to_numpy(py, f, true)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// 如果是 pcm，返回 numpy ndarray（可选输出 interleaved）；否则返回 None。
+    #[pyo3(signature = (layout="planar"))]
+    fn as_pcm_with_layout(&self, py: Python<'_>, layout: &str) -> PyResult<Option<PyObject>> {
+        let Some(inner) = &self.inner else {
+            return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
+        };
+        let planar = match layout.to_ascii_lowercase().as_str() {
+            "planar" => true,
+            "interleaved" => false,
+            _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
+        };
+        match inner {
+            NodeBuffer::Pcm(f) => Ok(Some(frame_to_numpy(py, f, planar)?)),
             _ => Ok(None),
         }
     }
@@ -785,13 +978,22 @@ impl NodeBufferPy {
             return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
         };
         match inner {
-            NodeBuffer::Packet(p) => Ok(Some(PacketPy {
-                data: p.data.clone(),
-                time_base_num: p.time_base.num,
-                time_base_den: p.time_base.den,
-                pts: p.pts,
-                duration: p.duration,
-            })),
+            NodeBuffer::Packet(p) => Ok(Some(PacketPy::from_rs(p))),
+            _ => Ok(None),
+        }
+    }
+
+    /// 如果是 pcm，返回 (AudioFormat, pts, (time_base_num,time_base_den))；否则返回 None。
+    fn pcm_info(&self) -> PyResult<Option<(AudioFormat, Option<i64>, (i32, i32))>> {
+        let Some(inner) = &self.inner else {
+            return Err(PyRuntimeError::new_err("NodeBuffer 已被移动（不可再次使用）"));
+        };
+        match inner {
+            NodeBuffer::Pcm(f) => {
+                let fmt = audio_format_from_rs(*f.format_ref());
+                let tb = f.time_base();
+                Ok(Some((fmt, f.pts(), (tb.num, tb.den))))
+            }
             _ => Ok(None),
         }
     }
@@ -1228,7 +1430,7 @@ impl AudioFileReaderPy {
     /// 读取下一帧 PCM（numpy），EOF 返回 None。
     fn next_frame(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
         match AudioReader::next_frame(&mut self.r).map_err(map_file_err)? {
-            Some(f) => Ok(Some(frame_to_numpy(py, &f)?)),
+            Some(f) => Ok(Some(frame_to_numpy(py, &f, true)?)),
             None => Ok(None),
         }
     }
@@ -1305,11 +1507,10 @@ impl AudioFileWriterPy {
         })
     }
 
-    /// 直接写入一帧 PCM（numpy shape=(channels,samples)，要求 input_format.planar=True）。
+    /// 直接写入一帧 PCM（numpy）：
+    /// - input_format.planar=True  => shape=(channels,samples)
+    /// - input_format.planar=False => shape=(samples,channels)
     fn write_pcm(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>) -> PyResult<()> {
-        if !self.input_format.is_planar() {
-            return Err(PyValueError::new_err("write_pcm 仅支持 input_format.planar=True（numpy shape=(channels,samples)）"));
-        }
         let dtype_name = match self.sample_type {
             SampleType::U8 => "uint8",
             SampleType::I16 => "int16",
@@ -1319,13 +1520,24 @@ impl AudioFileWriterPy {
             SampleType::F64 => "float64",
         };
         let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
-        let frame = match self.sample_type {
-            SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
-            SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
-            SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
-            SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
-            SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
-            SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+        let frame = if self.input_format.is_planar() {
+            match self.sample_type {
+                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
+                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
+                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
+                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
+                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
+                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+            }
+        } else {
+            match self.sample_type {
+                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, self.input_format)?,
+                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, self.input_format)?,
+                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, self.input_format)?,
+                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, self.input_format)?,
+                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, self.input_format)?,
+                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, self.input_format)?,
+            }
         };
         AudioWriter::write_frame(&mut self.w, &frame as &dyn AudioFrameView).map_err(map_file_err)?;
         Ok(())
@@ -1357,7 +1569,7 @@ pub struct Encoder {
     sample_type: SampleType,
     fifo: AudioFifo,
     enc: Box<dyn AudioEncoder>,
-    out_q: VecDeque<Vec<u8>>,
+    out_q: VecDeque<CodecPacket>,
     sent_eof: bool,
 }
 
@@ -1373,9 +1585,6 @@ impl Encoder {
         match codec_norm {
             "wav" => {
                 let cfg = config.extract::<WavEncoderConfigPy>()?;
-                if !cfg.input_format.planar {
-                    return Err(PyValueError::new_err("Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True"));
-                }
                 let input_format = cfg.input_format.to_rs()?;
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
@@ -1393,9 +1602,6 @@ impl Encoder {
             }
             "mp3" => {
                 let cfg = config.extract::<Mp3EncoderConfigPy>()?;
-                if !cfg.input_format.planar {
-                    return Err(PyValueError::new_err("Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True"));
-                }
                 let input_format = cfg.input_format.to_rs()?;
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
@@ -1417,9 +1623,6 @@ impl Encoder {
             }
             "aac" => {
                 let cfg = config.extract::<AacEncoderConfigPy>()?;
-                if !cfg.input_format.planar {
-                    return Err(PyValueError::new_err("Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True"));
-                }
                 let input_format = cfg.input_format.to_rs()?;
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
@@ -1441,11 +1644,6 @@ impl Encoder {
             }
             "opus" => {
                 let cfg = config.extract::<OpusEncoderConfigPy>()?;
-                if !cfg.input_format.planar {
-                    return Err(PyValueError::new_err(
-                        "Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True",
-                    ));
-                }
                 let input_format = cfg.input_format.to_rs()?;
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
@@ -1467,11 +1665,6 @@ impl Encoder {
             }
             "flac" => {
                 let cfg = config.extract::<FlacEncoderConfigPy>()?;
-                if !cfg.input_format.planar {
-                    return Err(PyValueError::new_err(
-                        "Python put_frame 的 numpy shape=(channels,samples)；因此 input_format.planar 必须为 True",
-                    ));
-                }
                 let input_format = cfg.input_format.to_rs()?;
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo = AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
@@ -1495,7 +1688,9 @@ impl Encoder {
         }
     }
 
-    /// 输入一段 PCM：numpy ndarray，shape=(channels, samples)
+    /// 输入一段 PCM：
+    /// - input_format.planar=True  => numpy shape=(channels, samples)
+    /// - input_format.planar=False => numpy shape=(samples, channels)
     ///
     /// 注意：这里不会立刻保证产生输出；需要 get_frame() 去取。
     fn put_frame(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>) -> PyResult<()> {
@@ -1509,14 +1704,24 @@ impl Encoder {
         };
         let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
 
-        // 生成 planar AudioFrame 并 push 进 FIFO
-        let frame = match self.sample_type {
-            SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
-            SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
-            SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
-            SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
-            SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
-            SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+        let frame = if self.input_format.is_planar() {
+            match self.sample_type {
+                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
+                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
+                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
+                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
+                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
+                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+            }
+        } else {
+            match self.sample_type {
+                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, self.input_format)?,
+                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, self.input_format)?,
+                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, self.input_format)?,
+                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, self.input_format)?,
+                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, self.input_format)?,
+                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, self.input_format)?,
+            }
         };
         self.fifo.push_frame(&frame).map_err(map_audio_err)?;
         Ok(())
@@ -1537,7 +1742,7 @@ impl Encoder {
             self.enc.send_frame(None).map_err(map_codec_err)?;
             loop {
                 match self.enc.receive_packet() {
-                    Ok(pkt) => self.out_q.push_back(pkt.data),
+                    Ok(pkt) => self.out_q.push_back(pkt),
                     Err(CodecError::Again) => break,
                     Err(CodecError::Eof) => break,
                     Err(e) => return Err(map_codec_err(e)),
@@ -1546,13 +1751,41 @@ impl Encoder {
             self.sent_eof = true;
         }
 
-        if let Some(data) = self.out_q.pop_front() {
-            Ok(Some(PyBytes::new_bound(py, &data).unbind()))
+        if let Some(pkt) = self.out_q.pop_front() {
+            Ok(Some(PyBytes::new_bound(py, &pkt.data).unbind()))
         } else {
             let left = self.fifo.available_samples();
             if left > 0 && left < self.chunk_samples {
                 warnings_warn(py, "Not enough for one chunk: the last frame is incomplete and will not be returned by default; to return it, please call get_frame(force=True)")?;
             }
+            Ok(None)
+        }
+    }
+
+    /// 取出一个编码后的 packet（带 time_base/pts/dts/duration/flags）。
+    #[pyo3(signature = (force=false))]
+    fn get_packet(&mut self, _py: Python<'_>, force: bool) -> PyResult<Option<PacketPy>> {
+        if self.out_q.is_empty() {
+            push_encoder_from_fifo(self.enc.as_mut(), &mut self.fifo, self.chunk_samples, &mut self.out_q, force)
+                .map_err(map_codec_err)?;
+        }
+
+        if force && self.out_q.is_empty() && self.fifo.available_samples() == 0 && !self.sent_eof {
+            self.enc.send_frame(None).map_err(map_codec_err)?;
+            loop {
+                match self.enc.receive_packet() {
+                    Ok(pkt) => self.out_q.push_back(pkt),
+                    Err(CodecError::Again) => break,
+                    Err(CodecError::Eof) => break,
+                    Err(e) => return Err(map_codec_err(e)),
+                }
+            }
+            self.sent_eof = true;
+        }
+
+        if let Some(pkt) = self.out_q.pop_front() {
+            Ok(Some(PacketPy::from_rs(&pkt)))
+        } else {
             Ok(None)
         }
     }
@@ -1602,6 +1835,142 @@ pub struct Decoder {
     packet_time_base: Rational,
     dec: Box<dyn AudioDecoder>,
     fifo: Option<AudioFifo>, // 输出 FIFO（planar）
+}
+
+/// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor。
+#[pyclass(name = "Processor")]
+pub struct ProcessorPy {
+    p: Box<dyn AudioProcessor>,
+    in_format: Option<RsAudioFormat>,
+    out_format: Option<RsAudioFormat>,
+    // 若 input_format 已知，则在 numpy<->frame 时可用来选择 dtype
+    in_sample_type: Option<SampleType>,
+}
+
+#[pymethods]
+impl ProcessorPy {
+    /// 创建 identity processor：
+    /// - format=None：不做格式约束
+    /// - format=AudioFormat：严格要求输入匹配
+    #[staticmethod]
+    #[pyo3(signature = (format=None))]
+    fn identity(format: Option<AudioFormat>) -> PyResult<Self> {
+        let p: Box<dyn AudioProcessor> = if let Some(fmt) = format {
+            Box::new(IdentityProcessor::new_with_format(fmt.to_rs()?))
+        } else {
+            Box::new(IdentityProcessor::new().map_err(map_codec_err)?)
+        };
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p,
+            in_format,
+            out_format,
+            in_sample_type,
+        })
+    }
+
+    /// 创建 resample processor（自动选择后端：ffmpeg 优先，否则 linear）。
+    ///
+    /// 说明：
+    /// - in_format/out_format 必须完整匹配（channels/planar/sample_type 等）
+    /// - out_chunk_samples/pad_final 可用于“重分帧”（典型：Opus 前 960@48k）
+    #[staticmethod]
+    #[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
+    fn resample(in_format: AudioFormat, out_format: AudioFormat, out_chunk_samples: Option<usize>, pad_final: bool) -> PyResult<Self> {
+        let in_rs = in_format.to_rs()?;
+        let out_rs = out_format.to_rs()?;
+        let mut p = ResampleProcessor::new(in_rs, out_rs).map_err(map_codec_err)?;
+        p.set_output_chunker(out_chunk_samples, pad_final).map_err(map_codec_err)?;
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p: Box::new(p),
+            in_format,
+            out_format,
+            in_sample_type,
+        })
+    }
+
+    #[getter]
+    fn name(&self) -> &'static str {
+        self.p.name()
+    }
+
+    /// 输入一帧 PCM（numpy）：
+    /// - 若 processor.input_format() 已知，则要求 numpy layout 与 format.planar 一致：
+    ///   - planar=True  => (channels, samples)
+    ///   - planar=False => (samples, channels)
+    /// - 若 input_format=None：暂不支持（需要你显式给 identity(format=...) 或 resample(in_format=...)）
+    #[pyo3(signature = (pcm, pts=None))]
+    fn put_frame(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>, pts: Option<i64>) -> PyResult<()> {
+        let in_fmt = self
+            .in_format
+            .ok_or_else(|| PyValueError::new_err("Processor 输入格式未知：请用 Processor.identity(format=...) 或 Processor.resample(in_format=...)"))?;
+        let st = self.in_sample_type.ok_or_else(|| PyRuntimeError::new_err("missing input sample type"))?;
+        let dtype_name = match st {
+            SampleType::U8 => "uint8",
+            SampleType::I16 => "int16",
+            SampleType::I32 => "int32",
+            SampleType::I64 => "int64",
+            SampleType::F32 => "float32",
+            SampleType::F64 => "float64",
+        };
+        let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
+        let mut frame = if in_fmt.is_planar() {
+            match st {
+                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, in_fmt)?,
+                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, in_fmt)?,
+                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, in_fmt)?,
+                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, in_fmt)?,
+                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, in_fmt)?,
+                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, in_fmt)?,
+            }
+        } else {
+            match st {
+                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, in_fmt)?,
+                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, in_fmt)?,
+                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, in_fmt)?,
+                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, in_fmt)?,
+                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, in_fmt)?,
+                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, in_fmt)?,
+            }
+        };
+        if let Some(p) = pts {
+            frame.set_pts(Some(p));
+        }
+        self.p.send_frame(Some(&frame as &dyn AudioFrameView)).map_err(map_codec_err)?;
+        Ok(())
+    }
+
+    /// flush：通知输入结束（之后继续 get_frame 直到 EOF）。
+    fn flush(&mut self) -> PyResult<()> {
+        self.p.send_frame(None).map_err(map_codec_err)
+    }
+
+    /// 取出一帧输出 PCM：
+    /// - 返回 numpy；无输出返回 None
+    #[pyo3(signature = (layout="planar"))]
+    fn get_frame(&mut self, py: Python<'_>, layout: &str) -> PyResult<Option<PyObject>> {
+        let planar = match layout.to_ascii_lowercase().as_str() {
+            "planar" => true,
+            "interleaved" => false,
+            _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
+        };
+        match self.p.receive_frame() {
+            Ok(f) => Ok(Some(frame_to_numpy(py, &f, planar)?)),
+            Err(CodecError::Again) => Ok(None),
+            Err(CodecError::Eof) => Ok(None),
+            Err(e) => Err(map_codec_err(e)),
+        }
+    }
+
+    /// 输出格式（若已知）。
+    fn output_format(&self) -> Option<AudioFormat> {
+        self.out_format.map(audio_format_from_rs)
+    }
 }
 
 #[pymethods]
@@ -1732,12 +2101,46 @@ impl Decoder {
         Ok(())
     }
 
+    /// 输入一个 packet（支持 pts/dts/duration/time_base/flags）。
+    fn put_packet(&mut self, _py: Python<'_>, pkt: PacketPy) -> PyResult<()> {
+        let pkt = pkt.to_rs();
+        self.dec.send_packet(Some(pkt)).map_err(map_codec_err)?;
+
+        loop {
+            match self.dec.receive_frame() {
+                Ok(f) => {
+                    let f = ensure_planar_frame(f).map_err(map_audio_err)?;
+                    let fmt = *f.format_ref();
+                    let fifo = if let Some(existing) = &mut self.fifo {
+                        // 校验 format 一致（若不一致则报错）
+                        if existing.format() != fmt {
+                            return Err(PyRuntimeError::new_err("decoder output format changed unexpectedly"));
+                        }
+                        existing
+                    } else {
+                        self.fifo = Some(AudioFifo::new(fmt, f.time_base()).map_err(map_audio_err)?);
+                        self.fifo.as_mut().unwrap()
+                    };
+                    fifo.push_frame(&f).map_err(map_audio_err)?;
+                }
+                Err(CodecError::Again) => break,
+                Err(e) => return Err(map_codec_err(e)),
+            }
+        }
+        Ok(())
+    }
+
     /// 取出一帧 PCM：numpy ndarray，shape=(channels, samples)
     ///
     /// - 默认：如果 FIFO 剩余不够一个 chunk，则返回 None 并 warnings.warn
     /// - force=True：强制把最后不足一个 chunk 的残留也返回（作为最后一帧）
-    #[pyo3(signature = (force=false))]
-    fn get_frame(&mut self, py: Python<'_>, force: bool) -> PyResult<Option<PyObject>> {
+    #[pyo3(signature = (force=false, layout="planar"))]
+    fn get_frame(&mut self, py: Python<'_>, force: bool, layout: &str) -> PyResult<Option<PyObject>> {
+        let planar = match layout.to_ascii_lowercase().as_str() {
+            "planar" => true,
+            "interleaved" => false,
+            _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
+        };
         let Some(fifo) = &mut self.fifo else {
             // 还没解出任何帧
             return Ok(None);
@@ -1749,7 +2152,7 @@ impl Decoder {
                 .pop_frame(self.chunk_samples)
                 .map_err(map_audio_err)?
                 .expect("available checked");
-            return Ok(Some(frame_to_numpy(py, &f)?));
+            return Ok(Some(frame_to_numpy(py, &f, planar)?));
         }
 
         if !force {
@@ -1763,7 +2166,41 @@ impl Decoder {
             return Ok(None);
         }
         let f = fifo.pop_frame(nb).map_err(map_audio_err)?.expect("nb>0");
-        Ok(Some(frame_to_numpy(py, &f)?))
+        Ok(Some(frame_to_numpy(py, &f, planar)?))
+    }
+
+    /// 取出一帧 PCM + 元信息：返回 (numpy, pts, (time_base_num,time_base_den))
+    #[pyo3(signature = (force=false, layout="planar"))]
+    fn get_frame_info(&mut self, py: Python<'_>, force: bool, layout: &str) -> PyResult<Option<(PyObject, Option<i64>, (i32, i32))>> {
+        let planar = match layout.to_ascii_lowercase().as_str() {
+            "planar" => true,
+            "interleaved" => false,
+            _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
+        };
+        let Some(fifo) = &mut self.fifo else {
+            return Ok(None);
+        };
+
+        let nb = fifo.available_samples();
+        let take = if nb >= self.chunk_samples {
+            self.chunk_samples
+        } else if force {
+            nb
+        } else {
+            if nb > 0 {
+                warnings_warn(py, "不够一个 chunk：最后一帧未满，默认不返回；如需返回请 get_frame(force=True)")?;
+            }
+            return Ok(None);
+        };
+        if take == 0 {
+            return Ok(None);
+        }
+
+        let f = fifo.pop_frame(take).map_err(map_audio_err)?.expect("take>0");
+        let pts = f.pts();
+        let tb = f.time_base();
+        let arr = frame_to_numpy(py, &f, planar)?;
+        Ok(Some((arr, pts, (tb.num, tb.den))))
     }
 
     #[getter]
@@ -1817,6 +2254,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Decoder>()?;
     m.add_class::<PacketPy>()?;
     m.add_class::<NodeBufferPy>()?;
+    m.add_class::<ProcessorPy>()?;
     m.add_class::<DynNodePy>()?;
     m.add_class::<AsyncDynPipelinePy>()?;
     m.add_class::<AsyncDynRunnerPy>()?;

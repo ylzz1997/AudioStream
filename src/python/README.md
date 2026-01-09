@@ -31,7 +31,7 @@ fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=T
 cfg = ast.WavEncoderConfig(fmt, chunk_samples=1024)
 enc = ast.Encoder("wav", cfg)
 
-pcm = np.zeros((2, 1024), dtype=np.float32)
+pcm = np.zeros((2, 1024), dtype=np.float32)  # planar: (channels, samples)
 enc.put_frame(pcm)
 
 out = enc.get_frame()         # bytes 或 None
@@ -54,7 +54,8 @@ cfg = ast.WavDecoderConfig(out_fmt, chunk_samples=1024)
 dec = ast.Decoder("wav", cfg)
 
 dec.put_frame(b"...")     # bytes
-pcm = dec.get_frame()     # numpy ndarray shape=(channels, samples) 或 None
+pcm = dec.get_frame()     # numpy ndarray shape=(channels, samples) 或 None（planar）
+pcm_i = dec.get_frame(layout="interleaved")  # shape=(samples, channels)
 pcm_last = dec.get_frame(force=True)
 ```
 
@@ -65,6 +66,33 @@ pcm_last = dec.get_frame(force=True)
 ```python
 cfg = ast.OpusDecoderConfig(chunk_samples=960, packet_time_base_den=48000, extradata=opus_head_bytes)
 dec = ast.Decoder("opus", cfg)
+```
+
+---
+
+## Processor（PCM->PCM）
+
+目前暴露了：
+
+- `Processor.identity(format=None|AudioFormat)`
+- `Processor.resample(in_format, out_format, out_chunk_samples=None, pad_final=True)`
+
+```python
+import numpy as np
+import pyaudiostream as ast
+
+in_fmt = ast.AudioFormat(44100, 2, "f32", planar=True)
+out_fmt = ast.AudioFormat(48000, 2, "f32", planar=True)
+p = ast.Processor.resample(in_fmt, out_fmt, out_chunk_samples=960, pad_final=True)
+
+p.put_frame(np.zeros((2, 4410), np.float32))
+p.flush()
+
+while True:
+    out = p.get_frame()
+    if out is None:
+        break
+    # out: numpy (channels, samples) by default
 ```
 
 ### 语义说明

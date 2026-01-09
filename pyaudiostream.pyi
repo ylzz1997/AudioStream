@@ -139,6 +139,8 @@ class Encoder:
 
     def get_frame(self, force: bool = ...) -> Optional[bytes]: ...
 
+    def get_packet(self, force: bool = ...) -> Optional[Packet]: ...
+
     def pending_samples(self) -> int: ...
 
     def state(self) -> Literal["ready", "need_more", "empty"]: ...
@@ -156,7 +158,19 @@ class Decoder:
 
     def put_frame(self, frame: bytes) -> None: ...
 
-    def get_frame(self, force: bool = ...) -> Optional[NDArray[np.generic]]: ...
+    def put_packet(self, pkt: Packet) -> None: ...
+
+    def get_frame(
+        self,
+        force: bool = ...,
+        layout: Literal["planar", "interleaved"] = ...,
+    ) -> Optional[NDArray[np.generic]]: ...
+
+    def get_frame_info(
+        self,
+        force: bool = ...,
+        layout: Literal["planar", "interleaved"] = ...,
+    ) -> Optional[tuple[NDArray[np.generic], Optional[int], tuple[int, int]]]: ...
 
     def pending_samples(self) -> int: ...
 
@@ -168,7 +182,9 @@ class Packet:
     time_base_num: int
     time_base_den: int
     pts: Optional[int]
+    dts: Optional[int]
     duration: Optional[int]
+    flags: int
 
     def __init__(
         self,
@@ -176,7 +192,9 @@ class Packet:
         time_base_num: int = ...,
         time_base_den: int = ...,
         pts: Optional[int] = ...,
+        dts: Optional[int] = ...,
         duration: Optional[int] = ...,
+        flags: int = ...,
     ) -> None: ...
 
 
@@ -184,14 +202,24 @@ class NodeBuffer:
     kind: Literal["pcm", "packet"]
 
     @staticmethod
-    def pcm(pcm: NDArray[np.generic], format: AudioFormat, pts: Optional[int] = ...) -> NodeBuffer: ...
+    def pcm(
+        pcm: NDArray[np.generic],
+        format: AudioFormat,
+        pts: Optional[int] = ...,
+        time_base_num: Optional[int] = ...,
+        time_base_den: Optional[int] = ...,
+    ) -> NodeBuffer: ...
 
     @staticmethod
     def packet(pkt: Packet) -> NodeBuffer: ...
 
     def as_pcm(self) -> Optional[NDArray[np.generic]]: ...
 
+    def as_pcm_with_layout(self, layout: Literal["planar", "interleaved"] = ...) -> Optional[NDArray[np.generic]]: ...
+
     def as_packet(self) -> Optional[Packet]: ...
+
+    def pcm_info(self) -> Optional[tuple[AudioFormat, Optional[int], tuple[int, int]]]: ...
 
 
 class DynNode:
@@ -269,5 +297,28 @@ class AudioFileWriter:
     def push(self, buf: NodeBuffer) -> None: ...
 
     def finalize(self) -> None: ...
+
+
+class Processor:
+    name: str
+
+    @staticmethod
+    def identity(format: Optional[AudioFormat] = ...) -> Processor: ...
+
+    @staticmethod
+    def resample(
+        in_format: AudioFormat,
+        out_format: AudioFormat,
+        out_chunk_samples: Optional[int] = ...,
+        pad_final: bool = ...,
+    ) -> Processor: ...
+
+    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = ...) -> None: ...
+
+    def flush(self) -> None: ...
+
+    def get_frame(self, layout: Literal["planar", "interleaved"] = ...) -> Optional[NDArray[np.generic]]: ...
+
+    def output_format(self) -> Optional[AudioFormat]: ...
 
 
