@@ -37,7 +37,8 @@ use std::collections::VecDeque;
 use tokio::runtime::Runtime;
 
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
-use crate::pipeline::node::dynamic_node_interface::{DynNode, IdentityNode, ProcessorNode};
+use crate::pipeline::node::dynamic_node_interface::{DynNode, ProcessorNode};
+use crate::pipeline::node::node_interface::IdentityNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 
 use crate::codec::processor::resample_processor::ResampleProcessor;
