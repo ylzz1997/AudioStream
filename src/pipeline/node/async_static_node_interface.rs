@@ -3,9 +3,8 @@
 use crate::codec::error::{CodecError, CodecResult};
 use crate::pipeline::node::static_node_interface::StaticNode;
 use crate::pipeline::node::node_interface::AsyncPipeline;
-use core::future::Future;
-use core::pin::Pin;
 use tokio::sync::mpsc;
+use async_trait::async_trait;
 
 type Msg<T> = Result<Option<T>, CodecError>;
 
@@ -186,6 +185,7 @@ where
 }
 
 
+#[async_trait]
 impl<N1, N2, N3> AsyncPipeline for AsyncPipeline3<N1, N2, N3>
 where
     N1: StaticNode + Send + 'static,
@@ -220,14 +220,12 @@ where
         }
     }
 
-    fn get_frame<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CodecResult<Self::Out>> + Send + 'a>> {
-        Box::pin(async move {
-            match self.out_rx.recv().await {
-                Some(Ok(v)) => Ok(v),
-                Some(Err(e)) => Err(e),
-                None => Err(CodecError::Eof),
-            }
-        })
+    async fn get_frame(&mut self) -> CodecResult<Self::Out> {
+        match self.out_rx.recv().await {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
+            None => Err(CodecError::Eof),
+        }
     }
 }
 

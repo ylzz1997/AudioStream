@@ -19,6 +19,7 @@ numpy = { version = "0.22", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+async-trait = "0.1"
 
 [features]
 default = ["ffmpeg"]

@@ -3,9 +3,8 @@
 use crate::codec::error::{CodecError, CodecResult};
 use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::node_interface::{NodeBuffer, AsyncPipeline};
-use core::future::Future;
-use core::pin::Pin;
 use tokio::sync::mpsc;
+use async_trait::async_trait;
 
 /// pipeline 内部消息：
 /// - `Ok(Some(buf))`：一条数据
@@ -171,7 +170,7 @@ impl AsyncDynPipeline {
     }
 }
 
-
+#[async_trait]
 impl AsyncPipeline for AsyncDynPipeline {
     type In = NodeBuffer;
     type Out = NodeBuffer;
@@ -199,14 +198,12 @@ impl AsyncPipeline for AsyncDynPipeline {
     }
 
     /// 异步等待一个末端输出。
-    fn get_frame<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = CodecResult<NodeBuffer>> + Send + 'a>> {
-        Box::pin(async move {
-            match self.out_rx.recv().await {
-                Some(Ok(v)) => Ok(v),
-                Some(Err(e)) => Err(e),
-                None => Err(CodecError::Eof),
-            }
-        })
+    async fn get_frame(&mut self) -> CodecResult<NodeBuffer> {
+        match self.out_rx.recv().await {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
+            None => Err(CodecError::Eof),
+        }
     }
 }
 
