@@ -6,7 +6,7 @@ use crate::codec::error::{CodecError, CodecResult};
 use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::AudioFrameView;
 use crate::pipeline::node::node_interface::{NodeBuffer, NodeBufferKind};
-use std::collections::VecDeque;
+use crate::pipeline::node::node_interface::IdentityNode;
 
 /// 动态 node：输入/输出都是 `NodeBuffer`，用 `CodecError::{Again,Eof}` 表达背压/结束。
 pub trait DynNode: Send {
@@ -60,24 +60,6 @@ impl<P: AudioProcessor> DynNode for ProcessorNode<P> {
     }
 }
 
-/// Identity 节点：把输入 buffer 原样移动到输出（零拷贝，不做任何处理）。
-///
-/// - 作为占位节点，便于后续插入 processor/filter。
-pub struct IdentityNode {
-    kind: NodeBufferKind,
-    q: VecDeque<NodeBuffer>,
-    flushed: bool,
-}
-
-impl IdentityNode {
-    pub fn new(kind: NodeBufferKind) -> Self {
-        Self {
-            kind,
-            q: VecDeque::new(),
-            flushed: false,
-        }
-    }
-}
 
 impl DynNode for IdentityNode {
     fn name(&self) -> &'static str {

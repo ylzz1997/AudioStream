@@ -222,6 +222,25 @@ class NodeBuffer:
     def pcm_info(self) -> Optional[tuple[AudioFormat, Optional[int], tuple[int, int]]]: ...
 
 
+class Node:
+
+    def push(self, buf: Optional[NodeBuffer]) -> None: ...
+
+    def pull(self) -> Optional[NodeBuffer]: ...
+
+
+class AudioSource:
+
+    def pull(self) -> Optional[NodeBuffer]: ...
+
+
+class AudioSink:
+
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+
 class DynNode:
     name: str
     input_kind: Literal["pcm", "packet"]
@@ -250,6 +269,13 @@ def make_decoder_node(
     config: WavDecoderConfig | Mp3DecoderConfig | AacDecoderConfig | OpusDecoderConfig | FlacDecoderConfig,
 ) -> DynNode: ...
 
+def make_python_node(
+    obj: Node,
+    input_kind: Literal["pcm", "packet"],
+    output_kind: Literal["pcm", "packet"],
+    name: str = ...,
+) -> DynNode: ...
+
 
 class AsyncDynPipeline:
     input_kind: Literal["pcm", "packet"]
@@ -267,7 +293,7 @@ class AsyncDynPipeline:
 
 
 class AsyncDynRunner:
-    def __init__(self, source: object, nodes: list[DynNode], sink: object) -> None: ...
+    def __init__(self, source: AudioSource, nodes: list[DynNode], sink: AudioSink) -> None: ...
 
     def run(self) -> None: ...
 

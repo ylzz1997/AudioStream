@@ -8,6 +8,7 @@ use crate::codec::packet::CodecPacket;
 use crate::common::audio::audio::AudioFrame;
 use crate::codec::error::CodecResult;
 use async_trait::async_trait;
+use std::collections::VecDeque;
 
 /// node 之间传递的数据类型（运行时版 pipeline 用）。
 #[derive(Debug)]
@@ -67,4 +68,24 @@ pub trait AsyncPipelineConsumer: Send {
     type Out: Send + 'static;
     fn try_get_frame(&mut self) -> CodecResult<Self::Out>;
     async fn get_frame(&mut self) -> CodecResult<Self::Out>;
+}
+
+
+/// Identity 节点：把输入 buffer 原样移动到输出（零拷贝，不做任何处理）。
+///
+/// - 作为占位节点，便于后续插入 processor/filter。
+pub struct IdentityNode {
+    pub kind: NodeBufferKind,
+    pub q: VecDeque<NodeBuffer>,
+    pub flushed: bool,
+}
+
+impl IdentityNode {
+    pub fn new(kind: NodeBufferKind) -> Self {
+        Self {
+            kind,
+            q: VecDeque::new(),
+            flushed: false,
+        }
+    }
 }

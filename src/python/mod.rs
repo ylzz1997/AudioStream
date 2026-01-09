@@ -29,7 +29,7 @@ use crate::common::audio::audio::{
 use crate::common::audio::fifo::AudioFifo;
 
 use numpy::{Element, PyArray2, PyArrayMethods};
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyBlockingIOError, PyEOFError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict};
 
@@ -49,7 +49,8 @@ use crate::runner::async_auto_runner::AsyncAutoRunner;
 // use crate::runner::auto_runner::AutoRunner;
 use crate::runner::error::{RunnerError, RunnerResult};
 use crate::common::io::file as rs_file;
-use crate::common::io::file::{AudioIOError, AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
+use crate::common::io::AudioIOError;
+use crate::common::io::file::{AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
 use crate::common::io::io::{AudioReader, AudioWriter};
 
 fn map_codec_err(e: CodecError) -> PyErr {
@@ -551,6 +552,21 @@ fn map_runner_err(e: crate::runner::error::RunnerError) -> PyErr {
 
 fn pyerr_to_runner_err(e: PyErr) -> RunnerError {
     RunnerError::Codec(CodecError::Other(e.to_string()))
+}
+
+fn pyerr_to_codec_err(e: PyErr) -> CodecError {
+    // 允许 Python 用异常表达控制流：
+    // - BlockingIOError => Again（暂无输出/背压）
+    // - EOFError => Eof（结束）
+    Python::with_gil(|py| {
+        if e.is_instance_of::<PyBlockingIOError>(py) {
+            return CodecError::Again;
+        }
+        if e.is_instance_of::<PyEOFError>(py) {
+            return CodecError::Eof;
+        }
+        CodecError::Other(e.to_string())
+    })
 }
 
 fn map_file_err(e: AudioIOError) -> PyErr {
@@ -1116,7 +1132,141 @@ impl DynNode for BoxedDecoderNode {
     }
 }
 
-/// 创建一个 identity 节点（pcm 或 packet）。
+/// 让 Python 对象实现 DynNode：要求提供
+///
+/// - `push(buf: Optional[NodeBuffer]) -> None`
+/// - `pull() -> Optional[NodeBuffer]`
+///
+/// 约定：
+/// - flush 前：pull() 返回 None 表示 `Again`
+/// - flush 后：pull() 返回 None 表示 `Eof`（避免最后阶段 busy loop）
+/// - 也可以显式 `raise BlockingIOError` / `raise EOFError` 来表达 Again/Eof
+struct PyCallbackNode {
+    obj: Py<PyAny>,
+    in_kind: NodeBufferKind,
+    out_kind: NodeBufferKind,
+    name: &'static str,
+    flushed: bool,
+}
+
+impl PyCallbackNode {
+    fn new(obj: Py<PyAny>, in_kind: NodeBufferKind, out_kind: NodeBufferKind, name: String) -> Self {
+        // DynNode::name 需要 &'static str；这里把 name 泄漏到进程生命周期（模块卸载前都安全）。
+        let leaked: &'static str = Box::leak(name.into_boxed_str());
+        Self {
+            obj,
+            in_kind,
+            out_kind,
+            name: leaked,
+            flushed: false,
+        }
+    }
+}
+
+impl DynNode for PyCallbackNode {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn input_kind(&self) -> NodeBufferKind {
+        self.in_kind
+    }
+
+    fn output_kind(&self) -> NodeBufferKind {
+        self.out_kind
+    }
+
+    fn push(&mut self, input: Option<NodeBuffer>) -> crate::codec::error::CodecResult<()> {
+        Python::with_gil(|py| {
+            let o = self.obj.bind(py);
+            match input {
+                None => {
+                    self.flushed = true;
+                    // 优先调用 flush()（若存在），否则退化为 push(None)
+                    match o.call_method0("flush") {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            // 没有 flush 方法：尝试 push(None)
+                            if e.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) {
+                                o.call_method1("push", (Option::<Py<NodeBufferPy>>::None,))
+                                    .map(|_| ())
+                                    .map_err(pyerr_to_codec_err)
+                            } else {
+                                Err(pyerr_to_codec_err(e))
+                            }
+                        }
+                    }
+                }
+                Some(buf) => {
+                    if buf.kind() != self.in_kind {
+                        return Err(CodecError::InvalidData("Python node input kind mismatch"));
+                    }
+                    let nb = Py::new(py, NodeBufferPy { inner: Some(buf) }).map_err(pyerr_to_codec_err)?;
+                    o.call_method1("push", (nb,)).map(|_| ()).map_err(pyerr_to_codec_err)
+                }
+            }
+        })
+    }
+
+    fn pull(&mut self) -> crate::codec::error::CodecResult<NodeBuffer> {
+        Python::with_gil(|py| {
+            let o = self.obj.bind(py);
+            let ret = o.call_method0("pull").map_err(pyerr_to_codec_err)?;
+            if ret.is_none() {
+                return Err(if self.flushed { CodecError::Eof } else { CodecError::Again });
+            }
+            let nb_py: Py<NodeBufferPy> = ret.extract().map_err(|_| {
+                CodecError::InvalidData("Python node.pull() 必须返回 NodeBuffer 或 None")
+            })?;
+            let mut nb = nb_py.bind(py).borrow_mut();
+            let inner = nb
+                .take_inner()
+                .map_err(|_| CodecError::InvalidState("Python node.pull() 返回的 NodeBuffer 已被移动（不可再次使用）"))?;
+            if inner.kind() != self.out_kind {
+                return Err(CodecError::InvalidData("Python node output kind mismatch"));
+            }
+            Ok(inner)
+        })
+    }
+}
+
+/// python 侧的 Node 基类
+#[pyclass(name = "Node", subclass)]
+pub struct NodeBase {}
+
+#[pymethods]
+impl NodeBase {
+    #[new]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+/// 仅用于类型提示/继承的空基类
+#[pyclass(name = "AudioSource", subclass)]
+pub struct AudioSourceBase {}
+
+#[pymethods]
+impl AudioSourceBase {
+    #[new]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+/// 仅用于类型提示/继承的空基类
+#[pyclass(name = "AudioSink", subclass)]
+pub struct AudioSinkBase {}
+
+#[pymethods]
+impl AudioSinkBase {
+    #[new]
+    fn new() -> Self {
+        Self {}
+    }
+}
+
+
 #[pyfunction]
 fn make_identity_node(kind: &str) -> PyResult<DynNodePy> {
     let k = node_kind_from_str(kind).ok_or_else(|| PyValueError::new_err("kind 仅支持: pcm/packet"))?;
@@ -1197,6 +1347,23 @@ fn make_decoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) ->
         _ => return Err(PyValueError::new_err("unsupported codec")),
     };
     Ok(DynNodePy::new_boxed(Box::new(BoxedDecoderNode { d: dec })))
+}
+
+/// 创建一个 Python 自定义节点（DynNode），可用于 `AsyncDynPipeline`/`AsyncDynRunner` 的 nodes 列表。
+///
+/// 你需要在 Python 侧提供一个对象（实例）并实现：
+/// - `push(buf: Optional[NodeBuffer]) -> None`
+/// - `pull() -> Optional[NodeBuffer]`
+///
+/// 参数：
+/// - `input_kind/output_kind`: "pcm" 或 "packet"
+/// - `name`: 仅用于调试展示（内部会被泄漏为 &'static str）
+#[pyfunction]
+#[pyo3(signature = (obj, input_kind, output_kind, name="py-node".to_string()))]
+fn make_python_node(obj: Py<PyAny>, input_kind: &str, output_kind: &str, name: String) -> PyResult<DynNodePy> {
+    let in_k = node_kind_from_str(input_kind).ok_or_else(|| PyValueError::new_err("input_kind 仅支持: pcm/packet"))?;
+    let out_k = node_kind_from_str(output_kind).ok_or_else(|| PyValueError::new_err("output_kind 仅支持: pcm/packet"))?;
+    Ok(DynNodePy::new_boxed(Box::new(PyCallbackNode::new(obj, in_k, out_k, name))))
 }
 
 /// Python 侧 AsyncDynPipeline（动态节点列表）。
@@ -2264,6 +2431,9 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Decoder>()?;
     m.add_class::<PacketPy>()?;
     m.add_class::<NodeBufferPy>()?;
+    m.add_class::<NodeBase>()?;
+    m.add_class::<AudioSourceBase>()?;
+    m.add_class::<AudioSinkBase>()?;
     m.add_class::<ProcessorPy>()?;
     m.add_class::<DynNodePy>()?;
     m.add_class::<AsyncDynPipelinePy>()?;
@@ -2274,6 +2444,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(make_resample_node, m)?)?;
     m.add_function(wrap_pyfunction!(make_encoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(make_decoder_node, m)?)?;
+    m.add_function(wrap_pyfunction!(make_python_node, m)?)?;
     Ok(())
 }
 

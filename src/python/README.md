@@ -143,6 +143,73 @@ while True:
         packets.append(pkt.data)
 ```
 
+### Python 自定义 Node（DynNode）
+
+除了内置的 `make_identity_node / make_resample_node / make_encoder_node / make_decoder_node`，你也可以用 Python 自己实现一个节点，并放进 `AsyncDynPipeline(nodes=[...])` / `AsyncDynRunner(nodes=[...])` 里。
+
+#### 1) Python 侧需要实现的方法
+
+- `push(buf: Optional[ast.NodeBuffer]) -> None`
+  - `buf is None` 表示 flush（输入结束）
+- `pull() -> Optional[ast.NodeBuffer]`
+  - flush 前：返回 `None` 表示“暂无输出”（类似 Again）
+  - flush 后：返回 `None` 表示“结束”（类似 EOF）
+  - 你也可以显式 `raise BlockingIOError` / `raise EOFError` 来表达 Again/EOF
+
+#### 2) 构造 DynNode
+
+用 `ast.make_python_node(obj, input_kind, output_kind, name="...")` 把你的对象包装成可用于 pipeline 的 `DynNode`：
+
+```python
+import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(sample_rate=48000, channels=1, sample_type="f32", planar=True)
+
+class GainNode:
+    def __init__(self, gain: float):
+        self.gain = gain
+        self.q = []
+        self.flushed = False
+
+    def push(self, buf):
+        if buf is None:
+            self.flushed = True
+            return
+
+        pcm = buf.as_pcm()
+        if pcm is None:
+            raise ValueError("expects pcm")
+
+        # 注意：NodeBuffer 在 Rust 侧会被 move；建议输出新的 NodeBuffer
+        fmt2, pts, (tb_num, tb_den) = buf.pcm_info()
+        out = (pcm * self.gain).astype(np.float32, copy=False)
+        self.q.append(ast.NodeBuffer.pcm(out, fmt2, pts=pts, time_base_num=tb_num, time_base_den=tb_den))
+
+    def pull(self):
+        if self.q:
+            return self.q.pop(0)
+        if self.flushed:
+            raise EOFError()
+        return None
+
+py_gain = ast.make_python_node(GainNode(0.5), input_kind="pcm", output_kind="pcm", name="gain")
+
+nodes = [
+    py_gain,
+    ast.make_encoder_node("opus", ast.OpusEncoderConfig(fmt, chunk_samples=960, bitrate=96_000)),
+]
+
+p = ast.AsyncDynPipeline(nodes)
+p.push(ast.NodeBuffer.pcm(np.zeros((1, 960), np.float32), fmt))
+p.flush()
+while True:
+    out = p.get()
+    if out is None:
+        break
+    # out: packet
+```
+
 ### 用 AsyncDynRunner 串联 Python Source/Sink
 
 Python 侧只要实现：
