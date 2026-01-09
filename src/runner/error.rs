@@ -1,11 +1,11 @@
 use crate::codec::error::CodecError;
-use crate::common::io::file::AudioFileError;
+use crate::common::io::io::AudioIOError;
 use core::fmt;
 
 #[derive(Debug)]
 pub enum RunnerError {
     Codec(CodecError),
-    Io(AudioFileError),
+    Io(AudioIOError),
     InvalidData(&'static str),
     InvalidState(&'static str),
 }
@@ -29,8 +29,8 @@ impl From<CodecError> for RunnerError {
     }
 }
 
-impl From<AudioFileError> for RunnerError {
-    fn from(e: AudioFileError) -> Self {
+impl From<AudioIOError> for RunnerError {
+    fn from(e: AudioIOError) -> Self {
         RunnerError::Io(e)
     }
 }

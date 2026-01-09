@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-use super::file::{AudioFileError, AudioFileResult};
+use crate::common::io::io::{AudioIOResult, AudioIOError};
 
 /// 一个最小、可流式的 Opus “自定义封装”：
 const MAGIC: &[u8; 8] = b"ASTOPUS\0";
@@ -51,22 +51,22 @@ impl OpusPacketWriter {
     pub fn create<P: AsRef<Path>>(
         path: P,
         cfg: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
-    ) -> AudioFileResult<Self> {
+    ) -> AudioIOResult<Self> {
         let mut file = File::create(path)?;
         let encoder = crate::codec::encoder::opus_encoder::OpusEncoder::new(cfg)?;
 
         let input_format = encoder
             .input_format()
-            .ok_or(AudioFileError::Format("Opus encoder missing input_format"))?;
+            .ok_or(AudioIOError::Format("Opus encoder missing input_format"))?;
         if input_format.sample_rate != 48_000 {
-            return Err(AudioFileError::Codec(CodecError::InvalidData(
+            return Err(AudioIOError::Codec(CodecError::InvalidData(
                 "Opus writer requires 48kHz input (no resample layer yet)",
             )));
         }
 
         let time_base = Rational::new(1, 48_000);
         let fifo =
-            AudioFifo::new(input_format, time_base).map_err(|_| AudioFileError::Format("failed to create AudioFifo"))?;
+            AudioFifo::new(input_format, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
         let frame_samples = encoder.preferred_frame_samples().unwrap_or(960);
 
         // extradata：优先用 encoder 提供的，否则用最小 OpusHead。
@@ -81,7 +81,7 @@ impl OpusPacketWriter {
         write_i32_le(&mut file, time_base.num)?;
         write_i32_le(&mut file, time_base.den)?;
         if extradata.len() > u16::MAX as usize {
-            return Err(AudioFileError::Format("opus extradata too large"));
+            return Err(AudioIOError::Format("opus extradata too large"));
         }
         write_u16_le(&mut file, extradata.len() as u16)?;
         file.write_all(&extradata)?;
@@ -95,16 +95,16 @@ impl OpusPacketWriter {
         })
     }
 
-    pub fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+    pub fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         self.fifo
             .push_frame(frame)
-            .map_err(|_| AudioFileError::Format("AudioFifo push failed (format mismatch?)"))?;
+            .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
         while let Some(chunk) = self
             .fifo
             .pop_frame(self.frame_samples)
-            .map_err(|_| AudioFileError::Format("AudioFifo pop failed"))?
+            .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
         {
             self.encoder.send_frame(Some(&chunk))?;
             self.drain_packets()?;
@@ -112,7 +112,7 @@ impl OpusPacketWriter {
         Ok(())
     }
 
-    pub fn finalize(&mut self) -> AudioFileResult<()> {
+    pub fn finalize(&mut self) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
 
         let remain = self.fifo.available_samples();
@@ -120,7 +120,7 @@ impl OpusPacketWriter {
             if let Some(last) = self
                 .fifo
                 .pop_frame(remain)
-                .map_err(|_| AudioFileError::Format("AudioFifo pop last failed"))?
+                .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
             {
                 self.encoder.send_frame(Some(&last))?;
                 self.drain_packets()?;
@@ -139,7 +139,7 @@ impl OpusPacketWriter {
         Ok(())
     }
 
-    fn drain_packets(&mut self) -> AudioFileResult<()> {
+    fn drain_packets(&mut self) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         loop {
             match self.encoder.receive_packet() {
@@ -151,12 +151,12 @@ impl OpusPacketWriter {
         Ok(())
     }
 
-    fn write_one_packet(&mut self, pkt: &CodecPacket) -> AudioFileResult<()> {
+    fn write_one_packet(&mut self, pkt: &CodecPacket) -> AudioIOResult<()> {
         if !self.header_written {
-            return Err(AudioFileError::Format("opus header not written"));
+            return Err(AudioIOError::Format("opus header not written"));
         }
         if pkt.data.len() > u32::MAX as usize {
-            return Err(AudioFileError::Format("opus packet too large"));
+            return Err(AudioIOError::Format("opus packet too large"));
         }
         write_u32_le(&mut self.file, pkt.data.len() as u32)?;
         write_i32_le(&mut self.file, pkt.duration.unwrap_or(0) as i32)?;
@@ -166,11 +166,11 @@ impl OpusPacketWriter {
 }
 
 impl AudioWriter for OpusPacketWriter {
-    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
         self.write_frame(frame)
     }
 
-    fn finalize(&mut self) -> AudioFileResult<()> {
+    fn finalize(&mut self) -> AudioIOResult<()> {
         self.finalize()
     }
 }
@@ -192,8 +192,8 @@ impl OpusOggWriter {
     pub fn create<P: AsRef<Path>>(
         _path: P,
         _cfg: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
-    ) -> AudioFileResult<Self> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    ) -> AudioIOResult<Self> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -201,13 +201,13 @@ impl OpusOggWriter {
 
 #[cfg(not(feature = "ffmpeg"))]
 impl AudioWriter for OpusOggWriter {
-    fn write_frame(&mut self, _frame: &dyn AudioFrameView) -> AudioFileResult<()> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn write_frame(&mut self, _frame: &dyn AudioFrameView) -> AudioIOResult<()> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
-    fn finalize(&mut self) -> AudioFileResult<()> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn finalize(&mut self) -> AudioIOResult<()> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -218,8 +218,8 @@ pub struct OpusOggReader;
 
 #[cfg(not(feature = "ffmpeg"))]
 impl OpusOggReader {
-    pub fn open<P: AsRef<Path>>(_path: P) -> AudioFileResult<Self> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    pub fn open<P: AsRef<Path>>(_path: P) -> AudioIOResult<Self> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus reader requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -227,8 +227,8 @@ impl OpusOggReader {
 
 #[cfg(not(feature = "ffmpeg"))]
 impl AudioReader for OpusOggReader {
-    fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus reader requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -247,15 +247,15 @@ mod ogg_ffmpeg_backend {
     use libc;
     use crate::common::ffmpeg_util::ff_err_to_string;
 
-    fn map_ff_err(err: i32) -> AudioFileError {
-        AudioFileError::Codec(CodecError::Other(ff_err_to_string(err)))
+    fn map_ff_err(err: i32) -> AudioIOError {
+        AudioIOError::Codec(CodecError::Other(ff_err_to_string(err)))
     }
 
     fn tb_from_avr(tb: ff::AVRational) -> Rational {
         Rational::new(tb.num, tb.den)
     }
 
-    fn map_sample_format(sf: crate::common::audio::audio::SampleFormat) -> AudioFileResult<ff::AVSampleFormat> {
+    fn map_sample_format(sf: crate::common::audio::audio::SampleFormat) -> AudioIOResult<ff::AVSampleFormat> {
         use ff::AVSampleFormat::*;
         let av = match sf {
             crate::common::audio::audio::SampleFormat::I16 { planar: false } => AV_SAMPLE_FMT_S16,
@@ -263,7 +263,7 @@ mod ogg_ffmpeg_backend {
             crate::common::audio::audio::SampleFormat::U8 { planar: false } => AV_SAMPLE_FMT_U8,
             crate::common::audio::audio::SampleFormat::I32 { planar: false } => AV_SAMPLE_FMT_S32,
             _ => {
-                return Err(AudioFileError::Format(
+                return Err(AudioIOError::Format(
                     "Opus Ogg writer supports only packed (interleaved) U8/I16/I32/F32",
                 ))
             }
@@ -287,16 +287,16 @@ mod ogg_ffmpeg_backend {
         pub fn create<P: AsRef<Path>>(
             path: P,
             cfg: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
-        ) -> AudioFileResult<Self> {
+        ) -> AudioIOResult<Self> {
             let out_path = path.as_ref().to_string_lossy();
-            let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioFileError::Format("path contains NUL"))?;
+            let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
             let in_fmt = cfg.input_format;
             if in_fmt.sample_rate != 48_000 {
-                return Err(AudioFileError::Format("Ogg Opus writer expects 48kHz input (resample before writing)"));
+                return Err(AudioIOError::Format("Ogg Opus writer expects 48kHz input (resample before writing)"));
             }
             if in_fmt.sample_format.is_planar() {
-                return Err(AudioFileError::Format("Ogg Opus writer expects packed/interleaved samples"));
+                return Err(AudioIOError::Format("Ogg Opus writer expects packed/interleaved samples"));
             }
 
             unsafe {
@@ -313,16 +313,16 @@ mod ogg_ffmpeg_backend {
                 }
 
                 // encoder (prefer libopus)
-                let name = CString::new("libopus").map_err(|_| AudioFileError::Format("codec name contains NUL"))?;
+                let name = CString::new("libopus").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
                 let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
                 if codec.is_null() {
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Unsupported("FFmpeg libopus encoder not found")));
+                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg libopus encoder not found")));
                 }
                 let enc_ctx = ff::avcodec_alloc_context3(codec);
                 if enc_ctx.is_null() {
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
                 }
 
                 (*enc_ctx).sample_rate = 48_000;
@@ -364,7 +364,7 @@ mod ogg_ffmpeg_backend {
                 if st.is_null() {
                     ff::avcodec_free_context(&mut (enc_ctx as *mut _));
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Other("avformat_new_stream failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
                 }
                 (*st).time_base = (*enc_ctx).time_base;
                 let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
@@ -401,7 +401,7 @@ mod ogg_ffmpeg_backend {
                     960
                 };
                 let fifo = AudioFifo::new(in_fmt, Rational::new(1, 48_000))
-                    .map_err(|_| AudioFileError::Format("failed to create AudioFifo"))?;
+                    .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
 
                 Ok(Self {
                     oc,
@@ -415,23 +415,23 @@ mod ogg_ffmpeg_backend {
             }
         }
 
-        fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioFileResult<()> {
+        fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioIOResult<()> {
             unsafe {
                 let fmt = frame.format();
                 if fmt.sample_rate != 48_000 || fmt.sample_format.is_planar() {
-                    return Err(AudioFileError::Format("Ogg Opus writer expects 48kHz packed samples"));
+                    return Err(AudioIOError::Format("Ogg Opus writer expects 48kHz packed samples"));
                 }
                 let nb = frame.nb_samples();
-                let plane = frame.plane(0).ok_or(AudioFileError::Format("missing plane 0"))?;
+                let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
                 let bps = fmt.sample_format.bytes_per_sample();
                 let expected = nb * (fmt.channels() as usize) * bps;
                 if plane.len() != expected {
-                    return Err(AudioFileError::Format("unexpected interleaved plane size"));
+                    return Err(AudioIOError::Format("unexpected interleaved plane size"));
                 }
 
                 let avf = ff::av_frame_alloc();
                 if avf.is_null() {
-                    return Err(AudioFileError::Codec(CodecError::Other("av_frame_alloc failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("av_frame_alloc failed".into())));
                 }
                 (*avf).nb_samples = nb as i32;
                 (*avf).format = (*self.enc_ctx).sample_fmt as i32;
@@ -449,7 +449,7 @@ mod ogg_ffmpeg_backend {
                 let dst = (*avf).data[0] as *mut u8;
                 if dst.is_null() {
                     ff::av_frame_free(&mut (avf as *mut _));
-                    return Err(AudioFileError::Format("ffmpeg frame data[0] is null"));
+                    return Err(AudioIOError::Format("ffmpeg frame data[0] is null"));
                 }
                 ptr::copy_nonoverlapping(plane.as_ptr(), dst, expected);
                 (*avf).pts = self.next_pts;
@@ -465,7 +465,7 @@ mod ogg_ffmpeg_backend {
                 loop {
                     let pkt = ff::av_packet_alloc();
                     if pkt.is_null() {
-                        return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                        return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                     }
                     let ret = ff::avcodec_receive_packet(self.enc_ctx, pkt);
                     if ret < 0 {
@@ -494,7 +494,7 @@ mod ogg_ffmpeg_backend {
             }
         }
 
-        fn flush_encoder(&mut self) -> AudioFileResult<()> {
+        fn flush_encoder(&mut self) -> AudioIOResult<()> {
             unsafe {
                 let ret = ff::avcodec_send_frame(self.enc_ctx, ptr::null());
                 if ret < 0 {
@@ -503,7 +503,7 @@ mod ogg_ffmpeg_backend {
                 loop {
                     let pkt = ff::av_packet_alloc();
                     if pkt.is_null() {
-                        return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                        return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                     }
                     let ret = ff::avcodec_receive_packet(self.enc_ctx, pkt);
                     if ret < 0 {
@@ -555,25 +555,25 @@ mod ogg_ffmpeg_backend {
     }
 
     impl AudioWriter for OpusOggWriter {
-        fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+        fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
             if self.finished {
-                return Err(AudioFileError::Codec(CodecError::InvalidState("already finalized")));
+                return Err(AudioIOError::Codec(CodecError::InvalidState("already finalized")));
             }
             self.fifo
                 .push_frame(frame)
-                .map_err(|_| AudioFileError::Format("AudioFifo push failed (format mismatch?)"))?;
+                .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
             while let Some(chunk) = self
                 .fifo
                 .pop_frame(self.frame_samples)
-                .map_err(|_| AudioFileError::Format("AudioFifo pop failed"))?
+                .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
             {
                 self.encode_and_mux(&chunk)?;
             }
             Ok(())
         }
 
-        fn finalize(&mut self) -> AudioFileResult<()> {
+        fn finalize(&mut self) -> AudioIOResult<()> {
             if self.finished {
                 return Ok(());
             }
@@ -583,20 +583,20 @@ mod ogg_ffmpeg_backend {
                 if let Some(partial) = self
                     .fifo
                     .pop_frame(remain)
-                    .map_err(|_| AudioFileError::Format("AudioFifo pop last failed"))?
+                    .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
                 {
                     // pad zeros
                     let mut padded = AudioFrame::new_alloc(self.fifo.format(), self.frame_samples)
-                        .map_err(|_| AudioFileError::Format("failed to alloc padded frame"))?;
-                    padded.set_time_base(partial.time_base()).map_err(|_| AudioFileError::Format("invalid time_base"))?;
+                        .map_err(|_| AudioIOError::Format("failed to alloc padded frame"))?;
+                    padded.set_time_base(partial.time_base()).map_err(|_| AudioIOError::Format("invalid time_base"))?;
                     padded.set_pts(partial.pts());
 
                     let fmt = partial.format();
                     let bps = fmt.sample_format.bytes_per_sample();
                     let ch = fmt.channels() as usize;
                     let bytes = remain * ch * bps;
-                    let src = partial.plane(0).ok_or(AudioFileError::Format("missing plane 0"))?;
-                    let dst = padded.plane_mut(0).ok_or(AudioFileError::Format("missing padded plane 0"))?;
+                    let src = partial.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
+                    let dst = padded.plane_mut(0).ok_or(AudioIOError::Format("missing padded plane 0"))?;
                     dst[..bytes].copy_from_slice(&src[..bytes]);
                     self.encode_and_mux(&padded)?;
                 }
@@ -632,9 +632,9 @@ mod ogg_ffmpeg_backend {
     unsafe impl Send for OpusOggReader {}
 
     impl OpusOggReader {
-        pub fn open<P: AsRef<Path>>(path: P) -> AudioFileResult<Self> {
+        pub fn open<P: AsRef<Path>>(path: P) -> AudioIOResult<Self> {
             let in_path = path.as_ref().to_string_lossy();
-            let in_c = CString::new(in_path.as_bytes()).map_err(|_| AudioFileError::Format("path contains NUL"))?;
+            let in_c = CString::new(in_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
             unsafe {
                 let mut ic: *mut ff::AVFormatContext = ptr::null_mut();
@@ -659,7 +659,7 @@ mod ogg_ffmpeg_backend {
                 }
                 if best < 0 {
                     ff::avformat_close_input(&mut ic);
-                    return Err(AudioFileError::Format("no audio stream found"));
+                    return Err(AudioIOError::Format("no audio stream found"));
                 }
                 let st = *(*ic).streams.offset(best as isize);
                 let tb = tb_from_avr((*st).time_base);
@@ -688,11 +688,11 @@ mod ogg_ffmpeg_backend {
             }
         }
 
-        fn read_next_packet(&mut self) -> AudioFileResult<Option<CodecPacket>> {
+        fn read_next_packet(&mut self) -> AudioIOResult<Option<CodecPacket>> {
             unsafe {
                 let pkt = ff::av_packet_alloc();
                 if pkt.is_null() {
-                    return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                 }
                 loop {
                     let ret = ff::av_read_frame(self.fmt_ctx, pkt);
@@ -740,7 +740,7 @@ mod ogg_ffmpeg_backend {
     }
 
     impl AudioReader for OpusOggReader {
-        fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
+        fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
             loop {
                 match self.dec.receive_frame() {
                     Ok(f) => return Ok(Some(f)),

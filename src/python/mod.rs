@@ -49,7 +49,7 @@ use crate::runner::async_auto_runner::AsyncAutoRunner;
 // use crate::runner::auto_runner::AutoRunner;
 use crate::runner::error::{RunnerError, RunnerResult};
 use crate::common::io::file as rs_file;
-use crate::common::io::file::{AudioFileError, AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
+use crate::common::io::file::{AudioIOError, AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
 use crate::common::io::io::{AudioReader, AudioWriter};
 
 fn map_codec_err(e: CodecError) -> PyErr {
@@ -553,7 +553,7 @@ fn pyerr_to_runner_err(e: PyErr) -> RunnerError {
     RunnerError::Codec(CodecError::Other(e.to_string()))
 }
 
-fn map_file_err(e: AudioFileError) -> PyErr {
+fn map_file_err(e: AudioIOError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 

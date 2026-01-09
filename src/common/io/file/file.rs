@@ -10,40 +10,31 @@ use super::flac_file::{FlacReader, FlacWriter, FlacWriterConfig};
 use super::mp3_file::{Mp3Reader, Mp3Writer};
 use super::opus_file::{OpusOggReader, OpusOggWriter};
 use super::wav_file::{WavReader, WavWriter};
-use crate::common::io::io::{AudioReader, AudioWriter};
+use crate::common::io::io::{AudioReader, AudioWriter, AudioIOResult, AudioIOError};
 
-#[derive(Debug)]
-pub enum AudioFileError {
-    Io(std::io::Error),
-    Codec(CodecError),
-    Format(&'static str),
-}
-
-impl fmt::Display for AudioFileError {
+impl fmt::Display for AudioIOError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AudioFileError::Io(e) => write!(f, "io error: {e}"),
-            AudioFileError::Codec(e) => write!(f, "codec error: {e}"),
-            AudioFileError::Format(msg) => write!(f, "format error: {msg}"),
+            AudioIOError::Io(e) => write!(f, "io error: {e}"),
+            AudioIOError::Codec(e) => write!(f, "codec error: {e}"),
+            AudioIOError::Format(msg) => write!(f, "format error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for AudioFileError {}
+impl std::error::Error for AudioIOError {}
 
-impl From<std::io::Error> for AudioFileError {
+impl From<std::io::Error> for AudioIOError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
     }
 }
 
-impl From<CodecError> for AudioFileError {
+impl From<CodecError> for AudioIOError {
     fn from(e: CodecError) -> Self {
         Self::Codec(e)
     }
 }
-
-pub type AudioFileResult<T> = Result<T, AudioFileError>;
 
 /// 当前支持的“文件封装格式”。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +92,7 @@ pub enum AudioFileReader {
 }
 
 impl AudioFileWriter {
-    pub fn create<P: AsRef<Path>>(path: P, cfg: AudioFileWriteConfig) -> AudioFileResult<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, cfg: AudioFileWriteConfig) -> AudioIOResult<Self> {
         match cfg {
             AudioFileWriteConfig::AacAdts(enc_cfg) => Ok(Self::AacAdts(AacAdtsWriter::create(path, enc_cfg)?)),
             AudioFileWriteConfig::Flac(cfg) => Ok(Self::Flac(FlacWriter::create(path, cfg)?)),
@@ -113,7 +104,7 @@ impl AudioFileWriter {
 }
 
 impl AudioFileReader {
-    pub fn open<P: AsRef<Path>>(path: P, cfg: AudioFileReadConfig) -> AudioFileResult<Self> {
+    pub fn open<P: AsRef<Path>>(path: P, cfg: AudioFileReadConfig) -> AudioIOResult<Self> {
         match cfg {
             AudioFileReadConfig::AacAdts => Ok(Self::AacAdts(AacAdtsReader::open(path)?)),
             AudioFileReadConfig::Flac => Ok(Self::Flac(FlacReader::open(path)?)),
@@ -125,7 +116,7 @@ impl AudioFileReader {
 }
 
 impl AudioWriter for AudioFileWriter {
-    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
         match self {
             AudioFileWriter::AacAdts(w) => w.write_frame(frame),
             AudioFileWriter::Flac(w) => w.write_frame(frame),
@@ -135,7 +126,7 @@ impl AudioWriter for AudioFileWriter {
         }
     }
 
-    fn finalize(&mut self) -> AudioFileResult<()> {
+    fn finalize(&mut self) -> AudioIOResult<()> {
         match self {
             AudioFileWriter::AacAdts(w) => w.finalize(),
             AudioFileWriter::Flac(w) => w.finalize(),
@@ -147,7 +138,7 @@ impl AudioWriter for AudioFileWriter {
 }
 
 impl AudioReader for AudioFileReader {
-    fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
+    fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
         match self {
             AudioFileReader::AacAdts(r) => r.next_frame(),
             AudioFileReader::Flac(r) => r.next_frame(),

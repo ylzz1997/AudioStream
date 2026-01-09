@@ -1,4 +1,4 @@
-use super::file::{AudioFileError, AudioFileResult};
+use crate::common::io::io::{AudioIOResult, AudioIOError};
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
@@ -29,7 +29,7 @@ pub struct Mp3Writer {
 }
 
 impl Mp3Writer {
-    pub fn create<P: AsRef<Path>>(path: P, cfg: Mp3WriterConfig) -> AudioFileResult<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, cfg: Mp3WriterConfig) -> AudioIOResult<Self> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         let w = BufWriter::new(File::create(path)?);
         let enc_cfg = cfg.encoder;
@@ -40,23 +40,23 @@ impl Mp3Writer {
         let frame_samples = enc.preferred_frame_samples().unwrap_or(1152);
         let time_base = Rational::new(1, sample_rate as i32);
         let fifo = AudioFifo::new(fmt, time_base)
-            .map_err(|_| AudioFileError::Format("failed to create AudioFifo"))?;
+            .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
         Ok(Self { w, enc, fifo, frame_samples })
     }
 }
 
 impl AudioWriter for Mp3Writer {
-    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+    fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         // 先入 FIFO，再按 mp3 frame_size 重分帧输出
         self.fifo
             .push_frame(frame)
-            .map_err(|_| AudioFileError::Format("AudioFifo push failed (format mismatch?)"))?;
+            .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
         while let Some(chunk) = self
             .fifo
             .pop_frame(self.frame_samples)
-            .map_err(|_| AudioFileError::Format("AudioFifo pop failed"))?
+            .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
         {
             self.enc.send_frame(Some(&chunk))?;
             drain_mp3_packets(&mut self.enc, &mut self.w)?;
@@ -64,7 +64,7 @@ impl AudioWriter for Mp3Writer {
         Ok(())
     }
 
-    fn finalize(&mut self) -> AudioFileResult<()> {
+    fn finalize(&mut self) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         use crate::codec::error::CodecError;
         // 先把 FIFO 里剩余数据作为“最后一帧”（允许 < frame_samples）送入
@@ -73,7 +73,7 @@ impl AudioWriter for Mp3Writer {
             if let Some(last) = self
                 .fifo
                 .pop_frame(remain)
-                .map_err(|_| AudioFileError::Format("AudioFifo pop last failed"))?
+                .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
             {
                 self.enc.send_frame(Some(&last))?;
                 drain_mp3_packets(&mut self.enc, &mut self.w)?;
@@ -98,7 +98,7 @@ impl AudioWriter for Mp3Writer {
 fn drain_mp3_packets(
     enc: &mut crate::codec::encoder::mp3_encoder::Mp3Encoder,
     w: &mut BufWriter<File>,
-) -> AudioFileResult<()> {
+) -> AudioIOResult<()> {
     use crate::codec::encoder::encoder_interface::AudioEncoder;
     use crate::codec::error::CodecError;
     loop {
@@ -128,7 +128,7 @@ pub struct Mp3Reader {
 unsafe impl Send for Mp3Reader {}
 
 impl Mp3Reader {
-    pub fn open<P: AsRef<Path>>(path: P) -> AudioFileResult<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> AudioIOResult<Self> {
         let mut r = BufReader::new(File::open(path)?);
         let mut data = Vec::new();
         r.read_to_end(&mut data)?;
@@ -145,13 +145,13 @@ impl Mp3Reader {
             // 所以先在 file 层自己建一个 codec ctx 仅用于 parser。
             let codec = ff::avcodec_find_decoder_by_name(std::ffi::CString::new("mp3").unwrap().as_ptr());
             if codec.is_null() {
-                return Err(AudioFileError::Codec(crate::codec::error::CodecError::Unsupported(
+                return Err(AudioIOError::Codec(crate::codec::error::CodecError::Unsupported(
                     "FFmpeg MP3 decoder not found",
                 )));
             }
             let dec_ctx = ff::avcodec_alloc_context3(codec);
             if dec_ctx.is_null() {
-                return Err(AudioFileError::Codec(crate::codec::error::CodecError::Other(
+                return Err(AudioIOError::Codec(crate::codec::error::CodecError::Other(
                     "avcodec_alloc_context3 failed".into(),
                 )));
             }
@@ -159,7 +159,7 @@ impl Mp3Reader {
             let parser = ff::av_parser_init((*codec).id as i32);
             if parser.is_null() {
                 ff::avcodec_free_context(&mut (dec_ctx as *mut _));
-                return Err(AudioFileError::Format("av_parser_init failed"));
+                return Err(AudioIOError::Format("av_parser_init failed"));
             }
             return Ok(Self {
                 data,
@@ -203,7 +203,7 @@ impl Drop for Mp3Reader {
 }
 
 impl AudioReader for Mp3Reader {
-    fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
+    fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
         use crate::codec::decoder::decoder_interface::AudioDecoder;
         use crate::codec::error::CodecError;
 
@@ -227,10 +227,10 @@ impl AudioReader for Mp3Reader {
 }
 
 impl Mp3Reader {
-    fn next_packet(&mut self) -> AudioFileResult<Option<crate::codec::packet::CodecPacket>> {
+    fn next_packet(&mut self) -> AudioIOResult<Option<crate::codec::packet::CodecPacket>> {
         #[cfg(not(feature = "ffmpeg"))]
         {
-            return Err(AudioFileError::Codec(crate::codec::error::CodecError::Unsupported(
+            return Err(AudioIOError::Codec(crate::codec::error::CodecError::Unsupported(
                 "MP3 reader requires ffmpeg feature (parser)",
             )));
         }
@@ -259,7 +259,7 @@ impl Mp3Reader {
                 );
 
                 if consumed < 0 {
-                    return Err(AudioFileError::Format("mp3 parse failed"));
+                    return Err(AudioIOError::Format("mp3 parse failed"));
                 }
                 if consumed == 0 && out_len == 0 {
                     // 防止极端情况下死循环：无法前进则结束

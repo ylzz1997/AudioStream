@@ -1,4 +1,4 @@
-use super::file::{AudioFileError, AudioFileResult};
+use crate::common::io::io::{AudioIOResult, AudioIOError};
 use crate::codec::error::CodecError;
 use crate::codec::packet::CodecPacket;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
@@ -34,8 +34,8 @@ pub struct FlacWriter;
 
 #[cfg(not(feature = "ffmpeg"))]
 impl FlacWriter {
-    pub fn create<P: AsRef<Path>>(_path: P, _cfg: FlacWriterConfig) -> AudioFileResult<Self> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    pub fn create<P: AsRef<Path>>(_path: P, _cfg: FlacWriterConfig) -> AudioIOResult<Self> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "FLAC writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -43,14 +43,14 @@ impl FlacWriter {
 
 #[cfg(not(feature = "ffmpeg"))]
 impl AudioWriter for FlacWriter {
-    fn write_frame(&mut self, _frame: &dyn AudioFrameView) -> AudioFileResult<()> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn write_frame(&mut self, _frame: &dyn AudioFrameView) -> AudioIOResult<()> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "FLAC writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
 
-    fn finalize(&mut self) -> AudioFileResult<()> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn finalize(&mut self) -> AudioIOResult<()> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "FLAC writer requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -61,8 +61,8 @@ pub struct FlacReader;
 
 #[cfg(not(feature = "ffmpeg"))]
 impl FlacReader {
-    pub fn open<P: AsRef<Path>>(_path: P) -> AudioFileResult<Self> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    pub fn open<P: AsRef<Path>>(_path: P) -> AudioIOResult<Self> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "FLAC reader requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -70,8 +70,8 @@ impl FlacReader {
 
 #[cfg(not(feature = "ffmpeg"))]
 impl AudioReader for FlacReader {
-    fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
-        Err(AudioFileError::Codec(CodecError::Unsupported(
+    fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
+        Err(AudioIOError::Codec(CodecError::Unsupported(
             "FLAC reader requires FFmpeg backend (enable feature=ffmpeg)",
         )))
     }
@@ -89,15 +89,15 @@ mod ffmpeg_backend {
     use libc;
     use crate::common::ffmpeg_util::ff_err_to_string;
 
-    fn map_ff_err(err: i32) -> AudioFileError {
-        AudioFileError::Codec(CodecError::Other(ff_err_to_string(err)))
+    fn map_ff_err(err: i32) -> AudioIOError {
+        AudioIOError::Codec(CodecError::Other(ff_err_to_string(err)))
     }
 
     fn tb_from_avr(tb: ff::AVRational) -> Rational {
         Rational::new(tb.num, tb.den)
     }
 
-    fn map_sample_format(sf: SampleFormat) -> AudioFileResult<ff::AVSampleFormat> {
+    fn map_sample_format(sf: SampleFormat) -> AudioIOResult<ff::AVSampleFormat> {
         use ff::AVSampleFormat::*;
         let av = match sf {
             SampleFormat::U8 { planar: false } => AV_SAMPLE_FMT_U8,
@@ -129,14 +129,14 @@ mod ffmpeg_backend {
     unsafe impl Send for FlacWriter {}
 
     impl FlacWriter {
-        pub fn create<P: AsRef<Path>>(path: P, cfg: FlacWriterConfig) -> AudioFileResult<Self> {
+        pub fn create<P: AsRef<Path>>(path: P, cfg: FlacWriterConfig) -> AudioIOResult<Self> {
             let out_path = path.as_ref().to_string_lossy();
-            let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioFileError::Format("path contains NUL"))?;
+            let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
             let in_fmt = cfg.input_format;
             let time_base = Rational::new(1, in_fmt.sample_rate as i32);
             let fifo =
-                AudioFifo::new(in_fmt, time_base).map_err(|_| AudioFileError::Format("failed to create AudioFifo"))?;
+                AudioFifo::new(in_fmt, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
 
             unsafe {
                 // allocate output context (deduce container by extension: .flac => flac)
@@ -152,16 +152,16 @@ mod ffmpeg_backend {
                 }
 
                 // encoder (flac)
-                let name = CString::new("flac").map_err(|_| AudioFileError::Format("codec name contains NUL"))?;
+                let name = CString::new("flac").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
                 let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
                 if codec.is_null() {
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Unsupported("FFmpeg FLAC encoder not found")));
+                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg FLAC encoder not found")));
                 }
                 let enc_ctx = ff::avcodec_alloc_context3(codec);
                 if enc_ctx.is_null() {
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
                 }
 
                 (*enc_ctx).sample_rate = in_fmt.sample_rate as i32;
@@ -204,7 +204,7 @@ mod ffmpeg_backend {
                 if st.is_null() {
                     ff::avcodec_free_context(&mut (enc_ctx as *mut _));
                     ff::avformat_free_context(oc);
-                    return Err(AudioFileError::Codec(CodecError::Other("avformat_new_stream failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
                 }
                 (*st).time_base = (*enc_ctx).time_base;
                 let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
@@ -254,14 +254,14 @@ mod ffmpeg_backend {
             }
         }
 
-        fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioFileResult<()> {
+        fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioIOResult<()> {
             unsafe {
                 let fmt = frame.format();
                 if fmt.sample_rate as i32 != (*self.enc_ctx).sample_rate {
-                    return Err(AudioFileError::Format("FLAC writer expects fixed sample_rate"));
+                    return Err(AudioIOError::Format("FLAC writer expects fixed sample_rate"));
                 }
                 if fmt != self.fifo.format() {
-                    return Err(AudioFileError::Format("FLAC writer format mismatch (no resample/convert layer yet)"));
+                    return Err(AudioIOError::Format("FLAC writer format mismatch (no resample/convert layer yet)"));
                 }
 
                 let nb = frame.nb_samples();
@@ -270,7 +270,7 @@ mod ffmpeg_backend {
 
                 let avf = ff::av_frame_alloc();
                 if avf.is_null() {
-                    return Err(AudioFileError::Codec(CodecError::Other("av_frame_alloc failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("av_frame_alloc failed".into())));
                 }
                 (*avf).nb_samples = nb as i32;
                 (*avf).format = (*self.enc_ctx).sample_fmt as i32;
@@ -289,29 +289,29 @@ mod ffmpeg_backend {
                 if fmt.is_planar() {
                     let expected = nb * bps;
                     for ch in 0..channels {
-                        let src = frame.plane(ch).ok_or(AudioFileError::Format("missing plane"))?;
+                        let src = frame.plane(ch).ok_or(AudioIOError::Format("missing plane"))?;
                         if src.len() != expected {
                             ff::av_frame_free(&mut (avf as *mut _));
-                            return Err(AudioFileError::Format("unexpected plane size"));
+                            return Err(AudioIOError::Format("unexpected plane size"));
                         }
                         let dst = (*avf).data[ch] as *mut u8;
                         if dst.is_null() {
                             ff::av_frame_free(&mut (avf as *mut _));
-                            return Err(AudioFileError::Format("ffmpeg frame plane is null"));
+                            return Err(AudioIOError::Format("ffmpeg frame plane is null"));
                         }
                         ptr::copy_nonoverlapping(src.as_ptr(), dst, expected);
                     }
                 } else {
                     let expected = nb * channels * bps;
-                    let src = frame.plane(0).ok_or(AudioFileError::Format("missing plane 0"))?;
+                    let src = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
                     if src.len() != expected {
                         ff::av_frame_free(&mut (avf as *mut _));
-                        return Err(AudioFileError::Format("unexpected interleaved plane size"));
+                        return Err(AudioIOError::Format("unexpected interleaved plane size"));
                     }
                     let dst = (*avf).data[0] as *mut u8;
                     if dst.is_null() {
                         ff::av_frame_free(&mut (avf as *mut _));
-                        return Err(AudioFileError::Format("ffmpeg frame data[0] is null"));
+                        return Err(AudioIOError::Format("ffmpeg frame data[0] is null"));
                     }
                     ptr::copy_nonoverlapping(src.as_ptr(), dst, expected);
                 }
@@ -329,7 +329,7 @@ mod ffmpeg_backend {
                 loop {
                     let pkt = ff::av_packet_alloc();
                     if pkt.is_null() {
-                        return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                        return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                     }
                     let ret = ff::avcodec_receive_packet(self.enc_ctx, pkt);
                     if ret < 0 {
@@ -358,7 +358,7 @@ mod ffmpeg_backend {
             }
         }
 
-        fn flush_encoder(&mut self) -> AudioFileResult<()> {
+        fn flush_encoder(&mut self) -> AudioIOResult<()> {
             unsafe {
                 let ret = ff::avcodec_send_frame(self.enc_ctx, ptr::null());
                 if ret < 0 {
@@ -367,7 +367,7 @@ mod ffmpeg_backend {
                 loop {
                     let pkt = ff::av_packet_alloc();
                     if pkt.is_null() {
-                        return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                        return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                     }
                     let ret = ff::avcodec_receive_packet(self.enc_ctx, pkt);
                     if ret < 0 {
@@ -418,25 +418,25 @@ mod ffmpeg_backend {
     }
 
     impl AudioWriter for FlacWriter {
-        fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioFileResult<()> {
+        fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
             if self.finished {
-                return Err(AudioFileError::Codec(CodecError::InvalidState("already finalized")));
+                return Err(AudioIOError::Codec(CodecError::InvalidState("already finalized")));
             }
             self.fifo
                 .push_frame(frame)
-                .map_err(|_| AudioFileError::Format("AudioFifo push failed (format mismatch?)"))?;
+                .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
             while let Some(chunk) = self
                 .fifo
                 .pop_frame(self.frame_samples)
-                .map_err(|_| AudioFileError::Format("AudioFifo pop failed"))?
+                .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
             {
                 self.encode_and_mux(&chunk)?;
             }
             Ok(())
         }
 
-        fn finalize(&mut self) -> AudioFileResult<()> {
+        fn finalize(&mut self) -> AudioIOResult<()> {
             if self.finished {
                 return Ok(());
             }
@@ -447,7 +447,7 @@ mod ffmpeg_backend {
                 if let Some(last) = self
                     .fifo
                     .pop_frame(remain)
-                    .map_err(|_| AudioFileError::Format("AudioFifo pop last failed"))?
+                    .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
                 {
                     self.encode_and_mux(&last)?;
                 }
@@ -483,9 +483,9 @@ mod ffmpeg_backend {
     unsafe impl Send for FlacReader {}
 
     impl FlacReader {
-        pub fn open<P: AsRef<Path>>(path: P) -> AudioFileResult<Self> {
+        pub fn open<P: AsRef<Path>>(path: P) -> AudioIOResult<Self> {
             let in_path = path.as_ref().to_string_lossy();
-            let in_c = CString::new(in_path.as_bytes()).map_err(|_| AudioFileError::Format("path contains NUL"))?;
+            let in_c = CString::new(in_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
             unsafe {
                 let mut ic: *mut ff::AVFormatContext = ptr::null_mut();
@@ -515,7 +515,7 @@ mod ffmpeg_backend {
                 }
                 if best < 0 {
                     ff::avformat_close_input(&mut ic);
-                    return Err(AudioFileError::Format("no audio stream found"));
+                    return Err(AudioIOError::Format("no audio stream found"));
                 }
                 let st = *(*ic).streams.offset(best as isize);
                 let tb = tb_from_avr((*st).time_base);
@@ -532,11 +532,11 @@ mod ffmpeg_backend {
             }
         }
 
-        fn read_next_packet(&mut self) -> AudioFileResult<Option<CodecPacket>> {
+        fn read_next_packet(&mut self) -> AudioIOResult<Option<CodecPacket>> {
             unsafe {
                 let pkt = ff::av_packet_alloc();
                 if pkt.is_null() {
-                    return Err(AudioFileError::Codec(CodecError::Other("av_packet_alloc failed".into())));
+                    return Err(AudioIOError::Codec(CodecError::Other("av_packet_alloc failed".into())));
                 }
                 loop {
                     let ret = ff::av_read_frame(self.fmt_ctx, pkt);
@@ -584,7 +584,7 @@ mod ffmpeg_backend {
     }
 
     impl AudioReader for FlacReader {
-        fn next_frame(&mut self) -> AudioFileResult<Option<AudioFrame>> {
+        fn next_frame(&mut self) -> AudioIOResult<Option<AudioFrame>> {
             loop {
                 match self.dec.receive_frame() {
                     Ok(f) => return Ok(Some(f)),
