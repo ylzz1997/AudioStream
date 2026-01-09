@@ -6,6 +6,7 @@ use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
 use crate::runner::auto_runner::AutoRunner;
 use crate::runner::error::RunnerResult;
+use async_trait::async_trait;
 
 /// 异步动态 Runner（薄封装）：Source(NodeBuffer) -> AsyncDynPipeline -> Sink(NodeBuffer)
 pub struct AsyncDynRunner<S, K>
@@ -38,15 +39,14 @@ where
     }
 }
 
+#[async_trait(?Send)]
 impl<S, K> AsyncRunner for AsyncDynRunner<S, K>
 where
     S: AudioSource<Out = NodeBuffer>,
     K: AudioSink<In = NodeBuffer>,
 {
-    fn execute<'a>(
-        &'a mut self,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = crate::runner::error::RunnerResult<()>> + 'a>> {
-        self.inner.execute()
+    async fn execute(&mut self) -> RunnerResult<()> {
+        self.inner.execute().await
     }
 }
 

@@ -7,7 +7,7 @@ use crate::runner::audio_sink::AudioSink;
 use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
 use crate::runner::error::RunnerResult;
-use core::pin::Pin;
+use async_trait::async_trait;
 
 /// 自动 Runner：给定一个 `AudioSource`、一个 `AsyncPipeline`、一个 `AudioSink`，
 /// 自动完成 push / drain / flush / finalize 的完整驱动。
@@ -48,41 +48,40 @@ where
     }
 }
 
+#[async_trait(?Send)]
 impl<P, S, K> AsyncRunner for AutoRunner<P, S, K>
 where
     P: AsyncPipeline,
     S: AudioSource<Out = P::In>,
     K: AudioSink<In = P::Out>,
 {
-    fn execute<'a>(&'a mut self) -> Pin<Box<dyn core::future::Future<Output = RunnerResult<()>> + 'a>> {
-        Box::pin(async move {
-            // ---- feed ----
-            'feed: while let Some(v) = self.source.pull()? {
-                self.pipeline.push_frame(v)?;
-                // 尽可能把末端输出写入 sink，避免内存堆积
-                loop {
-                    match self.pipeline.try_get_frame() {
-                        Ok(out) => self.sink.push(out)?,
-                        Err(CodecError::Again) => break,
-                        Err(CodecError::Eof) => break 'feed,
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            }
-
-            // ---- flush ----
-            self.pipeline.flush()?;
+    async fn execute(&mut self) -> RunnerResult<()> {
+        // ---- feed ----
+        'feed: while let Some(v) = self.source.pull()? {
+            self.pipeline.push_frame(v)?;
+            // 尽可能把末端输出写入 sink，避免内存堆积
             loop {
-                match self.pipeline.get_frame().await {
+                match self.pipeline.try_get_frame() {
                     Ok(out) => self.sink.push(out)?,
-                    Err(CodecError::Eof) => break,
+                    Err(CodecError::Again) => break,
+                    Err(CodecError::Eof) => break 'feed,
                     Err(e) => return Err(e.into()),
                 }
             }
+        }
 
-            self.sink.finalize()?;
-            Ok(())
-        })
+        // ---- flush ----
+        self.pipeline.flush()?;
+        loop {
+            match self.pipeline.get_frame().await {
+                Ok(out) => self.sink.push(out)?,
+                Err(CodecError::Eof) => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        self.sink.finalize()?;
+        Ok(())
     }
 }
 

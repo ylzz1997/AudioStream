@@ -1,10 +1,12 @@
 use crate::runner::error::RunnerResult;
-use core::future::Future;
-use core::pin::Pin;
+use async_trait::async_trait;
 
-/// 异步 Runner：返回一个 Future，执行完成后表示整个链路跑完并 finalize 了 sink。
+/// 异步 Runner：执行完成后表示整个链路跑完并 finalize 了 sink。
+///
+/// 使用 `async-trait` 把 `async fn` 降级成可编译的 trait 方法。
+#[async_trait(?Send)]
 pub trait AsyncRunner {
-    fn execute<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = RunnerResult<()>> + 'a>>;
+    async fn execute(&mut self) -> RunnerResult<()>;
 }
 
 

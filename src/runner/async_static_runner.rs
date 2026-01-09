@@ -4,6 +4,8 @@ use crate::runner::audio_sink::AudioSink;
 use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
 use crate::runner::auto_runner::AutoRunner;
+use crate::runner::error::RunnerResult;
+use async_trait::async_trait;
 
 /// 异步静态 Runner（固定 3 段）：Source(N1::In) -> AsyncPipeline3 -> Sink(N3::Out)。
 pub struct AsyncStaticRunner3<S, K, N1, N2, N3>
@@ -40,6 +42,7 @@ where
     }
 }
 
+#[async_trait(?Send)]
 impl<S, K, N1, N2, N3> AsyncRunner for AsyncStaticRunner3<S, K, N1, N2, N3>
 where
     N1: StaticNode + Send + 'static,
@@ -52,10 +55,8 @@ where
     S: AudioSource<Out = N1::In>,
     K: AudioSink<In = N3::Out>,
 {
-    fn execute<'a>(
-        &'a mut self,
-    ) -> core::pin::Pin<Box<dyn core::future::Future<Output = crate::runner::error::RunnerResult<()>> + 'a>> {
-        self.inner.execute()
+    async fn execute(&mut self) -> RunnerResult<()> {
+        self.inner.execute().await
     }
 }
 
