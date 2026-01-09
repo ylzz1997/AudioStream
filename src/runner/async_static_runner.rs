@@ -3,7 +3,7 @@ use crate::pipeline::node::static_node_interface::StaticNode;
 use crate::runner::audio_sink::AudioSink;
 use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
-use crate::runner::auto_runner::AutoRunner;
+use crate::runner::async_auto_runner::AsyncAutoRunner;
 use crate::runner::error::RunnerResult;
 use async_trait::async_trait;
 
@@ -17,10 +17,10 @@ where
     N1::Out: Send + 'static,
     N2::Out: Send + 'static,
     N3::Out: Send + 'static,
-    S: AudioSource<Out = N1::In>,
-    K: AudioSink<In = N3::Out>,
+    S: AudioSource<Out = N1::In> + Send + 'static,
+    K: AudioSink<In = N3::Out> + Send + 'static,
 {
-    inner: AutoRunner<AsyncPipeline3<N1, N2, N3>, S, K>,
+    inner: AsyncAutoRunner<AsyncPipeline3<N1, N2, N3>, S, K>,
 }
 
 impl<S, K, N1, N2, N3> AsyncStaticRunner3<S, K, N1, N2, N3>
@@ -32,12 +32,12 @@ where
     N1::Out: Send + 'static,
     N2::Out: Send + 'static,
     N3::Out: Send + 'static,
-    S: AudioSource<Out = N1::In>,
-    K: AudioSink<In = N3::Out>,
+    S: AudioSource<Out = N1::In> + Send + 'static,
+    K: AudioSink<In = N3::Out> + Send + 'static,
 {
     pub fn new(source: S, pipeline: AsyncPipeline3<N1, N2, N3>, sink: K) -> Self {
         Self {
-            inner: AutoRunner::new(source, pipeline, sink),
+            inner: AsyncAutoRunner::new(source, pipeline, sink),
         }
     }
 }
@@ -52,8 +52,8 @@ where
     N1::Out: Send + 'static,
     N2::Out: Send + 'static,
     N3::Out: Send + 'static,
-    S: AudioSource<Out = N1::In>,
-    K: AudioSink<In = N3::Out>,
+    S: AudioSource<Out = N1::In> + Send + 'static,
+    K: AudioSink<In = N3::Out> + Send + 'static,
 {
     async fn execute(&mut self) -> RunnerResult<()> {
         self.inner.execute().await

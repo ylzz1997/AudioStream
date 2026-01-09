@@ -2,6 +2,7 @@ use crate::common::audio::audio::AudioFrame;
 use crate::common::io::io::AudioReader;
 use crate::pipeline::node::node_interface::NodeBuffer;
 use crate::runner::error::RunnerResult;
+use async_trait::async_trait;
 use std::collections::VecDeque;
 
 /// 音频源（只出）：Runner 会不断拉取直到返回 `Ok(None)` 表示结束。
@@ -13,6 +14,36 @@ pub trait AudioSource {
     }
 
     fn pull(&mut self) -> RunnerResult<Option<Self::Out>>;
+}
+
+/// 异步音频源（只出）：允许在 tokio runtime 中 `await` 拉取输入。
+#[async_trait]
+pub trait AsyncAudioSource: Send {
+    type Out: Send + 'static;
+
+    fn name(&self) -> &'static str {
+        "async-audio-source"
+    }
+
+    async fn pull(&mut self) -> RunnerResult<Option<Self::Out>>;
+}
+
+/// 同步 source 自动适配为 async source（在 async 上下文里直接同步执行）。
+#[async_trait]
+impl<T> AsyncAudioSource for T
+where
+    T: AudioSource + Send,
+    T::Out: Send + 'static,
+{
+    type Out = T::Out;
+
+    fn name(&self) -> &'static str {
+        AudioSource::name(self)
+    }
+
+    async fn pull(&mut self) -> RunnerResult<Option<Self::Out>> {
+        AudioSource::pull(self)
+    }
 }
 
 /// 让现有的 `AudioReader` 自动成为 `AudioSource<Out = AudioFrame>`。

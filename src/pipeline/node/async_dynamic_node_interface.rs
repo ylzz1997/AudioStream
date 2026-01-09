@@ -2,7 +2,7 @@
 
 use crate::codec::error::{CodecError, CodecResult};
 use crate::pipeline::node::dynamic_node_interface::DynNode;
-use crate::pipeline::node::node_interface::{NodeBuffer, AsyncPipeline};
+use crate::pipeline::node::node_interface::{AsyncPipeline, AsyncPipelineProducer, AsyncPipelineConsumer, AsyncPipelineEndpoint, NodeBuffer};
 use tokio::sync::mpsc;
 use async_trait::async_trait;
 
@@ -136,6 +136,68 @@ pub struct AsyncDynPipeline {
     out_rx: mpsc::UnboundedReceiver<Result<NodeBuffer, CodecError>>,
 }
 
+pub struct AsyncDynPipelineProducer {
+    tx: mpsc::UnboundedSender<Msg>,
+}
+
+pub struct AsyncDynPipelineConsumer {
+    rx: mpsc::UnboundedReceiver<Result<NodeBuffer, CodecError>>,
+}
+
+impl AsyncDynPipelineProducer {
+    pub fn push_frame(&self, buf: NodeBuffer) -> CodecResult<()> {
+        self.tx
+            .send(Ok(Some(buf)))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+
+    pub fn flush(&self) -> CodecResult<()> {
+        self.tx
+            .send(Ok(None))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+}
+
+impl AsyncPipelineProducer for AsyncDynPipelineProducer {
+    type In = NodeBuffer;
+    fn push_frame(&self, frame: Self::In) -> CodecResult<()> {
+        self.push_frame(frame)
+    }
+    fn flush(&self) -> CodecResult<()> {
+        self.flush()
+    }
+}
+
+impl AsyncDynPipelineConsumer {
+    pub fn try_get_frame(&mut self) -> CodecResult<NodeBuffer> {
+        match self.rx.try_recv() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::error::TryRecvError::Empty) => Err(CodecError::Again),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(CodecError::Eof),
+        }
+    }
+
+    pub async fn get_frame(&mut self) -> CodecResult<NodeBuffer> {
+        match self.rx.recv().await {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
+            None => Err(CodecError::Eof),
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncPipelineConsumer for AsyncDynPipelineConsumer {
+    type Out = NodeBuffer;
+    fn try_get_frame(&mut self) -> CodecResult<Self::Out> {
+        self.try_get_frame()
+    }
+    async fn get_frame(&mut self) -> CodecResult<Self::Out> {
+        self.get_frame().await
+    }
+}
+
 impl AsyncDynPipeline {
     pub fn new(nodes: Vec<Box<dyn DynNode>>) -> Result<Self, CodecError> {
         if nodes.is_empty() {
@@ -167,6 +229,14 @@ impl AsyncDynPipeline {
         spawn_last_stage(current, rx, out_tx);
 
         Ok(Self { in_tx, out_rx })
+    }
+
+    /// 拆分为输入端/输出端，用于 runner 并行驱动。
+    pub fn endpoints(self) -> (AsyncDynPipelineProducer, AsyncDynPipelineConsumer) {
+        (
+            AsyncDynPipelineProducer { tx: self.in_tx },
+            AsyncDynPipelineConsumer { rx: self.out_rx },
+        )
     }
 }
 
@@ -204,6 +274,17 @@ impl AsyncPipeline for AsyncDynPipeline {
             Some(Err(e)) => Err(e),
             None => Err(CodecError::Eof),
         }
+    }
+}
+
+impl AsyncPipelineEndpoint for AsyncDynPipeline {
+    type In = NodeBuffer;
+    type Out = NodeBuffer;
+    type Producer = AsyncDynPipelineProducer;
+    type Consumer = AsyncDynPipelineConsumer;
+
+    fn endpoints(self) -> (Self::Producer, Self::Consumer) {
+        self.endpoints()
     }
 }
 

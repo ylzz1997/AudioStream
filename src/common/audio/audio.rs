@@ -161,9 +161,6 @@ impl fmt::Display for AudioError {
 impl std::error::Error for AudioError {}
 
 /// 只读音频帧视图 trait。
-///
-/// 你后续做 encoder/decoder/filter 时，参数尽量接收 `&dyn AudioFrameView`，
-/// 这样 `AudioFrame`、零拷贝引用帧、甚至 wasm 映射内存的帧都能统一接入。
 pub trait AudioFrameView: Send + Sync {
     /// 格式描述（采样率/声道/采样格式）。
     fn format(&self) -> AudioFormat;

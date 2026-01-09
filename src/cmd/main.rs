@@ -46,10 +46,10 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::IdentityNode;
     use audiostream::pipeline::node::node_interface::NodeBufferKind;
+    use audiostream::runner::async_dynamic_runner::AsyncDynRunner;
     use audiostream::runner::async_runner_interface::AsyncRunner;
     use audiostream::runner::audio_sink::PcmSink;
     use audiostream::runner::audio_source::{PcmSource, PrependSource};
-    use audiostream::runner::auto_runner::AutoRunner;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -69,11 +69,12 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     // 先读一帧用于拿格式：用 PrependSource 把它“塞回”source，再由 runner 统一驱动。
     let source = PcmSource::new(PrependSource::new(r, vec![first]));
     let sink = PcmSink::new(w);
-    let mut runner = AutoRunner::new(source, p, sink);
+    // 使用 “endpoints 并行驱动” 的异步 Runner（输入/输出各一个任务）
+    let mut runner = AsyncDynRunner::new(source, p, sink);
     runner
         .execute()
         .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+        .map_err(|e| format!("{e}"))?;
     Ok(())
 }
 
@@ -91,10 +92,10 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::{IdentityNode, ProcessorNode, DynNode};
     use audiostream::pipeline::node::node_interface::NodeBufferKind;
+    use audiostream::runner::async_dynamic_runner::AsyncDynRunner;
     use audiostream::runner::async_runner_interface::AsyncRunner;
     use audiostream::runner::audio_sink::PcmSink;
     use audiostream::runner::audio_source::{PcmSource, PrependSource};
-    use audiostream::runner::auto_runner::AutoRunner;
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;
@@ -163,7 +164,8 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
 
     let source = PcmSource::new(PrependSource::new(r, vec![first]));
     let sink = PcmSink::new(w);
-    let mut runner = AutoRunner::new(source, p, sink);
+    // 使用 “endpoints 并行驱动” 的异步 Runner（输入/输出各一个任务）
+    let mut runner = AsyncDynRunner::new(source, p, sink);
     runner.execute().await.map_err(|e| format!("{e}"))?;
     Ok(())
 }

@@ -45,7 +45,8 @@ use crate::common::audio::audio::AudioFrameViewMut;
 use crate::runner::audio_sink::AudioSink;
 use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner as RsAsyncRunner;
-use crate::runner::auto_runner::AutoRunner;
+use crate::runner::async_auto_runner::AsyncAutoRunner;
+// use crate::runner::auto_runner::AutoRunner;
 use crate::runner::error::{RunnerError, RunnerResult};
 use crate::common::io::file as rs_file;
 use crate::common::io::file::{AudioFileError, AudioFileReader as RsAudioFileReader, AudioFileReadConfig, AudioFileWriter as RsAudioFileWriter, AudioFileWriteConfig};
@@ -1355,7 +1356,7 @@ impl AudioSink for PyCallbackSink {
 #[pyclass(name = "AsyncDynRunner")]
 pub struct AsyncDynRunnerPy {
     rt: Runtime,
-    runner: AutoRunner<AsyncDynPipeline, PyCallbackSource, PyCallbackSink>,
+    runner: AsyncAutoRunner<AsyncDynPipeline, PyCallbackSource, PyCallbackSink>,
 }
 
 #[pymethods]
@@ -1375,7 +1376,7 @@ impl AsyncDynRunnerPy {
         let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
         let _guard = rt.enter();
         let pipeline = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
-        let runner = AutoRunner::new(
+        let runner = AsyncAutoRunner::new(
             PyCallbackSource { obj: source },
             pipeline,
             PyCallbackSink { obj: sink },
@@ -1428,9 +1429,18 @@ impl AudioFileReaderPy {
     }
 
     /// 读取下一帧 PCM（numpy），EOF 返回 None。
-    fn next_frame(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+    ///
+    /// - 默认输出 planar: shape=(channels, samples)
+    /// - layout="interleaved": shape=(samples, channels)
+    #[pyo3(signature = (layout="planar"))]
+    fn next_frame(&mut self, py: Python<'_>, layout: &str) -> PyResult<Option<PyObject>> {
+        let planar = match layout.to_ascii_lowercase().as_str() {
+            "planar" => true,
+            "interleaved" => false,
+            _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
+        };
         match AudioReader::next_frame(&mut self.r).map_err(map_file_err)? {
-            Some(f) => Ok(Some(frame_to_numpy(py, &f, true)?)),
+            Some(f) => Ok(Some(frame_to_numpy(py, &f, planar)?)),
             None => Ok(None),
         }
     }

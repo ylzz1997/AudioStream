@@ -4,27 +4,27 @@ use crate::pipeline::node::node_interface::NodeBuffer;
 use crate::runner::audio_sink::AudioSink;
 use crate::runner::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
-use crate::runner::auto_runner::AutoRunner;
+use crate::runner::async_auto_runner::AsyncAutoRunner;
 use crate::runner::error::RunnerResult;
 use async_trait::async_trait;
 
 /// 异步动态 Runner（薄封装）：Source(NodeBuffer) -> AsyncDynPipeline -> Sink(NodeBuffer)
 pub struct AsyncDynRunner<S, K>
 where
-    S: AudioSource<Out = NodeBuffer>,
-    K: AudioSink<In = NodeBuffer>,
+    S: AudioSource<Out = NodeBuffer> + Send + 'static,
+    K: AudioSink<In = NodeBuffer> + Send + 'static,
 {
-    inner: AutoRunner<AsyncDynPipeline, S, K>,
+    inner: AsyncAutoRunner<AsyncDynPipeline, S, K>,
 }
 
 impl<S, K> AsyncDynRunner<S, K>
 where
-    S: AudioSource<Out = NodeBuffer>,
-    K: AudioSink<In = NodeBuffer>,
+    S: AudioSource<Out = NodeBuffer> + Send + 'static,
+    K: AudioSink<In = NodeBuffer> + Send + 'static,
 {
     pub fn new(source: S, pipeline: AsyncDynPipeline, sink: K) -> Self {
         Self {
-            inner: AutoRunner::new(source, pipeline, sink),
+            inner: AsyncAutoRunner::new(source, pipeline, sink),
         }
     }
 
@@ -33,17 +33,13 @@ where
         let pipeline = AsyncDynPipeline::new(nodes)?;
         Ok(Self::new(source, pipeline, sink))
     }
-
-    pub fn into_inner(self) -> AutoRunner<AsyncDynPipeline, S, K> {
-        self.inner
-    }
 }
 
 #[async_trait(?Send)]
 impl<S, K> AsyncRunner for AsyncDynRunner<S, K>
 where
-    S: AudioSource<Out = NodeBuffer>,
-    K: AudioSink<In = NodeBuffer>,
+    S: AudioSource<Out = NodeBuffer> + Send + 'static,
+    K: AudioSink<In = NodeBuffer> + Send + 'static,
 {
     async fn execute(&mut self) -> RunnerResult<()> {
         self.inner.execute().await

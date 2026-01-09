@@ -3,6 +3,7 @@ use crate::common::audio::audio::AudioFrameView;
 use crate::common::io::io::AudioWriter;
 use crate::pipeline::node::node_interface::NodeBuffer;
 use crate::runner::error::{RunnerError, RunnerResult};
+use async_trait::async_trait;
 
 /// 音频汇（只进）：Runner 会把末端输出写入 Sink，最后调用 finalize。
 pub trait AudioSink {
@@ -14,6 +15,41 @@ pub trait AudioSink {
 
     fn push(&mut self, input: Self::In) -> RunnerResult<()>;
     fn finalize(&mut self) -> RunnerResult<()>;
+}
+
+/// 异步音频汇（只进）：允许在 tokio runtime 中 `await` 写入与 finalize。
+#[async_trait]
+pub trait AsyncAudioSink: Send {
+    type In: Send + 'static;
+
+    fn name(&self) -> &'static str {
+        "async-audio-sink"
+    }
+
+    async fn push(&mut self, input: Self::In) -> RunnerResult<()>;
+    async fn finalize(&mut self) -> RunnerResult<()>;
+}
+
+/// 同步 sink 自动适配为 async sink（在 async 上下文里直接同步执行）。
+#[async_trait]
+impl<T> AsyncAudioSink for T
+where
+    T: AudioSink + Send,
+    T::In: Send + 'static,
+{
+    type In = T::In;
+
+    fn name(&self) -> &'static str {
+        AudioSink::name(self)
+    }
+
+    async fn push(&mut self, input: Self::In) -> RunnerResult<()> {
+        AudioSink::push(self, input)
+    }
+
+    async fn finalize(&mut self) -> RunnerResult<()> {
+        AudioSink::finalize(self)
+    }
 }
 
 /// 让现有的 `AudioWriter` 自动成为 `AudioSink<In = AudioFrame>`。

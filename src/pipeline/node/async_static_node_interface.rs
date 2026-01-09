@@ -2,7 +2,7 @@
 
 use crate::codec::error::{CodecError, CodecResult};
 use crate::pipeline::node::static_node_interface::StaticNode;
-use crate::pipeline::node::node_interface::AsyncPipeline;
+use crate::pipeline::node::node_interface::{AsyncPipeline, AsyncPipelineConsumer, AsyncPipelineProducer, AsyncPipelineEndpoint};
 use tokio::sync::mpsc;
 use async_trait::async_trait;
 
@@ -155,6 +155,80 @@ where
     _phantom: core::marker::PhantomData<(N1, N2, N3)>,
 }
 
+pub struct AsyncPipeline3Producer<TIn> {
+    tx: mpsc::UnboundedSender<Msg<TIn>>,
+}
+
+pub struct AsyncPipeline3Consumer<TOut> {
+    rx: mpsc::UnboundedReceiver<Result<TOut, CodecError>>,
+}
+
+impl<TIn> AsyncPipeline3Producer<TIn>
+where
+    TIn: Send + 'static,
+{
+    pub fn push_frame(&self, input: TIn) -> CodecResult<()> {
+        self.tx
+            .send(Ok(Some(input)))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+
+    pub fn flush(&self) -> CodecResult<()> {
+        self.tx
+            .send(Ok(None))
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+    }
+}
+
+impl<TIn> AsyncPipelineProducer for AsyncPipeline3Producer<TIn>
+where
+    TIn: Send + 'static,
+{
+    type In = TIn;
+    fn push_frame(&self, frame: Self::In) -> CodecResult<()> {
+        self.push_frame(frame)
+    }
+    fn flush(&self) -> CodecResult<()> {
+        self.flush()
+    }
+}
+
+impl<TOut> AsyncPipeline3Consumer<TOut>
+where
+    TOut: Send + 'static,
+{
+    pub fn try_get_frame(&mut self) -> CodecResult<TOut> {
+        match self.rx.try_recv() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err(e),
+            Err(mpsc::error::TryRecvError::Empty) => Err(CodecError::Again),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(CodecError::Eof),
+        }
+    }
+
+    pub async fn get_frame(&mut self) -> CodecResult<TOut> {
+        match self.rx.recv().await {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
+            None => Err(CodecError::Eof),
+        }
+    }
+}
+
+#[async_trait]
+impl<TOut> AsyncPipelineConsumer for AsyncPipeline3Consumer<TOut>
+where
+    TOut: Send + 'static,
+{
+    type Out = TOut;
+    fn try_get_frame(&mut self) -> CodecResult<Self::Out> {
+        self.try_get_frame()
+    }
+    async fn get_frame(&mut self) -> CodecResult<Self::Out> {
+        self.get_frame().await
+    }
+}
+
 impl<N1, N2, N3> AsyncPipeline3<N1, N2, N3>
 where
     N1: StaticNode + Send + 'static,
@@ -182,6 +256,13 @@ where
         }
     }
 
+    /// 拆分为输入端/输出端，用于 runner 并行驱动。
+    pub fn endpoints(self) -> (AsyncPipeline3Producer<N1::In>, AsyncPipeline3Consumer<N3::Out>) {
+        (
+            AsyncPipeline3Producer { tx: self.in_tx },
+            AsyncPipeline3Consumer { rx: self.out_rx },
+        )
+    }
 }
 
 
@@ -226,6 +307,26 @@ where
             Some(Err(e)) => Err(e),
             None => Err(CodecError::Eof),
         }
+    }
+}
+
+impl<N1, N2, N3> AsyncPipelineEndpoint for AsyncPipeline3<N1, N2, N3>
+where
+    N1: StaticNode + Send + 'static,
+    N2: StaticNode<In = N1::Out> + Send + 'static,
+    N3: StaticNode<In = N2::Out> + Send + 'static,
+    N1::In: Send + 'static,
+    N1::Out: Send + 'static,
+    N2::Out: Send + 'static,
+    N3::Out: Send + 'static,
+{
+    type In = N1::In;
+    type Out = N3::Out;
+    type Producer = AsyncPipeline3Producer<N1::In>;
+    type Consumer = AsyncPipeline3Consumer<N3::Out>;
+
+    fn endpoints(self) -> (Self::Producer, Self::Consumer) {
+        self.endpoints()
     }
 }
 

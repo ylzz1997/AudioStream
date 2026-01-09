@@ -41,3 +41,30 @@ pub trait AsyncPipeline {
     fn try_get_frame(&mut self) -> CodecResult<Self::Out>;
     async fn get_frame(&mut self) -> CodecResult<Self::Out>;
 }
+
+/// 将 tokio pipeline 拆分为“输入端”和“输出端”，用于 runner 侧并行驱动：
+/// - 输入端负责 send/flush
+/// - 输出端负责 recv/try_recv
+pub trait AsyncPipelineEndpoint: Sized + Send + 'static {
+    type In: Send + 'static;
+    type Out: Send + 'static;
+    type Producer: AsyncPipelineProducer<In = Self::In> + Send + 'static;
+    type Consumer: AsyncPipelineConsumer<Out = Self::Out> + Send + 'static;
+
+    fn endpoints(self) -> (Self::Producer, Self::Consumer);
+}
+
+/// pipeline 输入端：push/flush
+pub trait AsyncPipelineProducer: Send {
+    type In: Send + 'static;
+    fn push_frame(&self, frame: Self::In) -> CodecResult<()>;
+    fn flush(&self) -> CodecResult<()>;
+}
+
+/// pipeline 输出端：try_get/get
+#[async_trait]
+pub trait AsyncPipelineConsumer: Send {
+    type Out: Send + 'static;
+    fn try_get_frame(&mut self) -> CodecResult<Self::Out>;
+    async fn get_frame(&mut self) -> CodecResult<Self::Out>;
+}

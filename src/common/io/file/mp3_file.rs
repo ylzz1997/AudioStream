@@ -124,6 +124,9 @@ pub struct Mp3Reader {
     flushed: bool,
 }
 
+#[cfg(feature = "ffmpeg")]
+unsafe impl Send for Mp3Reader {}
+
 impl Mp3Reader {
     pub fn open<P: AsRef<Path>>(path: P) -> AudioFileResult<Self> {
         let mut r = BufReader::new(File::open(path)?);
