@@ -22,6 +22,7 @@ use crate::codec::encoder::wav_encoder::{WavEncoder, WavEncoderConfig};
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
 use crate::codec::processor::identity_processor::IdentityProcessor;
+use crate::codec::processor::gain_processor::GainProcessor;
 use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::{
     AudioError, AudioFormat as RsAudioFormat, AudioFrameView, ChannelLayout, Rational, SampleFormat, SampleType,
@@ -2061,6 +2062,26 @@ impl ProcessorPy {
         let out_rs = out_format.to_rs()?;
         let mut p = ResampleProcessor::new(in_rs, out_rs).map_err(map_codec_err)?;
         p.set_output_chunker(out_chunk_samples, pad_final).map_err(map_codec_err)?;
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p: Box::new(p),
+            in_format,
+            out_format,
+            in_sample_type,
+        })
+    }
+
+    /// 创建 gain processor（线性增益，PCM->PCM，不改变格式）。
+    ///
+    /// - format：必须指定（因为 put_frame 需要已知输入格式）
+    /// - gain：线性倍率，例如 0.5 / 2.0
+    #[staticmethod]
+    #[pyo3(signature = (format, gain))]
+    fn gain(format: AudioFormat, gain: f64) -> PyResult<Self> {
+        let fmt_rs = format.to_rs()?;
+        let p = GainProcessor::new_with_format(fmt_rs, gain).map_err(map_codec_err)?;
         let in_format = p.input_format();
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());

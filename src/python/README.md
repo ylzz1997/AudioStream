@@ -1,6 +1,6 @@
-## Python 接口（PyO3）
+# Python 接口（PyO3）
 
-### 构建/安装（推荐 maturin）
+## 构建/安装（推荐 maturin）
 
 在项目根目录：
 
@@ -21,7 +21,7 @@ pip install pyaudiostream
 import pyaudiostream as ast
 ```
 
-### Encoder 用法（wav/mp3/aac/opus/flac）
+## Encoder 用法（wav/mp3/aac/opus/flac）
 
 ```python
 import numpy as np
@@ -38,11 +38,11 @@ out = enc.get_frame()         # bytes 或 None
 out2 = enc.get_frame(force=True)  # 可强制 flush 不满 chunk 的残留
 ```
 
-#### Opus 注意事项
+### Opus 注意事项
 
 - Opus encoder **目前要求输入采样率为 48kHz**（库内部暂不做隐式重采样）。如需其它采样率，先在 pipeline 里用 `ResampleProcessor` 转到 48kHz。
 
-### Decoder 用法
+## Decoder 用法
 
 ```python
 import numpy as np
@@ -59,7 +59,7 @@ pcm_i = dec.get_frame(layout="interleaved")  # shape=(samples, channels)
 pcm_last = dec.get_frame(force=True)
 ```
 
-#### Opus Decoder extradata
+### Opus Decoder extradata
 
 对于 **raw Opus packet 流**，解码器可能需要 `extradata`（通常是 `OpusHead`）来获知声道数等信息：
 
@@ -76,6 +76,7 @@ dec = ast.Decoder("opus", cfg)
 
 - `Processor.identity(format=None|AudioFormat)`
 - `Processor.resample(in_format, out_format, out_chunk_samples=None, pad_final=True)`
+- `Processor.gain(format, gain)`
 
 ```python
 import numpy as np
@@ -93,6 +94,19 @@ while True:
     if out is None:
         break
     # out: numpy (channels, samples) by default
+```
+
+增益示例：
+
+```python
+import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(48000, 2, "f32", planar=True)
+p = ast.Processor.gain(fmt, gain=0.5)  # 降低一半音量
+p.put_frame(np.ones((2, 960), np.float32))
+p.flush()
+out = p.get_frame(force=True)
 ```
 
 ### 语义说明
@@ -276,5 +290,3 @@ r = ast.AsyncDynRunner(src, nodes, dst)
 r.run()
 dst.finalize()
 ```
-
-

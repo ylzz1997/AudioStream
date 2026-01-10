@@ -146,7 +146,7 @@ python example/server.py --mode sender --codec mp3 --host 127.0.0.1 --ingest-por
 
 ## 框架设计：AudioFlowModel
 
-AudioFlowModel 是作者针对 Audio 的**流式计算（streaming computation）**设计的抽象层：它将持续到达的音频数据视为一条“流”，将编码、解码、DSP 处理等模块视为可组合的“算子”（Operator），通过标准化的协议构建出灵活的音频处理链路。
+AudioFlowModel 是作者针对 Audio 的**流式计算**设计的抽象层：它将持续到达的音频数据视为一条“流”，将编码、解码、DSP 处理等模块视为可组合的“算子”（Operator），通过标准化的协议构建出灵活的音频处理链路。
 
 ### 1. 核心设计理念
 
