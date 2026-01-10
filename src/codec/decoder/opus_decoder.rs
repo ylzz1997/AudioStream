@@ -276,7 +276,7 @@ mod ffmpeg_backend {
                 let av_sf = core::mem::transmute::<i32, ff::AVSampleFormat>((*avf).format);
                 let sf = map_av_sample_format(av_sf)?;
 
-                let ch_layout = ChannelLayout::unspecified(channels);
+                let ch_layout = ChannelLayout::default_for_channels(channels);
 
                 let format = AudioFormat {
                     sample_rate,

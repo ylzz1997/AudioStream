@@ -172,7 +172,7 @@ pub(crate) fn ndarray_to_frame_planar<'py, T: Copy + Element>(
     let ch = view.shape()[0];
     let ns = view.shape()[1];
     if ch != fmt.channels() as usize {
-        return Err(PyValueError::new_err("pcm 的 channels 维度与 config.input_format.channels 不一致"));
+        return Err(PyValueError::new_err("pcm channels dimension does not match config.input_format.channels"));
     }
 
     // 每行视作一个 planar plane；拷贝成 bytes
@@ -182,7 +182,7 @@ pub(crate) fn ndarray_to_frame_planar<'py, T: Copy + Element>(
         let row = view.row(c);
         let slice = row
             .as_slice()
-            .ok_or_else(|| PyValueError::new_err("pcm 需要是 C contiguous 的 (channels, samples)"))?;
+            .ok_or_else(|| PyValueError::new_err("pcm needs to be C contiguous (channels, samples)"))?;
         let bytes_len = ns * bps;
         let mut out = vec![0u8; bytes_len];
         unsafe {
@@ -205,7 +205,7 @@ pub(crate) fn ndarray_to_frame_interleaved<'py, T: Copy + Element>(
     let ns = view.shape()[0];
     let ch = view.shape()[1];
     if ch != fmt.channels() as usize {
-        return Err(PyValueError::new_err("pcm 的 channels 维度与 format.channels 不一致"));
+        return Err(PyValueError::new_err("pcm channels dimension does not match format.channels"));
     }
 
     let bps = fmt.sample_format.bytes_per_sample();
@@ -214,7 +214,7 @@ pub(crate) fn ndarray_to_frame_interleaved<'py, T: Copy + Element>(
 
     let slice = view
         .as_slice()
-        .ok_or_else(|| PyValueError::new_err("pcm 需要是 C contiguous 的 (samples, channels)"))?;
+        .ok_or_else(|| PyValueError::new_err("pcm needs to be C contiguous (samples, channels)"))?;
 
     unsafe {
         std::ptr::copy_nonoverlapping(slice.as_ptr() as *const u8, out.as_mut_ptr(), bytes_len);

@@ -124,7 +124,12 @@ impl AudioProcessor for CompressorProcessor {
             return Ok(());
         }
 
-        if frame.format() != self.fmt {
+        let actual_fmt = frame.format();
+        if actual_fmt != self.fmt {
+            eprintln!(
+                "CompressorProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                crate::common::audio::audio::audio_format_diff(self.fmt, actual_fmt)
+            );
             return Err(CodecError::InvalidData(
                 "CompressorProcessor input AudioFormat mismatch",
             ));

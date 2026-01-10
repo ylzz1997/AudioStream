@@ -281,6 +281,10 @@ mod ffmpeg_backend {
                 let frame = frame.unwrap();
                 let fmt = frame.format();
                 if fmt != self.cfg.input_format {
+                    eprintln!(
+                        "OpusEncoder input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                        crate::common::audio::audio::audio_format_diff(self.cfg.input_format, fmt)
+                    );
                     return Err(CodecError::InvalidData(
                         "input AudioFormat mismatch (no resample/convert layer yet)",
                     ));

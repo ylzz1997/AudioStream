@@ -4,23 +4,13 @@ use crate::codec::packet::CodecPacket;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::io::io::{AudioReader, AudioWriter};
+use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
 use std::path::Path;
 
-/// FLAC 文件写入配置（标准 `.flac` 容器）。
+/// FLAC 文件写入配置：编码参数（encoder）+（预留）writer/容器侧参数。
 #[derive(Clone, Debug)]
 pub struct FlacWriterConfig {
-    pub input_format: crate::common::audio::audio::AudioFormat,
-    /// FLAC 压缩等级（FFmpeg 通常 0..=12）。
-    pub compression_level: Option<i32>,
-}
-
-impl FlacWriterConfig {
-    pub fn new(input_format: crate::common::audio::audio::AudioFormat) -> Self {
-        Self {
-            input_format,
-            compression_level: None,
-        }
-    }
+    pub encoder: FlacEncoderConfig,
 }
 
 // -----------------------------
@@ -133,7 +123,8 @@ mod ffmpeg_backend {
             let out_path = path.as_ref().to_string_lossy();
             let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
-            let in_fmt = cfg.input_format;
+            let enc_cfg = cfg.encoder;
+            let in_fmt = enc_cfg.input_format;
             let time_base = Rational::new(1, in_fmt.sample_rate as i32);
             let fifo =
                 AudioFifo::new(in_fmt, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
@@ -170,7 +161,7 @@ mod ffmpeg_backend {
                     num: 1,
                     den: (*enc_ctx).sample_rate,
                 };
-                if let Some(level) = cfg.compression_level {
+                if let Some(level) = enc_cfg.compression_level {
                     (*enc_ctx).compression_level = level;
                 }
 

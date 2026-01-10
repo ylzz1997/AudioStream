@@ -9,9 +9,9 @@ use crate::codec::processor::resample_processor::ResampleProcessor;
 use crate::common::audio::audio::{AudioFrameView, AudioFrameViewMut, SampleType};
 use crate::function::compressor::DynamicsParams;
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::PyAny;
 
 use crate::pipeline::node::dynamic_node_interface::ProcessorNode;
 use crate::pipeline::node::node_interface::{IdentityNode, NodeBufferKind};
@@ -31,6 +31,8 @@ pub struct ProcessorPy {
     out_format: Option<crate::common::audio::audio::AudioFormat>,
     // 若 input_format 已知，则在 numpy<->frame 时可用来选择 dtype
     in_sample_type: Option<SampleType>,
+    // 是否已发送 EOF（flush）
+    sent_eof: bool,
 }
 
 #[pymethods]
@@ -54,6 +56,7 @@ impl ProcessorPy {
             in_format,
             out_format,
             in_sample_type,
+            sent_eof: false,
         })
     }
 
@@ -81,6 +84,7 @@ impl ProcessorPy {
             in_format,
             out_format,
             in_sample_type,
+            sent_eof: false,
         })
     }
 
@@ -98,6 +102,7 @@ impl ProcessorPy {
             in_format,
             out_format,
             in_sample_type,
+            sent_eof: false,
         })
     }
 
@@ -137,6 +142,7 @@ impl ProcessorPy {
             in_format,
             out_format,
             in_sample_type,
+            sent_eof: false,
         })
     }
 
@@ -148,6 +154,11 @@ impl ProcessorPy {
     /// 输入一帧 PCM（numpy）。
     #[pyo3(signature = (pcm, pts=None))]
     fn put_frame(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>, pts: Option<i64>) -> PyResult<()> {
+        if self.sent_eof {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已 flush（输入结束），不能再 put_frame；如需继续输入，请新建一个 Processor",
+            ));
+        }
         let in_fmt = self
             .in_format
             .ok_or_else(|| PyValueError::new_err("Processor 输入格式未知：请用 Processor.identity(format=...) 或 Processor.resample(in_format=...)"))?;
@@ -193,13 +204,29 @@ impl ProcessorPy {
 
     /// flush：通知输入结束（之后继续 get_frame 直到 EOF）。
     fn flush(&mut self) -> PyResult<()> {
-        self.p.send_frame(None).map_err(map_codec_err)
+        if self.sent_eof {
+            return Ok(());
+        }
+        self.p.send_frame(None).map_err(map_codec_err)?;
+        self.sent_eof = true;
+        Ok(())
+    }
+
+    /// 重置内部状态（清空缓存、回到初始态），可继续接收新的流。
+    fn reset(&mut self) -> PyResult<()> {
+        self.p.reset().map_err(map_codec_err)?;
+        self.sent_eof = false;
+        Ok(())
     }
 
     /// 取出一帧输出 PCM：
     /// - 返回 numpy；无输出返回 None
-    #[pyo3(signature = (layout="planar"))]
-    fn get_frame(&mut self, py: Python<'_>, layout: &str) -> PyResult<Option<PyObject>> {
+    #[pyo3(signature = (force=false, layout="planar"))]
+    fn get_frame(&mut self, py: Python<'_>, force: bool, layout: &str) -> PyResult<Option<PyObject>> {
+        // 方案 B：force=True 触发一次内部 flush/吐尾巴（与 Encoder 的直觉对齐）。
+        if force && !self.sent_eof {
+            self.flush()?;
+        }
         let planar = match layout.to_ascii_lowercase().as_str() {
             "planar" => true,
             "interleaved" => false,
@@ -227,133 +254,180 @@ fn node_kind_from_str(s: &str) -> Option<NodeBufferKind> {
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
-pub fn make_resample_node(
-    in_format: AudioFormat,
-    out_format: AudioFormat,
-    out_chunk_samples: Option<usize>,
-    pad_final: bool,
-) -> PyResult<DynNodePy> {
-    let in_fmt = in_format.to_rs()?;
-    let out_fmt = out_format.to_rs()?;
-    let mut p = ResampleProcessor::new(in_fmt, out_fmt).map_err(map_codec_err)?;
-    p.set_output_chunker(out_chunk_samples, pad_final).map_err(map_codec_err)?;
-    Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
+/// pipeline 节点：IdentityNode 的 config
+#[pyclass(name = "IdentityNodeConfig")]
+#[derive(Clone)]
+pub struct IdentityNodeConfigPy {
+    /// "pcm" | "packet"
+    #[pyo3(get, set)]
+    pub kind: String,
 }
 
-#[pyfunction]
-pub fn make_gain_node(format: AudioFormat, gain: f64) -> PyResult<DynNodePy> {
-    let fmt = format.to_rs()?;
-    let p = GainProcessor::new_with_format(fmt, gain).map_err(map_codec_err)?;
-    Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
-}
-
-#[pyfunction]
-pub fn make_compressor_node(
-    format: AudioFormat,
-    sample_rate: f32,
-    threshold_db: f32,
-    knee_width_db: f32,
-    ratio: f32,
-    expansion_ratio: f32,
-    expansion_threshold_db: f32,
-    attack_time: f32,
-    release_time: f32,
-    master_gain_db: f32,
-) -> PyResult<DynNodePy> {
-    let fmt = format.to_rs()?;
-    let params = DynamicsParams {
-        sample_rate,
-        threshold_db,
-        knee_width_db,
-        ratio,
-        expansion_ratio,
-        expansion_threshold_db,
-        attack_time,
-        release_time,
-        master_gain_db,
-    };
-    let p = CompressorProcessor::new_with_format(fmt, params).map_err(map_codec_err)?;
-    Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
-}
-
-fn get_required<'py, T: FromPyObject<'py>>(d: &'py Bound<'py, PyDict>, key: &str) -> PyResult<T> {
-    let v = d
-        .get_item(key)?
-        .ok_or_else(|| PyValueError::new_err(format!("missing required key: {key}")))?;
-    v.extract::<T>()
-}
-
-fn get_optional<'py, T: FromPyObject<'py>>(d: &'py Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>> {
-    match d.get_item(key)? {
-        Some(v) => {
-            if v.is_none() {
-                Ok(None)
-            } else {
-                Ok(Some(v.extract::<T>()?))
-            }
-        }
-        None => Ok(None),
+#[pymethods]
+impl IdentityNodeConfigPy {
+    #[new]
+    fn new(kind: &str) -> Self {
+        Self { kind: kind.into() }
     }
 }
 
-fn get_optional_or<'py, T: FromPyObject<'py>>(d: &'py Bound<'py, PyDict>, key: &str, default: T) -> PyResult<T> {
-    Ok(get_optional::<T>(d, key)?.unwrap_or(default))
+/// pipeline 节点：ResampleProcessorNode 的 config
+#[pyclass(name = "ResampleNodeConfig")]
+#[derive(Clone)]
+pub struct ResampleNodeConfigPy {
+    #[pyo3(get, set)]
+    pub in_format: AudioFormat,
+    #[pyo3(get, set)]
+    pub out_format: AudioFormat,
+    #[pyo3(get, set)]
+    pub out_chunk_samples: Option<usize>,
+    #[pyo3(get, set)]
+    pub pad_final: bool,
 }
 
-/// 统一的 processor 节点工厂：通过字符串选择 processor，并用 dict 提供参数。
+#[pymethods]
+impl ResampleNodeConfigPy {
+    #[new]
+    #[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
+    fn new(in_format: AudioFormat, out_format: AudioFormat, out_chunk_samples: Option<usize>, pad_final: bool) -> Self {
+        Self {
+            in_format,
+            out_format,
+            out_chunk_samples,
+            pad_final,
+        }
+    }
+}
+
+/// pipeline 节点：GainProcessorNode 的 config
+#[pyclass(name = "GainNodeConfig")]
+#[derive(Clone)]
+pub struct GainNodeConfigPy {
+    #[pyo3(get, set)]
+    pub format: AudioFormat,
+    #[pyo3(get, set)]
+    pub gain: f64,
+}
+
+#[pymethods]
+impl GainNodeConfigPy {
+    #[new]
+    fn new(format: AudioFormat, gain: f64) -> Self {
+        Self { format, gain }
+    }
+}
+
+/// pipeline 节点：CompressorProcessorNode 的 config
+#[pyclass(name = "CompressorNodeConfig")]
+#[derive(Clone)]
+pub struct CompressorNodeConfigPy {
+    #[pyo3(get, set)]
+    pub format: AudioFormat,
+    /// None => 使用 format.sample_rate
+    #[pyo3(get, set)]
+    pub sample_rate: Option<f32>,
+    #[pyo3(get, set)]
+    pub threshold_db: f32,
+    #[pyo3(get, set)]
+    pub knee_width_db: f32,
+    #[pyo3(get, set)]
+    pub ratio: f32,
+    #[pyo3(get, set)]
+    pub expansion_ratio: f32,
+    #[pyo3(get, set)]
+    pub expansion_threshold_db: f32,
+    #[pyo3(get, set)]
+    pub attack_time: f32,
+    #[pyo3(get, set)]
+    pub release_time: f32,
+    #[pyo3(get, set)]
+    pub master_gain_db: f32,
+}
+
+#[pymethods]
+impl CompressorNodeConfigPy {
+    #[new]
+    #[pyo3(signature = (
+        format,
+        sample_rate=None,
+        threshold_db=-18.0,
+        knee_width_db=6.0,
+        ratio=4.0,
+        expansion_ratio=2.0,
+        expansion_threshold_db=-60.0,
+        attack_time=0.01,
+        release_time=0.10,
+        master_gain_db=0.0
+    ))]
+    fn new(
+        format: AudioFormat,
+        sample_rate: Option<f32>,
+        threshold_db: f32,
+        knee_width_db: f32,
+        ratio: f32,
+        expansion_ratio: f32,
+        expansion_threshold_db: f32,
+        attack_time: f32,
+        release_time: f32,
+        master_gain_db: f32,
+    ) -> Self {
+        Self {
+            format,
+            sample_rate,
+            threshold_db,
+            knee_width_db,
+            ratio,
+            expansion_ratio,
+            expansion_threshold_db,
+            attack_time,
+            release_time,
+            master_gain_db,
+        }
+    }
+}
+
+/// 统一的 processor 节点工厂：通过字符串选择 processor，并用 *NodeConfig 提供参数。
 #[pyfunction]
 pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<DynNodePy> {
-    let d: Bound<'_, PyDict> = config
-        .downcast::<PyDict>()
-        .map_err(|_| PyTypeError::new_err("config 需要是 dict"))?
-        .clone();
-
     match kind.to_ascii_lowercase().as_str() {
         "identity" => {
-            let k: String = get_required(&d, "kind")?;
-            let nk = node_kind_from_str(&k).ok_or_else(|| PyValueError::new_err("identity.kind 仅支持: pcm/packet"))?;
+            let cfg = config.extract::<IdentityNodeConfigPy>()?;
+            let nk = node_kind_from_str(&cfg.kind)
+                .ok_or_else(|| PyValueError::new_err("IdentityNodeConfig.kind 仅支持: pcm/packet"))?;
             Ok(DynNodePy::new_boxed(Box::new(IdentityNode::new(nk))))
         }
         "resample" => {
-            let in_format: AudioFormat = get_required(&d, "in_format")?;
-            let out_format: AudioFormat = get_required(&d, "out_format")?;
-            let out_chunk_samples: Option<usize> = get_optional(&d, "out_chunk_samples")?;
-            let pad_final: bool = get_optional_or(&d, "pad_final", true)?;
-            make_resample_node(in_format, out_format, out_chunk_samples, pad_final)
+            let cfg = config.extract::<ResampleNodeConfigPy>()?;
+            let in_fmt = cfg.in_format.to_rs()?;
+            let out_fmt = cfg.out_format.to_rs()?;
+            let mut p = ResampleProcessor::new(in_fmt, out_fmt).map_err(map_codec_err)?;
+            p.set_output_chunker(cfg.out_chunk_samples, cfg.pad_final)
+                .map_err(map_codec_err)?;
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         "gain" => {
-            let format: AudioFormat = get_required(&d, "format")?;
-            let gain: f64 = get_required(&d, "gain")?;
-            make_gain_node(format, gain)
+            let cfg = config.extract::<GainNodeConfigPy>()?;
+            let fmt = cfg.format.to_rs()?;
+            let p = GainProcessor::new_with_format(fmt, cfg.gain).map_err(map_codec_err)?;
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         "compressor" => {
-            let format: AudioFormat = get_required(&d, "format")?;
-            let sample_rate: f32 = match get_optional::<f32>(&d, "sample_rate")? {
-                Some(v) => v,
-                None => format.sample_rate as f32,
-            };
-            let threshold_db: f32 = get_required(&d, "threshold_db")?;
-            let knee_width_db: f32 = get_required(&d, "knee_width_db")?;
-            let ratio: f32 = get_required(&d, "ratio")?;
-            let expansion_ratio: f32 = get_required(&d, "expansion_ratio")?;
-            let expansion_threshold_db: f32 = get_required(&d, "expansion_threshold_db")?;
-            let attack_time: f32 = get_required(&d, "attack_time")?;
-            let release_time: f32 = get_required(&d, "release_time")?;
-            let master_gain_db: f32 = get_required(&d, "master_gain_db")?;
-            make_compressor_node(
-                format,
+            let cfg = config.extract::<CompressorNodeConfigPy>()?;
+            let fmt = cfg.format.to_rs()?;
+            let sample_rate = cfg.sample_rate.unwrap_or(cfg.format.sample_rate as f32);
+            let params = DynamicsParams {
                 sample_rate,
-                threshold_db,
-                knee_width_db,
-                ratio,
-                expansion_ratio,
-                expansion_threshold_db,
-                attack_time,
-                release_time,
-                master_gain_db,
-            )
+                threshold_db: cfg.threshold_db,
+                knee_width_db: cfg.knee_width_db,
+                ratio: cfg.ratio,
+                expansion_ratio: cfg.expansion_ratio,
+                expansion_threshold_db: cfg.expansion_threshold_db,
+                attack_time: cfg.attack_time,
+                release_time: cfg.release_time,
+                master_gain_db: cfg.master_gain_db,
+            };
+            let p = CompressorProcessor::new_with_format(fmt, params).map_err(map_codec_err)?;
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         _ => Err(PyValueError::new_err("kind only support: identity/resample/gain/compressor")),
     }

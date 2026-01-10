@@ -5,11 +5,12 @@
 
 use crate::codec::error::{CodecError, CodecResult};
 use crate::codec::processor::processor_interface::AudioProcessor;
-use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView, AudioFrameViewMut, Rational, SampleType};
+use crate::common::audio::audio::{audio_format_diff, AudioFormat, AudioFrame, AudioFrameView, AudioFrameViewMut, Rational, SampleType};
 use crate::common::audio::fifo::AudioFifo;
 use std::collections::VecDeque;
 
 use crate::function::resample::LinearResampler;
+
 
 #[cfg(feature = "ffmpeg")]
 use crate::function::resample::ffmpeg_backend::FfmpegResampler;
@@ -89,7 +90,7 @@ impl ResampleProcessor {
             out_pad_final: false,
             out_fifo: None,
             out_q: VecDeque::new(),
-            flushed: false,
+            flushed: false
         })
     }
 
@@ -214,7 +215,18 @@ impl AudioProcessor for ResampleProcessor {
         }
 
         let frame = frame.unwrap();
-        if frame.format() != self.in_fmt {
+        let actual_fmt = frame.format();
+        if actual_fmt != self.in_fmt {
+            // eprintln!(
+            //     "ResampleProcessor input AudioFormat mismatch\n  expected: {:?}\n  actual:   {:?}\n  diffs: {}",
+            //     self.in_fmt,
+            //     actual_fmt,
+            //     audio_format_diff(self.in_fmt, actual_fmt)
+            // );
+            eprintln!(
+                "ResampleProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                audio_format_diff(self.in_fmt, actual_fmt)
+            );
             return Err(CodecError::InvalidData("ResampleProcessor input AudioFormat mismatch"));
         }
 

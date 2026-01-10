@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::codec::encoder::aac_encoder::AacEncoderConfig;
+use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
 use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
@@ -23,7 +24,7 @@ use crate::runner::error::{RunnerError, RunnerResult};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::python::errors::{map_codec_err, map_file_err, map_runner_err, pyerr_to_codec_err, pyerr_to_runner_err};
 use crate::python::format::{
@@ -479,7 +480,12 @@ impl AsyncDynPipelinePy {
             boxed.push(nb.take_inner()?);
         }
 
-        let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
+        // Python 侧对象（尤其是 #[pyclass(unsendable)]）不能跨线程使用。
+        // 这里必须使用 current-thread runtime，确保所有 tokio 任务都在同一 OS 线程上 poll。
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
         let _guard = rt.enter();
         let p = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
 
@@ -616,7 +622,12 @@ impl AsyncDynRunnerPy {
             boxed.push(nb.take_inner()?);
         }
 
-        let rt = Runtime::new().map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
+        // Python 侧对象（尤其是 #[pyclass(unsendable)]）不能跨线程使用。
+        // AsyncAutoRunner 内部会 spawn 任务；使用 current-thread runtime 可避免被调度到其他 worker 线程。
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
         let _guard = rt.enter();
         let pipeline = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
         let runner = AsyncAutoRunner::new(
@@ -657,10 +668,14 @@ pub struct AudioFileReaderPy {
 #[pymethods]
 impl AudioFileReaderPy {
     #[new]
-    fn new(path: String, format: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, format, chunk_samples=None))]
+    fn new(path: String, format: &str, chunk_samples: Option<usize>) -> PyResult<Self> {
         let fmt = file_format_from_str(format).ok_or_else(|| PyValueError::new_err("format 仅支持: wav/mp3/aac_adts/flac/opus_ogg"))?;
         let cfg = match fmt {
-            "wav" => AudioFileReadConfig::Wav,
+            "wav" => {
+                let cs = chunk_samples.unwrap_or(1024).max(1);
+                AudioFileReadConfig::Wav(rs_file::WavReaderConfig { chunk_samples: cs })
+            }
             "mp3" => AudioFileReadConfig::Mp3,
             "aac_adts" => AudioFileReadConfig::AacAdts,
             "flac" => AudioFileReadConfig::Flac,
@@ -705,13 +720,14 @@ pub struct AudioFileWriterPy {
 #[pymethods]
 impl AudioFileWriterPy {
     #[new]
-    #[pyo3(signature = (path, format, input_format, bitrate=None, compression_level=None))]
+    #[pyo3(signature = (path, format, input_format, bitrate=None, compression_level=None, wav_output_format=None))]
     fn new(
         path: String,
         format: &str,
         input_format: AudioFormat,
         bitrate: Option<u32>,
         compression_level: Option<i32>,
+        wav_output_format: Option<String>,
     ) -> PyResult<Self> {
         let fmt = file_format_from_str(format).ok_or_else(|| PyValueError::new_err("format 仅支持: wav/mp3/aac_adts/flac/opus_ogg"))?;
         let rs_fmt = input_format.to_rs()?;
@@ -719,8 +735,16 @@ impl AudioFileWriterPy {
 
         let cfg = match fmt {
             "wav" => {
-                let ch = rs_fmt.channels();
-                AudioFileWriteConfig::Wav(rs_file::WavWriterConfig::pcm16le(rs_fmt.sample_rate, ch))
+                let out_fmt = match wav_output_format.as_deref() {
+                    None | Some("pcm16le") => rs_file::WavOutputSampleFormat::Pcm16Le,
+                    Some("f32le") => rs_file::WavOutputSampleFormat::Float32Le,
+                    Some(_) => return Err(PyValueError::new_err("wav_output_format 仅支持: pcm16le/f32le")),
+                };
+                let c = match out_fmt {
+                    rs_file::WavOutputSampleFormat::Pcm16Le => rs_file::WavWriterConfig::pcm16le(rs_fmt),
+                    rs_file::WavOutputSampleFormat::Float32Le => rs_file::WavWriterConfig::f32le(rs_fmt),
+                };
+                AudioFileWriteConfig::Wav(c)
             }
             "mp3" => {
                 let mut c = rs_file::Mp3WriterConfig::new(rs_fmt);
@@ -730,11 +754,15 @@ impl AudioFileWriterPy {
                 AudioFileWriteConfig::Mp3(c)
             }
             "aac_adts" => {
-                let c = AacEncoderConfig { input_format: rs_fmt, bitrate };
+                let c = rs_file::AacAdtsWriterConfig {
+                    encoder: AacEncoderConfig { input_format: rs_fmt, bitrate },
+                };
                 AudioFileWriteConfig::AacAdts(c)
             }
             "flac" => {
-                let c = rs_file::FlacWriterConfig { input_format: rs_fmt, compression_level };
+                let c = rs_file::FlacWriterConfig {
+                    encoder: FlacEncoderConfig { input_format: rs_fmt, compression_level },
+                };
                 AudioFileWriteConfig::Flac(c)
             }
             "opus_ogg" => {
@@ -744,7 +772,9 @@ impl AudioFileWriterPy {
                 if rs_fmt.sample_format.is_planar() {
                     return Err(PyValueError::new_err("opus_ogg writer 需要 interleaved samples（input_format.planar=False）"));
                 }
-                let c = OpusEncoderConfig { input_format: rs_fmt, bitrate };
+                let c = rs_file::OpusOggWriterConfig {
+                    encoder: OpusEncoderConfig { input_format: rs_fmt, bitrate },
+                };
                 AudioFileWriteConfig::OpusOgg(c)
             }
             _ => return Err(PyValueError::new_err("unsupported format")),

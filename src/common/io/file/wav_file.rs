@@ -1,25 +1,39 @@
 use crate::common::io::io::{AudioReader, AudioWriter, AudioIOResult, AudioIOError};
 use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView, ChannelLayout, Rational, SampleFormat};
+use crate::codec::encoder::wav_encoder::WavEncoderConfig;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-#[derive(Clone, Copy, Debug)]
-pub struct WavWriterConfig {
-    /// 输入 PCM 的目标 sample_rate/channels（写 WAV 头用）
-    pub sample_rate: u32,
-    pub channels: u16,
+/// WAV 写出样本格式（容器侧参数）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WavOutputSampleFormat {
+    /// PCM 16-bit little-endian（audio_format=1, bits=16）
+    Pcm16Le,
+    /// IEEE float 32-bit little-endian（audio_format=3, bits=32）
+    Float32Le,
+}
 
-    /// 写出的 WAV 样本格式：当前实现固定为 PCM16LE。
-    pub pcm16le: bool,
+/// WAV 文件写入配置：编码/输入参数（encoder）+ writer/容器侧参数（output_format）。
+#[derive(Clone, Debug)]
+pub struct WavWriterConfig {
+    pub encoder: WavEncoderConfig,
+    pub output_format: WavOutputSampleFormat,
 }
 
 impl WavWriterConfig {
-    pub fn pcm16le(sample_rate: u32, channels: u16) -> Self {
+    /// 默认行为：写出 PCM16LE（与旧实现一致）。
+    pub fn pcm16le(input_format: AudioFormat) -> Self {
         Self {
-            sample_rate,
-            channels,
-            pcm16le: true,
+            encoder: WavEncoderConfig { input_format },
+            output_format: WavOutputSampleFormat::Pcm16Le,
+        }
+    }
+
+    pub fn f32le(input_format: AudioFormat) -> Self {
+        Self {
+            encoder: WavEncoderConfig { input_format },
+            output_format: WavOutputSampleFormat::Float32Le,
         }
     }
 }
@@ -81,13 +95,16 @@ impl WavWriter {
         // fmt chunk (PCM16LE)
         self.w.write_all(b"fmt ")?;
         write_u32_le(&mut self.w, 16)?; // PCM fmt size
-        write_u16_le(&mut self.w, 1)?; // audio_format=1 PCM
-        write_u16_le(&mut self.w, self.cfg.channels)?;
-        write_u32_le(&mut self.w, self.cfg.sample_rate)?;
+        let (audio_format, bits_per_sample) = match self.cfg.output_format {
+            WavOutputSampleFormat::Pcm16Le => (1u16, 16u16),
+            WavOutputSampleFormat::Float32Le => (3u16, 32u16),
+        };
+        write_u16_le(&mut self.w, audio_format)?;
+        write_u16_le(&mut self.w, self.cfg.encoder.input_format.channels())?;
+        write_u32_le(&mut self.w, self.cfg.encoder.input_format.sample_rate)?;
 
-        let bits_per_sample = 16u16;
-        let block_align = self.cfg.channels * (bits_per_sample / 8);
-        let byte_rate = self.cfg.sample_rate * (block_align as u32);
+        let block_align = self.cfg.encoder.input_format.channels() * (bits_per_sample / 8);
+        let byte_rate = self.cfg.encoder.input_format.sample_rate * (block_align as u32);
         write_u32_le(&mut self.w, byte_rate)?;
         write_u16_le(&mut self.w, block_align)?;
         write_u16_le(&mut self.w, bits_per_sample)?;
@@ -106,6 +123,13 @@ impl WavWriter {
         self.data_bytes = self.data_bytes.saturating_add(bytes);
         Ok(())
     }
+
+    fn write_samples_f32_interleaved(&mut self, samples: &[f32]) -> AudioIOResult<()> {
+        let bytes = (samples.len() * 4) as u32;
+        self.w.write_all(bytemuck_f32_as_u8(samples))?;
+        self.data_bytes = self.data_bytes.saturating_add(bytes);
+        Ok(())
+    }
 }
 
 impl AudioWriter for WavWriter {
@@ -116,59 +140,112 @@ impl AudioWriter for WavWriter {
         if ch == 0 {
             return Err(AudioIOError::Format("channels=0"));
         }
-        if fmt.sample_rate != self.cfg.sample_rate || fmt.channels() != self.cfg.channels {
+        if fmt.sample_rate != self.cfg.encoder.input_format.sample_rate
+            || fmt.channels() != self.cfg.encoder.input_format.channels()
+        {
             return Err(AudioIOError::Format("WAV writer expects fixed sample_rate/channels (no resample layer yet)"));
         }
 
-        // 转为 interleaved PCM16
         let ns = frame.nb_samples();
-        let mut out: Vec<i16> = Vec::with_capacity(ns * ch);
-        match fmt.sample_format {
-            SampleFormat::I16 { planar: false } => {
-                let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
-                if plane.len() != ns * ch * 2 {
-                    return Err(AudioIOError::Format("unexpected i16 interleaved plane size"));
-                }
-                // 直接拷贝
-                for i in 0..(ns * ch) {
-                    let off = i * 2;
-                    out.push(i16::from_le_bytes([plane[off], plane[off + 1]]));
-                }
-            }
-            SampleFormat::I16 { planar: true } => {
-                for s in 0..ns {
-                    for c in 0..ch {
-                        let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
-                        let off = s * 2;
-                        out.push(i16::from_le_bytes([p[off], p[off + 1]]));
+        match self.cfg.output_format {
+            WavOutputSampleFormat::Pcm16Le => {
+                // 转为 interleaved PCM16
+                let mut out: Vec<i16> = Vec::with_capacity(ns * ch);
+                match fmt.sample_format {
+                    SampleFormat::I16 { planar: false } => {
+                        let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
+                        if plane.len() != ns * ch * 2 {
+                            return Err(AudioIOError::Format("unexpected i16 interleaved plane size"));
+                        }
+                        // 直接拷贝
+                        for i in 0..(ns * ch) {
+                            let off = i * 2;
+                            out.push(i16::from_le_bytes([plane[off], plane[off + 1]]));
+                        }
                     }
-                }
-            }
-            SampleFormat::F32 { planar: false } => {
-                let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
-                if plane.len() != ns * ch * 4 {
-                    return Err(AudioIOError::Format("unexpected f32 interleaved plane size"));
-                }
-                for i in 0..(ns * ch) {
-                    let off = i * 4;
-                    let v = f32::from_le_bytes([plane[off], plane[off + 1], plane[off + 2], plane[off + 3]]);
-                    out.push(float_to_i16(v));
-                }
-            }
-            SampleFormat::F32 { planar: true } => {
-                for s in 0..ns {
-                    for c in 0..ch {
-                        let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
-                        let off = s * 4;
-                        let v = f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]);
-                        out.push(float_to_i16(v));
+                    SampleFormat::I16 { planar: true } => {
+                        for s in 0..ns {
+                            for c in 0..ch {
+                                let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
+                                let off = s * 2;
+                                out.push(i16::from_le_bytes([p[off], p[off + 1]]));
+                            }
+                        }
                     }
+                    SampleFormat::F32 { planar: false } => {
+                        let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
+                        if plane.len() != ns * ch * 4 {
+                            return Err(AudioIOError::Format("unexpected f32 interleaved plane size"));
+                        }
+                        for i in 0..(ns * ch) {
+                            let off = i * 4;
+                            let v = f32::from_le_bytes([plane[off], plane[off + 1], plane[off + 2], plane[off + 3]]);
+                            out.push(float_to_i16(v));
+                        }
+                    }
+                    SampleFormat::F32 { planar: true } => {
+                        for s in 0..ns {
+                            for c in 0..ch {
+                                let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
+                                let off = s * 4;
+                                let v = f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]);
+                                out.push(float_to_i16(v));
+                            }
+                        }
+                    }
+                    _ => return Err(AudioIOError::Format("WAV writer supports only I16/F32 input currently")),
                 }
+                self.write_samples_i16_interleaved(&out)?;
             }
-            _ => return Err(AudioIOError::Format("WAV writer supports only I16/F32 input currently")),
+            WavOutputSampleFormat::Float32Le => {
+                // 转为 interleaved F32LE
+                let mut out: Vec<f32> = Vec::with_capacity(ns * ch);
+                match fmt.sample_format {
+                    SampleFormat::F32 { planar: false } => {
+                        let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
+                        if plane.len() != ns * ch * 4 {
+                            return Err(AudioIOError::Format("unexpected f32 interleaved plane size"));
+                        }
+                        for i in 0..(ns * ch) {
+                            let off = i * 4;
+                            out.push(f32::from_le_bytes([plane[off], plane[off + 1], plane[off + 2], plane[off + 3]]));
+                        }
+                    }
+                    SampleFormat::F32 { planar: true } => {
+                        for s in 0..ns {
+                            for c in 0..ch {
+                                let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
+                                let off = s * 4;
+                                out.push(f32::from_le_bytes([p[off], p[off + 1], p[off + 2], p[off + 3]]));
+                            }
+                        }
+                    }
+                    SampleFormat::I16 { planar: false } => {
+                        let plane = frame.plane(0).ok_or(AudioIOError::Format("missing plane 0"))?;
+                        if plane.len() != ns * ch * 2 {
+                            return Err(AudioIOError::Format("unexpected i16 interleaved plane size"));
+                        }
+                        for i in 0..(ns * ch) {
+                            let off = i * 2;
+                            let v = i16::from_le_bytes([plane[off], plane[off + 1]]);
+                            out.push(i16_to_f32(v));
+                        }
+                    }
+                    SampleFormat::I16 { planar: true } => {
+                        for s in 0..ns {
+                            for c in 0..ch {
+                                let p = frame.plane(c).ok_or(AudioIOError::Format("missing plane"))?;
+                                let off = s * 2;
+                                let v = i16::from_le_bytes([p[off], p[off + 1]]);
+                                out.push(i16_to_f32(v));
+                            }
+                        }
+                    }
+                    _ => return Err(AudioIOError::Format("WAV writer supports only I16/F32 input currently")),
+                }
+                self.write_samples_f32_interleaved(&out)?;
+            }
         }
-
-        self.write_samples_i16_interleaved(&out)?;
         Ok(())
     }
 
@@ -199,8 +276,25 @@ pub struct WavReader {
     chunk_samples: usize,
 }
 
+/// WAV reader 读取配置（主要控制 `next_frame()` 每次吐出的样本数）。
+#[derive(Clone, Copy, Debug)]
+pub struct WavReaderConfig {
+    /// 每次 `next_frame()` 返回的最大 samples/每声道（最后一帧可能更小）。
+    pub chunk_samples: usize,
+}
+
+impl Default for WavReaderConfig {
+    fn default() -> Self {
+        Self { chunk_samples: 1024 }
+    }
+}
+
 impl WavReader {
     pub fn open<P: AsRef<Path>>(path: P) -> AudioIOResult<Self> {
+        Self::open_with_config(path, WavReaderConfig::default())
+    }
+
+    pub fn open_with_config<P: AsRef<Path>>(path: P, cfg: WavReaderConfig) -> AudioIOResult<Self> {
         let mut r = BufReader::new(File::open(path)?);
 
         let mut riff = [0u8; 4];
@@ -274,7 +368,7 @@ impl WavReader {
             data_pos: 0,
             time_base,
             next_pts_samples: 0,
-            chunk_samples: 1024,
+            chunk_samples: cfg.chunk_samples.max(1),
         })
     }
 
@@ -283,7 +377,7 @@ impl WavReader {
         AudioFormat {
             sample_rate: self.fmt.sample_rate,
             sample_format: SampleFormat::F32 { planar: true },
-            channel_layout: ChannelLayout::unspecified(self.fmt.channels),
+            channel_layout: ChannelLayout::default_for_channels(self.fmt.channels),
         }
     }
 }
@@ -354,7 +448,16 @@ fn float_to_i16(v: f32) -> i16 {
     x.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
+fn i16_to_f32(v: i16) -> f32 {
+    // [-32768, 32767] -> [-1.0, 1.0)
+    (v as f32) / 32768.0
+}
+
 fn bytemuck_i16_as_u8(v: &[i16]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) }
+}
+
+fn bytemuck_f32_as_u8(v: &[f32]) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 

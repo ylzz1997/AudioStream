@@ -16,7 +16,7 @@ pub use crate::python::decoder::{
     make_decoder_node,
 };
 pub use crate::python::processor::{
-    ProcessorPy, make_compressor_node, make_gain_node, make_processor_node, make_resample_node,
+    CompressorNodeConfigPy, GainNodeConfigPy, IdentityNodeConfigPy, ProcessorPy, ResampleNodeConfigPy, make_processor_node,
 };
 pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
@@ -48,6 +48,10 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // processor
     m.add_class::<ProcessorPy>()?;
+    m.add_class::<IdentityNodeConfigPy>()?;
+    m.add_class::<ResampleNodeConfigPy>()?;
+    m.add_class::<GainNodeConfigPy>()?;
+    m.add_class::<CompressorNodeConfigPy>()?;
 
     // io/pipeline
     m.add_class::<PacketPy>()?;
@@ -63,9 +67,6 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // functions
     m.add_function(wrap_pyfunction!(io::make_identity_node, m)?)?;
-    m.add_function(wrap_pyfunction!(processor::make_resample_node, m)?)?;
-    m.add_function(wrap_pyfunction!(processor::make_gain_node, m)?)?;
-    m.add_function(wrap_pyfunction!(processor::make_compressor_node, m)?)?;
     m.add_function(wrap_pyfunction!(processor::make_processor_node, m)?)?;
     m.add_function(wrap_pyfunction!(encoder::make_encoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(decoder::make_decoder_node, m)?)?;

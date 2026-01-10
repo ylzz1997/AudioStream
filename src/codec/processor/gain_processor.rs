@@ -125,7 +125,12 @@ impl AudioProcessor for GainProcessor {
         }
 
         if let Some(expected) = self.fmt {
-            if frame.format() != expected {
+            let actual_fmt = frame.format();
+            if actual_fmt != expected {
+                eprintln!(
+                    "GainProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                    crate::common::audio::audio::audio_format_diff(expected, actual_fmt)
+                );
                 return Err(CodecError::InvalidData("GainProcessor input AudioFormat mismatch"));
             }
         } else {

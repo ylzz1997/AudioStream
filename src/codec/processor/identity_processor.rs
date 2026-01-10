@@ -95,7 +95,12 @@ impl AudioProcessor for IdentityProcessor {
         };
 
         if let Some(expected) = self.expected_fmt {
-            if frame.format() != expected {
+            let actual_fmt = frame.format();
+            if actual_fmt != expected {
+                eprintln!(
+                    "IdentityProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                    crate::common::audio::audio::audio_format_diff(expected, actual_fmt)
+                );
                 return Err(CodecError::InvalidData("IdentityProcessor input AudioFormat mismatch"));
             }
         }

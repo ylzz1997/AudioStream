@@ -42,7 +42,7 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     use audiostream::common::io::file::{AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter};
     use audiostream::common::io::AudioReader;
     use audiostream::common::audio::audio::AudioFrameView;
-    use audiostream::common::io::file::WavWriterConfig;
+    use audiostream::common::io::file::{WavReaderConfig, WavWriterConfig};
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::IdentityNode;
     use audiostream::pipeline::node::node_interface::NodeBufferKind;
@@ -56,10 +56,10 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
     if in_ext != "wav" || out_ext != "wav" {
         return Err("no-ffmpeg build supports only wav->wav".into());
     }
-    let mut r = AudioFileReader::open(input, AudioFileReadConfig::Wav).map_err(|e| format!("{e:?}"))?;
+    let mut r = AudioFileReader::open(input, AudioFileReadConfig::Wav(WavReaderConfig::default())).map_err(|e| format!("{e:?}"))?;
     let first = r.next_frame().map_err(|e| format!("{e:?}"))?.ok_or("empty input")?;
     let fmt = first.format();
-    let mut w = AudioFileWriter::create(output, AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())))
+    let mut w = AudioFileWriter::create(output, AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt)))
         .map_err(|e| format!("{e:?}"))?;
 
     // 统一走异步 pipeline：这里无需处理时，用 identity 节点零拷贝搬运。
@@ -81,13 +81,14 @@ async fn transcode_no_ffmpeg(input: &str, output: &str) -> Result<(), String> {
 #[cfg(feature = "ffmpeg")]
 async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
     use audiostream::codec::encoder::aac_encoder::AacEncoderConfig;
+    use audiostream::codec::encoder::flac_encoder::FlacEncoderConfig;
     use audiostream::codec::encoder::opus_encoder::OpusEncoderConfig;
     use audiostream::codec::processor::resample_processor::ResampleProcessor;
     use audiostream::common::io::file::{
         AudioFileReadConfig, AudioFileReader, AudioFileWriteConfig, AudioFileWriter,
     };
     use audiostream::common::io::AudioReader;
-    use audiostream::common::io::file::{Mp3WriterConfig, WavWriterConfig};
+    use audiostream::common::io::file::{AacAdtsWriterConfig, FlacWriterConfig, Mp3WriterConfig, OpusOggWriterConfig, WavReaderConfig, WavWriterConfig};
     use audiostream::common::audio::audio::{AudioFormat, AudioFrameView, SampleFormat};
     use audiostream::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
     use audiostream::pipeline::node::dynamic_node_interface::{ProcessorNode, DynNode};
@@ -102,7 +103,7 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
 
     // ---- open reader ----
     let in_cfg = match in_ext.as_str() {
-        "wav" => AudioFileReadConfig::Wav,
+        "wav" => AudioFileReadConfig::Wav(WavReaderConfig::default()),
         "mp3" => AudioFileReadConfig::Mp3,
         "aac" | "adts" => AudioFileReadConfig::AacAdts,
         "opus" => AudioFileReadConfig::OpusOgg,
@@ -129,9 +130,11 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
             proc.set_output_chunker(Some(960), true)?;
             resampler = Some(proc);
 
-            AudioFileWriteConfig::OpusOgg(OpusEncoderConfig {
-                input_format: target_fmt,
-                bitrate: Some(96_000),
+            AudioFileWriteConfig::OpusOgg(OpusOggWriterConfig {
+                encoder: OpusEncoderConfig {
+                    input_format: target_fmt,
+                    bitrate: Some(96_000),
+                },
             })
         }
         "flac" => {
@@ -145,11 +148,11 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
                 let proc = ResampleProcessor::new(fmt, target_fmt)?;
                 resampler = Some(proc);
             }
-            AudioFileWriteConfig::Flac(audiostream::common::io::file::FlacWriterConfig::new(target_fmt))
+            AudioFileWriteConfig::Flac(FlacWriterConfig { encoder: FlacEncoderConfig::new(target_fmt) })
         }
-        "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt.sample_rate, fmt.channels())),
+        "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt)),
         "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),
-        "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) }),
+        "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacAdtsWriterConfig { encoder: AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) } }),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
     let w = AudioFileWriter::create(output, out_cfg)?;

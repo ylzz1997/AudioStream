@@ -2,21 +2,23 @@ use crate::common::io::io::{AudioIOResult, AudioIOError};
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
+use crate::codec::encoder::mp3_encoder::Mp3EncoderConfig;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 #[cfg(feature = "ffmpeg")]
 use core::ptr;
 
+/// MP3 文件写入配置：编码参数（encoder）+（预留）writer/容器侧参数。
 #[derive(Clone, Debug)]
 pub struct Mp3WriterConfig {
-    pub encoder: crate::codec::encoder::mp3_encoder::Mp3EncoderConfig,
+    pub encoder: Mp3EncoderConfig,
 }
 
 impl Mp3WriterConfig {
     pub fn new(input_format: crate::common::audio::audio::AudioFormat) -> Self {
         Self {
-            encoder: crate::codec::encoder::mp3_encoder::Mp3EncoderConfig::new(input_format),
+            encoder: Mp3EncoderConfig::new(input_format),
         }
     }
 }

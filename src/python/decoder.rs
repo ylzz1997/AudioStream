@@ -40,7 +40,7 @@ impl WavDecoderConfigPy {
     #[pyo3(signature = (output_format, chunk_samples))]
     fn new(output_format: AudioFormat, chunk_samples: usize) -> PyResult<Self> {
         if chunk_samples == 0 {
-            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+            return Err(PyValueError::new_err("chunk_samples must be greater than 0"));
         }
         Ok(Self {
             output_format,
@@ -64,10 +64,10 @@ impl Mp3DecoderConfigPy {
     #[pyo3(signature = (chunk_samples, packet_time_base_den=48000))]
     fn new(chunk_samples: usize, packet_time_base_den: i32) -> PyResult<Self> {
         if chunk_samples == 0 {
-            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+            return Err(PyValueError::new_err("chunk_samples must be greater than 0"));
         }
         if packet_time_base_den <= 0 {
-            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+            return Err(PyValueError::new_err("packet_time_base_den must be greater than 0"));
         }
         Ok(Self {
             chunk_samples,
@@ -91,10 +91,10 @@ impl AacDecoderConfigPy {
     #[pyo3(signature = (chunk_samples, packet_time_base_den=48000))]
     fn new(chunk_samples: usize, packet_time_base_den: i32) -> PyResult<Self> {
         if chunk_samples == 0 {
-            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+            return Err(PyValueError::new_err("chunk_samples must be greater than 0"));
         }
         if packet_time_base_den <= 0 {
-            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+            return Err(PyValueError::new_err("packet_time_base_den must be greater than 0"));
         }
         Ok(Self {
             chunk_samples,
@@ -121,10 +121,10 @@ impl OpusDecoderConfigPy {
     #[pyo3(signature = (chunk_samples, packet_time_base_den=48000, extradata=None))]
     fn new(chunk_samples: usize, packet_time_base_den: i32, extradata: Option<Vec<u8>>) -> PyResult<Self> {
         if chunk_samples == 0 {
-            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+            return Err(PyValueError::new_err("chunk_samples must be greater than 0"));
         }
         if packet_time_base_den <= 0 {
-            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+            return Err(PyValueError::new_err("packet_time_base_den must be greater than 0"));
         }
         Ok(Self {
             chunk_samples,
@@ -149,10 +149,10 @@ impl FlacDecoderConfigPy {
     #[pyo3(signature = (chunk_samples, packet_time_base_den=48000))]
     fn new(chunk_samples: usize, packet_time_base_den: i32) -> PyResult<Self> {
         if chunk_samples == 0 {
-            return Err(PyValueError::new_err("chunk_samples 必须 > 0"));
+            return Err(PyValueError::new_err("chunk_samples must be greater than 0"));
         }
         if packet_time_base_den <= 0 {
-            return Err(PyValueError::new_err("packet_time_base_den 必须 > 0"));
+            return Err(PyValueError::new_err("packet_time_base_den must be greater than 0"));
         }
         Ok(Self {
             chunk_samples,
@@ -186,7 +186,7 @@ impl Decoder {
                 let out_fmt = cfg.output_format.to_rs()?;
                 if out_fmt.is_planar() {
                     return Err(PyValueError::new_err(
-                        "WAV/PCM decoder 的 output_format.planar 必须为 False（packet 为 interleaved bytes）",
+                        "WAV/PCM decoder's output_format.planar must be False (packet is interleaved bytes)",
                     ));
                 }
                 let packet_time_base = Rational::new(1, out_fmt.sample_rate as i32);
@@ -288,7 +288,7 @@ impl Decoder {
                     let fifo = if let Some(existing) = &mut self.fifo {
                         // 校验 format 一致（若不一致则报错）
                         if existing.format() != fmt {
-                            return Err(PyRuntimeError::new_err("decoder output format changed unexpectedly"));
+                            return Err(PyRuntimeError::new_err("decoder's output format changed unexpectedly"));
                         }
                         existing
                     } else {
@@ -317,7 +317,7 @@ impl Decoder {
                     let fifo = if let Some(existing) = &mut self.fifo {
                         // 校验 format 一致（若不一致则报错）
                         if existing.format() != fmt {
-                            return Err(PyRuntimeError::new_err("decoder output format changed unexpectedly"));
+                            return Err(PyRuntimeError::new_err("decoder's output format changed unexpectedly"));
                         }
                         existing
                     } else {
@@ -330,6 +330,13 @@ impl Decoder {
                 Err(e) => return Err(map_codec_err(e)),
             }
         }
+        Ok(())
+    }
+
+    /// 重置内部状态（清空缓存、回到初始态），可继续接收新的流。
+    fn reset(&mut self) -> PyResult<()> {
+        self.dec.reset().map_err(map_codec_err)?;
+        self.fifo = None;
         Ok(())
     }
 
@@ -360,7 +367,7 @@ impl Decoder {
 
         if !force {
             if nb > 0 {
-                warnings_warn(py, "不够一个 chunk：最后一帧未满，默认不返回；如需返回请 get_frame(force=True)")?;
+                warnings_warn(py, "not enough samples: last frame is not full, default not return; if you want to return, please get_frame(force=True)")?;
             }
             return Ok(None);
         }
@@ -396,7 +403,7 @@ impl Decoder {
             nb
         } else {
             if nb > 0 {
-                warnings_warn(py, "不够一个 chunk：最后一帧未满，默认不返回；如需返回请 get_frame(force=True)")?;
+                warnings_warn(py, "not enough samples: last frame is not full, default not return; if you want to return, please get_frame(force=True)")?;
             }
             return Ok(None);
         };
@@ -481,7 +488,7 @@ impl DynNode for BoxedDecoderNode {
 #[pyfunction]
 pub fn make_decoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>) -> PyResult<DynNodePy> {
     let codec_norm =
-        codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec 仅支持: wav/mp3/aac/opus/flac"))?;
+        codec_from_str(codec).ok_or_else(|| PyValueError::new_err("codec only supports: wav, mp3, aac, opus, flac"))?;
     let dec: Box<dyn AudioDecoder> = match codec_norm {
         "wav" => {
             let cfg = config.extract::<WavDecoderConfigPy>()?;
@@ -499,7 +506,7 @@ pub fn make_decoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>
             }
         }
         "flac" => Box::new(FlacDecoder::new().map_err(map_codec_err)?),
-        _ => return Err(PyValueError::new_err("unsupported codec")),
+        _ => return Err(PyValueError::new_err("unsupported codec: only supports wav, mp3, aac, opus, flac")),
     };
     Ok(DynNodePy::new_boxed(Box::new(BoxedDecoderNode { d: dec })))
 }

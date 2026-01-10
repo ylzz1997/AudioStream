@@ -280,8 +280,7 @@ mod ffmpeg_backend {
                 let av_sf = core::mem::transmute::<i32, ff::AVSampleFormat>((*avf).format);
                 let sf = map_av_sample_format(av_sf)?;
 
-                // 先保守处理：仅保留声道数。mask 的提取依赖 ch_layout.order/union，后续可补齐。
-                let ch_layout = ChannelLayout::unspecified(channels);
+                let ch_layout = ChannelLayout::default_for_channels(channels);
 
                 let format = AudioFormat {
                     sample_rate,

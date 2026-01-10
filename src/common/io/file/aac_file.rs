@@ -6,8 +6,15 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 use crate::codec::encoder::encoder_interface::AudioEncoder;
+use crate::codec::encoder::aac_encoder::AacEncoderConfig;
 
 use crate::common::io::io::{AudioReader, AudioWriter, AudioIOResult, AudioIOError};
+
+/// AAC-ADTS 文件写入配置：编码参数（encoder）+（预留）writer/封装侧参数。
+#[derive(Clone, Debug)]
+pub struct AacAdtsWriterConfig {
+    pub encoder: AacEncoderConfig,
+}
 
 /// ADTS 头解析出来的最小信息。
 #[derive(Clone, Copy, Debug)]
@@ -118,10 +125,10 @@ pub struct AacAdtsWriter {
 impl AacAdtsWriter {
     pub fn create<P: AsRef<Path>>(
         path: P,
-        cfg: crate::codec::encoder::aac_encoder::AacEncoderConfig,
+        cfg: AacAdtsWriterConfig,
     ) -> AudioIOResult<Self> {
         let file = File::create(path)?;
-        let encoder = crate::codec::encoder::aac_encoder::AacEncoder::new(cfg)?;
+        let encoder = crate::codec::encoder::aac_encoder::AacEncoder::new(cfg.encoder)?;
 
         // 真实 FFmpeg backend 下这里应当能拿到 ASC；占位实现下会是 None。
         let asc = encoder

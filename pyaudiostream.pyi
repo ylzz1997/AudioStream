@@ -21,8 +21,8 @@ class AudioFormat:
         sample_rate: int,
         channels: int,
         sample_type: SampleType,
-        planar: bool = ...,
-        channel_layout_mask: int = ...,
+        planar: bool = True,
+        channel_layout_mask: int = 0,
     ) -> None: ...
 
 
@@ -42,7 +42,7 @@ class Mp3EncoderConfig:
         self,
         input_format: AudioFormat,
         chunk_samples: int,
-        bitrate: Optional[int] = ...,
+        bitrate: Optional[int] = 128000,
     ) -> None: ...
 
 
@@ -55,7 +55,7 @@ class AacEncoderConfig:
         self,
         input_format: AudioFormat,
         chunk_samples: int,
-        bitrate: Optional[int] = ...,
+        bitrate: Optional[int] = None,
     ) -> None: ...
 
 
@@ -70,14 +70,14 @@ class Mp3DecoderConfig:
     chunk_samples: int
     packet_time_base_den: int
 
-    def __init__(self, chunk_samples: int, packet_time_base_den: int = ...) -> None: ...
+    def __init__(self, chunk_samples: int, packet_time_base_den: int = 48000) -> None: ...
 
 
 class AacDecoderConfig:
     chunk_samples: int
     packet_time_base_den: int
 
-    def __init__(self, chunk_samples: int, packet_time_base_den: int = ...) -> None: ...
+    def __init__(self, chunk_samples: int, packet_time_base_den: int = 48000) -> None: ...
 
 class OpusEncoderConfig:
     input_format: AudioFormat
@@ -88,7 +88,7 @@ class OpusEncoderConfig:
         self,
         input_format: AudioFormat,
         chunk_samples: int,
-        bitrate: Optional[int] = ...,
+        bitrate: Optional[int] = 96000,
     ) -> None: ...
 
 
@@ -101,7 +101,7 @@ class FlacEncoderConfig:
         self,
         input_format: AudioFormat,
         chunk_samples: int,
-        compression_level: Optional[int] = ...,
+        compression_level: Optional[int] = None,
     ) -> None: ...
 
 
@@ -113,8 +113,8 @@ class OpusDecoderConfig:
     def __init__(
         self,
         chunk_samples: int,
-        packet_time_base_den: int = ...,
-        extradata: Optional[bytes] = ...,
+        packet_time_base_den: int = 48000,
+        extradata: Optional[bytes] = None,
     ) -> None: ...
 
 
@@ -122,7 +122,7 @@ class FlacDecoderConfig:
     chunk_samples: int
     packet_time_base_den: int
 
-    def __init__(self, chunk_samples: int, packet_time_base_den: int = ...) -> None: ...
+    def __init__(self, chunk_samples: int, packet_time_base_den: int = 48000) -> None: ...
 
 
 class Encoder:
@@ -137,9 +137,11 @@ class Encoder:
 
     def put_frame(self, pcm: NDArray[np.generic]) -> None: ...
 
-    def get_frame(self, force: bool = ...) -> Optional[bytes]: ...
+    def get_frame(self, force: bool = False) -> Optional[bytes]: ...
 
-    def get_packet(self, force: bool = ...) -> Optional[Packet]: ...
+    def get_packet(self, force: bool = False) -> Optional[Packet]: ...
+
+    def reset(self) -> None: ...
 
     def pending_samples(self) -> int: ...
 
@@ -162,15 +164,17 @@ class Decoder:
 
     def get_frame(
         self,
-        force: bool = ...,
-        layout: Literal["planar", "interleaved"] = ...,
+        force: bool = False,
+        layout: Literal["planar", "interleaved"] = "planar",
     ) -> Optional[NDArray[np.generic]]: ...
 
     def get_frame_info(
         self,
-        force: bool = ...,
-        layout: Literal["planar", "interleaved"] = ...,
+        force: bool = False,
+        layout: Literal["planar", "interleaved"] = "planar",
     ) -> Optional[tuple[NDArray[np.generic], Optional[int], tuple[int, int]]]: ...
+
+    def reset(self) -> None: ...
 
     def pending_samples(self) -> int: ...
 
@@ -189,12 +193,12 @@ class Packet:
     def __init__(
         self,
         data: bytes,
-        time_base_num: int = ...,
-        time_base_den: int = ...,
-        pts: Optional[int] = ...,
-        dts: Optional[int] = ...,
-        duration: Optional[int] = ...,
-        flags: int = ...,
+        time_base_num: int = 1,
+        time_base_den: int = 48000,
+        pts: Optional[int] = None,
+        dts: Optional[int] = None,
+        duration: Optional[int] = None,
+        flags: int = 0,
     ) -> None: ...
 
 
@@ -205,9 +209,9 @@ class NodeBuffer:
     def pcm(
         pcm: NDArray[np.generic],
         format: AudioFormat,
-        pts: Optional[int] = ...,
-        time_base_num: Optional[int] = ...,
-        time_base_den: Optional[int] = ...,
+        pts: Optional[int] = None,
+        time_base_num: Optional[int] = None,
+        time_base_den: Optional[int] = None,
     ) -> NodeBuffer: ...
 
     @staticmethod
@@ -215,7 +219,7 @@ class NodeBuffer:
 
     def as_pcm(self) -> Optional[NDArray[np.generic]]: ...
 
-    def as_pcm_with_layout(self, layout: Literal["planar", "interleaved"] = ...) -> Optional[NDArray[np.generic]]: ...
+    def as_pcm_with_layout(self, layout: Literal["planar", "interleaved"] = "planar") -> Optional[NDArray[np.generic]]: ...
 
     def as_packet(self) -> Optional[Packet]: ...
 
@@ -250,34 +254,60 @@ class DynNode:
 def make_identity_node(kind: Literal["pcm", "packet"]) -> DynNode: ...
 
 
-def make_resample_node(
-    in_format: AudioFormat,
-    out_format: AudioFormat,
-    out_chunk_samples: Optional[int] = ...,
-    pad_final: bool = ...,
-) -> DynNode: ...
+class IdentityNodeConfig:
+    kind: Literal["pcm", "packet"]
 
-def make_gain_node(
-    format: AudioFormat,
-    gain: float,
-) -> DynNode: ...
+    def __init__(self, kind: Literal["pcm", "packet"]) -> None: ...
 
-def make_compressor_node(
-    format: AudioFormat,
-    sample_rate: float,
-    threshold_db: float,
-    knee_width_db: float,
-    ratio: float,
-    expansion_ratio: float,
-    expansion_threshold_db: float,
-    attack_time: float,
-    release_time: float,
-    master_gain_db: float,
-) -> DynNode: ...
+class ResampleNodeConfig:
+    in_format: AudioFormat
+    out_format: AudioFormat
+    out_chunk_samples: Optional[int]
+    pad_final: bool
+
+    def __init__(
+        self,
+        in_format: AudioFormat,
+        out_format: AudioFormat,
+        out_chunk_samples: Optional[int] = ...,
+        pad_final: bool = ...,
+    ) -> None: ...
+
+class GainNodeConfig:
+    format: AudioFormat
+    gain: float
+
+    def __init__(self, format: AudioFormat, gain: float) -> None: ...
+
+class CompressorNodeConfig:
+    format: AudioFormat
+    sample_rate: Optional[float]
+    threshold_db: float
+    knee_width_db: float
+    ratio: float
+    expansion_ratio: float
+    expansion_threshold_db: float
+    attack_time: float
+    release_time: float
+    master_gain_db: float
+
+    def __init__(
+        self,
+        format: AudioFormat,
+        sample_rate: Optional[float] = ...,
+        threshold_db: float = ...,
+        knee_width_db: float = ...,
+        ratio: float = ...,
+        expansion_ratio: float = ...,
+        expansion_threshold_db: float = ...,
+        attack_time: float = ...,
+        release_time: float = ...,
+        master_gain_db: float = ...,
+    ) -> None: ...
 
 def make_processor_node(
-    kind: str,
-    config: dict[str, Any],
+    kind: Literal["identity", "resample", "gain", "compressor"],
+    config: IdentityNodeConfig | ResampleNodeConfig | GainNodeConfig | CompressorNodeConfig,
 ) -> DynNode: ...
 
 
@@ -296,7 +326,7 @@ def make_python_node(
     obj: Node,
     input_kind: Literal["pcm", "packet"],
     output_kind: Literal["pcm", "packet"],
-    name: str = ...,
+    name: str = "py-node",
 ) -> DynNode: ...
 
 
@@ -322,7 +352,8 @@ class AsyncDynRunner:
 
 
 class AudioFileReader:
-    def __init__(self, path: str, format: Literal["wav", "mp3", "aac_adts", "flac", "opus_ogg"]) -> None: ...
+    # chunk_samples 目前仅对 wav 生效；默认行为是按 1024 samples/帧切块（最后一帧可能更短）。
+    def __init__(self, path: str, format: Literal["wav", "mp3", "aac_adts", "flac", "opus_ogg"], chunk_samples: Optional[int] = 1024) -> None: ...
 
     def next_frame(
         self,
@@ -339,8 +370,10 @@ class AudioFileWriter:
         path: str,
         format: Literal["wav", "mp3", "aac_adts", "flac", "opus_ogg"],
         input_format: AudioFormat,
-        bitrate: Optional[int] = ...,
-        compression_level: Optional[int] = ...,
+        bitrate: Optional[int] = None,
+        compression_level: Optional[int] = None,
+        # None 等价于 "pcm16le"
+        wav_output_format: Optional[Literal["pcm16le", "f32le"]] = "pcm16le",
     ) -> None: ...
 
     def write_pcm(self, pcm: NDArray[np.generic]) -> None: ...
@@ -355,14 +388,14 @@ class Processor:
     name: str
 
     @staticmethod
-    def identity(format: Optional[AudioFormat] = ...) -> Processor: ...
+    def identity(format: Optional[AudioFormat] = None) -> Processor: ...
 
     @staticmethod
     def resample(
         in_format: AudioFormat,
         out_format: AudioFormat,
-        out_chunk_samples: Optional[int] = ...,
-        pad_final: bool = ...,
+        out_chunk_samples: Optional[int] = None,
+        pad_final: bool = True,
     ) -> Processor: ...
 
     @staticmethod
@@ -385,11 +418,13 @@ class Processor:
         master_gain_db: float,
     ) -> Processor: ...
 
-    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = ...) -> None: ...
+    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = None) -> None: ...
 
     def flush(self) -> None: ...
 
-    def get_frame(self, layout: Literal["planar", "interleaved"] = ...) -> Optional[NDArray[np.generic]]: ...
+    def get_frame(self, force: bool = False, layout: Literal["planar", "interleaved"] = "planar") -> Optional[NDArray[np.generic]]: ...
+
+    def reset(self) -> None: ...
 
     def output_format(self) -> Optional[AudioFormat]: ...
 

@@ -5,3 +5,6 @@ test.py
 __pycache__
 out.*
 .DS_Store
+test_2.py
+test.mp3
+test.wav

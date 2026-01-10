@@ -210,7 +210,7 @@ mod ffmpeg_backend {
                 let format = AudioFormat {
                     sample_rate,
                     sample_format: sf,
-                    channel_layout: ChannelLayout::unspecified(channels),
+                    channel_layout: ChannelLayout::default_for_channels(channels),
                 };
 
                 let bps = format.sample_format.bytes_per_sample();

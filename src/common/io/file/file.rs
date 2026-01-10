@@ -6,7 +6,7 @@ use core::fmt;
 use std::path::Path;
 
 use super::aac_file::{AacAdtsReader, AacAdtsWriter};
-use super::flac_file::{FlacReader, FlacWriter, FlacWriterConfig};
+use super::flac_file::{FlacReader, FlacWriter};
 use super::mp3_file::{Mp3Reader, Mp3Writer};
 use super::opus_file::{OpusOggReader, OpusOggWriter};
 use super::wav_file::{WavReader, WavWriter};
@@ -58,11 +58,10 @@ pub enum CodecId {
 }
 
 pub enum AudioFileWriteConfig {
-    AacAdts(crate::codec::encoder::aac_encoder::AacEncoderConfig),
-    Flac(FlacWriterConfig),
+    AacAdts(super::aac_file::AacAdtsWriterConfig),
+    Flac(super::flac_file::FlacWriterConfig),
     Mp3(super::mp3_file::Mp3WriterConfig),
-    /// 标准 Ogg Opus（播放器可播放的 .opus）
-    OpusOgg(crate::codec::encoder::opus_encoder::OpusEncoderConfig),
+    OpusOgg(super::opus_file::OpusOggWriterConfig),
     Wav(super::wav_file::WavWriterConfig),
 }
 
@@ -70,9 +69,8 @@ pub enum AudioFileReadConfig {
     AacAdts,
     Flac,
     Mp3,
-    /// 标准 Ogg Opus（播放器可播放的 .opus）
     OpusOgg,
-    Wav,
+    Wav(super::wav_file::WavReaderConfig),
 }
 
 pub enum AudioFileWriter {
@@ -110,7 +108,7 @@ impl AudioFileReader {
             AudioFileReadConfig::Flac => Ok(Self::Flac(FlacReader::open(path)?)),
             AudioFileReadConfig::Mp3 => Ok(Self::Mp3(Mp3Reader::open(path)?)),
             AudioFileReadConfig::OpusOgg => Ok(Self::OpusOgg(OpusOggReader::open(path)?)),
-            AudioFileReadConfig::Wav => Ok(Self::Wav(WavReader::open(path)?)),
+            AudioFileReadConfig::Wav(cfg) => Ok(Self::Wav(WavReader::open_with_config(path, cfg)?)),
         }
     }
 }

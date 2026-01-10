@@ -288,7 +288,7 @@ impl LinearResampler {
 pub mod ffmpeg_backend {
     use super::ResampleError;
     use crate::common::audio::audio::{
-        AudioFormat, AudioFrame, AudioFrameView, ChannelLayout, Rational, SampleFormat,
+        audio_format_diff, AudioFormat, AudioFrame, AudioFrameView, ChannelLayout, Rational, SampleFormat,
     };
     use core::ptr;
     use std::ffi::CStr;
@@ -438,6 +438,10 @@ pub mod ffmpeg_backend {
             let fmt = input.format();
             // 目前先要求输入格式完全匹配，避免隐式转换导致上层“不知情”
             if fmt != self.in_fmt {
+                eprintln!(
+                    "FfmpegResampler input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                    audio_format_diff(self.in_fmt, fmt)
+                );
                 return Err(ResampleError::UnsupportedFormat("input AudioFormat mismatch for this resampler"));
             }
             let in_nb = input.nb_samples();

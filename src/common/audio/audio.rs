@@ -110,6 +110,18 @@ impl ChannelLayout {
     pub const fn unspecified(channels: u16) -> Self {
         Self { channels, mask: 0 }
     }
+
+    /// 仅根据声道数给出一个“合理默认”的 layout：
+    /// - 1ch => mono (FRONT_CENTER)
+    /// - 2ch => stereo (FRONT_LEFT|FRONT_RIGHT)
+    /// - 其它 => unspecified(channels)（不乱猜 5.1/7.1 等布局）
+    pub const fn default_for_channels(channels: u16) -> Self {
+        match channels {
+            1 => Self::mono(),
+            2 => Self::stereo(),
+            _ => Self::unspecified(channels),
+        }
+    }
 }
 
 /// 音频格式描述（对标 FFmpeg 的 AVCodecParameters / SwrContext 输入输出参数组合）。
@@ -128,6 +140,37 @@ impl AudioFormat {
     pub const fn is_planar(&self) -> bool {
         self.sample_format.is_planar()
     }
+}
+
+/// 用于调试：输出两个 `AudioFormat` 的逐字段差异（为空表示完全一致）。
+pub fn audio_format_diff(expected: AudioFormat, actual: AudioFormat) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if expected.sample_rate != actual.sample_rate {
+        parts.push(format!(
+            "sample_rate: {} != {}",
+            expected.sample_rate, actual.sample_rate
+        ));
+    }
+    if expected.sample_format != actual.sample_format {
+        parts.push(format!(
+            "sample_format: {:?} != {:?}",
+            expected.sample_format, actual.sample_format
+        ));
+    }
+    if expected.channels() != actual.channels() {
+        parts.push(format!(
+            "channels: {} != {}",
+            expected.channels(),
+            actual.channels()
+        ));
+    }
+    if expected.channel_layout.mask != actual.channel_layout.mask {
+        parts.push(format!(
+            "channel_layout_mask: {:#x} != {:#x}",
+            expected.channel_layout.mask, actual.channel_layout.mask
+        ));
+    }
+    parts.join(", ")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

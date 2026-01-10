@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-Hans">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AudioStream 文档</title>
+    <meta name="description" content="AudioStream 项目文档（Rust / Python）" />
+    <link rel="icon" href="../logo/logo.png" />
+    <link rel="stylesheet" href="./styles.css" />
+    <!-- 代码高亮：highlight.js（CDN）。如需完全离线，可把这两行替换为本地 vendor 文件。 -->
+    <link
+      rel="stylesheet"
+      href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar__left">
+        <a class="brand" href="./index.html" aria-label="AudioStream 文档首页">
+          <img class="brand__logo" src="../logo/logo.png" alt="AudioStream Logo" />
+          <div class="brand__text">
+            <div class="brand__title">AudioStream</div>
+            <div class="brand__subtitle">文档中心</div>
+          </div>
+        </a>
+      </div>
+
+      <div class="topbar__right">
+        <button class="iconbtn" id="btnToggleNav" type="button" aria-label="打开/关闭侧边栏" aria-expanded="false">
+          <span class="iconbtn__bar"></span>
+          <span class="iconbtn__bar"></span>
+          <span class="iconbtn__bar"></span>
+        </button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <aside class="nav" id="nav" aria-label="文档导航">
+        <div class="nav__section">
+          <div class="seg" role="tablist" aria-label="语言选择">
+            <button class="seg__btn" id="tabPython" type="button" role="tab" aria-selected="true">
+              Python
+            </button>
+            <button class="seg__btn" id="tabRust" type="button" role="tab" aria-selected="false">
+              Rust
+            </button>
+          </div>
+        </div>
+
+        <div class="nav__section">
+          <label class="field">
+            <span class="field__label">搜索条目</span>
+            <input class="field__input" id="search" type="search" placeholder="输入关键字…" autocomplete="off" />
+          </label>
+        </div>
+
+        <div class="nav__section nav__section--list" id="navList" aria-live="polite"></div>
+      </aside>
+
+      <main class="main" id="main" tabindex="-1">
+        <article class="doc" id="doc" aria-live="polite"></article>
+      </main>
+    </div>
+
+    <script defer src="./data.js"></script>
+    <script
+      defer
+      src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+    <script defer src="./app.js"></script>
+  </body>
+</html>
+
+

@@ -39,6 +39,12 @@ fn build_opus_head(channels: u8, input_sample_rate: u32) -> Vec<u8> {
     v
 }
 
+/// 标准 Ogg Opus（.opus）写入配置：编码参数（encoder）+（预留）容器侧参数。
+#[derive(Clone, Debug)]
+pub struct OpusOggWriterConfig {
+    pub encoder: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
+}
+
 pub struct OpusPacketWriter {
     file: File,
     encoder: crate::codec::encoder::opus_encoder::OpusEncoder,
@@ -191,7 +197,7 @@ pub struct OpusOggWriter;
 impl OpusOggWriter {
     pub fn create<P: AsRef<Path>>(
         _path: P,
-        _cfg: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
+        _cfg: OpusOggWriterConfig,
     ) -> AudioIOResult<Self> {
         Err(AudioIOError::Codec(CodecError::Unsupported(
             "Ogg Opus writer requires FFmpeg backend (enable feature=ffmpeg)",
@@ -286,12 +292,13 @@ mod ogg_ffmpeg_backend {
     impl OpusOggWriter {
         pub fn create<P: AsRef<Path>>(
             path: P,
-            cfg: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
+            cfg: OpusOggWriterConfig,
         ) -> AudioIOResult<Self> {
             let out_path = path.as_ref().to_string_lossy();
             let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
 
-            let in_fmt = cfg.input_format;
+            let enc_cfg = cfg.encoder;
+            let in_fmt = enc_cfg.input_format;
             if in_fmt.sample_rate != 48_000 {
                 return Err(AudioIOError::Format("Ogg Opus writer expects 48kHz input (resample before writing)"));
             }
@@ -328,7 +335,7 @@ mod ogg_ffmpeg_backend {
                 (*enc_ctx).sample_rate = 48_000;
                 (*enc_ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
                 (*enc_ctx).time_base = ff::AVRational { num: 1, den: 48_000 };
-                if let Some(br) = cfg.bitrate {
+                if let Some(br) = enc_cfg.bitrate {
                     (*enc_ctx).bit_rate = br as i64;
                 } else {
                     (*enc_ctx).bit_rate = 96_000;

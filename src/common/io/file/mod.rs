@@ -5,9 +5,9 @@ pub mod mp3_file;
 pub mod flac_file;
 pub mod file;
 
-pub use aac_file::{AacAdtsReader, AacAdtsWriter};
-pub use opus_file::{OpusOggReader, OpusOggWriter};
-pub use wav_file::{WavReader, WavWriter, WavWriterConfig};
+pub use aac_file::{AacAdtsReader, AacAdtsWriter, AacAdtsWriterConfig};
+pub use opus_file::{OpusOggReader, OpusOggWriter, OpusOggWriterConfig};
+pub use wav_file::{WavReader, WavReaderConfig, WavWriter, WavWriterConfig, WavOutputSampleFormat};
 pub use mp3_file::{Mp3Reader, Mp3Writer, Mp3WriterConfig};
 pub use flac_file::{FlacReader, FlacWriter, FlacWriterConfig};
 pub use file::*;

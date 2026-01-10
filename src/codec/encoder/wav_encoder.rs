@@ -53,6 +53,10 @@ impl AudioEncoder for WavEncoder {
         let frame = frame.unwrap();
         let fmt = frame.format();
         if fmt != self.cfg.input_format {
+            eprintln!(
+                "WavEncoder input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                crate::common::audio::audio::audio_format_diff(self.cfg.input_format, fmt)
+            );
             return Err(CodecError::InvalidData("input AudioFormat mismatch"));
         }
 

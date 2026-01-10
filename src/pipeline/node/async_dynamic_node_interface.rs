@@ -5,12 +5,29 @@ use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, AsyncPipelineProducer, AsyncPipelineConsumer, AsyncPipelineEndpoint, NodeBuffer};
 use tokio::sync::mpsc;
 use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
 
 /// pipeline 内部消息：
 /// - `Ok(Some(buf))`：一条数据
 /// - `Ok(None)`：flush（输入结束）
 /// - `Err(e)`：错误（会沿链路传递到末端）
 type Msg = Result<Option<NodeBuffer>, CodecError>;
+
+fn store_err(store: &Arc<Mutex<Option<CodecError>>>, e: &CodecError) {
+    // 只记录“第一个”错误，避免后续噪音覆盖根因
+    let mut g = store.lock().expect("err_store poisoned");
+    if g.is_none() {
+        *g = Some(e.clone());
+    }
+}
+
+fn err_or_closed(store: &Arc<Mutex<Option<CodecError>>>) -> CodecError {
+    store
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or(CodecError::InvalidState("tokio pipeline input channel closed"))
+}
 
 fn drain_to_next(node: &mut Box<dyn DynNode>, tx_next: &mpsc::UnboundedSender<Msg>) -> Result<(), CodecError> {
     loop {
@@ -28,11 +45,17 @@ fn drain_to_next(node: &mut Box<dyn DynNode>, tx_next: &mpsc::UnboundedSender<Ms
     }
 }
 
-fn spawn_stage(mut node: Box<dyn DynNode>, mut rx: mpsc::UnboundedReceiver<Msg>, tx_next: mpsc::UnboundedSender<Msg>) {
+fn spawn_stage(
+    mut node: Box<dyn DynNode>,
+    mut rx: mpsc::UnboundedReceiver<Msg>,
+    tx_next: mpsc::UnboundedSender<Msg>,
+    err_store: Arc<Mutex<Option<CodecError>>>,
+) {
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 Err(e) => {
+                    store_err(&err_store, &e);
                     let _ = tx_next.send(Err(e));
                     break;
                 }
@@ -52,6 +75,7 @@ fn spawn_stage(mut node: Box<dyn DynNode>, mut rx: mpsc::UnboundedReceiver<Msg>,
                         break;
                     }
                     Err(e) => {
+                        store_err(&err_store, &e);
                         let _ = tx_next.send(Err(e));
                         break;
                     }
@@ -67,11 +91,13 @@ fn spawn_last_stage(
     mut node: Box<dyn DynNode>,
     mut rx: mpsc::UnboundedReceiver<Msg>,
     out_tx: mpsc::UnboundedSender<Result<NodeBuffer, CodecError>>,
+    err_store: Arc<Mutex<Option<CodecError>>>,
 ) {
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
                 Err(e) => {
+                    store_err(&err_store, &e);
                     let _ = out_tx.send(Err(e));
                     return;
                 }
@@ -89,6 +115,7 @@ fn spawn_last_stage(
                                 return;
                             }
                             Err(e) => {
+                                store_err(&err_store, &e);
                                 let _ = out_tx.send(Err(e));
                                 return;
                             }
@@ -108,6 +135,7 @@ fn spawn_last_stage(
                                     return;
                                 }
                                 Err(e) => {
+                                    store_err(&err_store, &e);
                                     let _ = out_tx.send(Err(e));
                                     return;
                                 }
@@ -119,6 +147,7 @@ fn spawn_last_stage(
                         return;
                     }
                     Err(e) => {
+                        store_err(&err_store, &e);
                         let _ = out_tx.send(Err(e));
                         return;
                     }
@@ -134,10 +163,12 @@ fn spawn_last_stage(
 pub struct AsyncDynPipeline {
     in_tx: mpsc::UnboundedSender<Msg>,
     out_rx: mpsc::UnboundedReceiver<Result<NodeBuffer, CodecError>>,
+    err_store: Arc<Mutex<Option<CodecError>>>,
 }
 
 pub struct AsyncDynPipelineProducer {
     tx: mpsc::UnboundedSender<Msg>,
+    err_store: Arc<Mutex<Option<CodecError>>>,
 }
 
 pub struct AsyncDynPipelineConsumer {
@@ -148,13 +179,13 @@ impl AsyncDynPipelineProducer {
     pub fn push_frame(&self, buf: NodeBuffer) -> CodecResult<()> {
         self.tx
             .send(Ok(Some(buf)))
-            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+            .map_err(|_| err_or_closed(&self.err_store))
     }
 
     pub fn flush(&self) -> CodecResult<()> {
         self.tx
             .send(Ok(None))
-            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+            .map_err(|_| err_or_closed(&self.err_store))
     }
 }
 
@@ -212,6 +243,7 @@ impl AsyncDynPipeline {
         }
 
         let (in_tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        let err_store: Arc<Mutex<Option<CodecError>>> = Arc::new(Mutex::new(None));
 
         let mut iter = nodes.into_iter();
         let mut current = iter
@@ -220,21 +252,28 @@ impl AsyncDynPipeline {
 
         while let Some(next_node) = iter.next() {
             let (tx_next, rx_next) = mpsc::unbounded_channel::<Msg>();
-            spawn_stage(current, rx, tx_next);
+            spawn_stage(current, rx, tx_next, err_store.clone());
             current = next_node;
             rx = rx_next;
         }
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Result<NodeBuffer, CodecError>>();
-        spawn_last_stage(current, rx, out_tx);
+        spawn_last_stage(current, rx, out_tx, err_store.clone());
 
-        Ok(Self { in_tx, out_rx })
+        Ok(Self {
+            in_tx,
+            out_rx,
+            err_store,
+        })
     }
 
     /// 拆分为输入端/输出端，用于 runner 并行驱动。
     pub fn endpoints(self) -> (AsyncDynPipelineProducer, AsyncDynPipelineConsumer) {
         (
-            AsyncDynPipelineProducer { tx: self.in_tx },
+            AsyncDynPipelineProducer {
+                tx: self.in_tx,
+                err_store: self.err_store,
+            },
             AsyncDynPipelineConsumer { rx: self.out_rx },
         )
     }
@@ -248,13 +287,13 @@ impl AsyncPipeline for AsyncDynPipeline {
     fn push_frame(&self, buf: NodeBuffer) -> CodecResult<()> {
         self.in_tx
             .send(Ok(Some(buf)))
-            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+            .map_err(|_| err_or_closed(&self.err_store))
     }
 
     fn flush(&self) -> CodecResult<()> {
         self.in_tx
             .send(Ok(None))
-            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
+            .map_err(|_| err_or_closed(&self.err_store))
     }
 
     /// 非阻塞取末端输出。

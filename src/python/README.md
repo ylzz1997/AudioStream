@@ -160,37 +160,17 @@ import numpy as np
 import pyaudiostream as ast
 
 # 44.1k -> 48k（为 Opus encoder 做准备）
-in_fmt = ast.AudioFormat(sample_rate=44100, channels=2, sample_type="f32", planar=True)
-out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
+# 注意：libopus encoder 仅支持 packed/interleaved 的 flt/s16（不支持 fltp/s16p），
+# 所以这里要用 planar=False，并且 numpy shape 约定为 (samples, channels)。
+in_fmt = ast.AudioFormat(sample_rate=44100, channels=2, sample_type="f32", planar=False)
+out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=False)
 
 nodes = [
-    ast.make_resample_node(in_fmt, out_fmt, out_chunk_samples=960, pad_final=True),
-    ast.make_compressor_node(
-        out_fmt,
-        sample_rate=48000.0,
-        threshold_db=-18.0,
-        knee_width_db=6.0,
-        ratio=4.0,
-        expansion_ratio=2.0,
-        expansion_threshold_db=-60.0,
-        attack_time=0.01,
-        release_time=0.10,
-        master_gain_db=0.0,
-    ),
-    ast.make_gain_node(out_fmt, gain=0.9),
-    ast.make_encoder_node("opus", ast.OpusEncoderConfig(out_fmt, chunk_samples=960, bitrate=96_000)),
-]
-```
-
-你也可以用统一入口 `make_processor_node(kind, config)`（用 dict 传参）来动态选择 processor：
-
-```python
-nodes = [
-    ast.make_processor_node("resample", dict(in_format=in_fmt, out_format=out_fmt, out_chunk_samples=960, pad_final=True)),
+    ast.make_processor_node("resample", ast.ResampleNodeConfig(in_fmt, out_fmt, out_chunk_samples=960, pad_final=True)),
     ast.make_processor_node(
         "compressor",
-        dict(
-            format=out_fmt,
+        ast.CompressorNodeConfig(
+            out_fmt,
             sample_rate=48000.0,
             threshold_db=-18.0,
             knee_width_db=6.0,
@@ -202,28 +182,14 @@ nodes = [
             master_gain_db=0.0,
         ),
     ),
-    ast.make_processor_node("gain", dict(format=out_fmt, gain=0.9)),
+    ast.make_processor_node("gain", ast.GainNodeConfig(out_fmt, gain=0.9)),
+    ast.make_encoder_node("opus", ast.OpusEncoderConfig(out_fmt, chunk_samples=960, bitrate=96_000)),
 ]
-
-p = ast.AsyncDynPipeline(nodes)
-
-pcm = np.zeros((2, 4410), dtype=np.float32)  # 100ms @ 44.1kHz
-p.push(ast.NodeBuffer.pcm(pcm, in_fmt))
-p.flush()
-
-packets = []
-while True:
-    out = p.get()
-    if out is None:
-        break
-    pkt = out.as_packet()
-    if pkt is not None:
-        packets.append(pkt.data)
 ```
 
 ### Python 自定义 Node（DynNode）
 
-除了内置的 `make_identity_node / make_resample_node / make_encoder_node / make_decoder_node`，你也可以用 Python 自己实现一个节点，并放进 `AsyncDynPipeline(nodes=[...])` / `AsyncDynRunner(nodes=[...])` 里。
+除了内置的 `make_identity_node / make_processor_node / make_encoder_node / make_decoder_node`，你也可以用 Python 自己实现一个节点，并放进 `AsyncDynPipeline(nodes=[...])` / `AsyncDynRunner(nodes=[...])` 里。
 
 #### 1) Python 侧需要实现的方法
 
@@ -344,9 +310,12 @@ out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", plan
 dst = ast.AudioFileWriter("out.flac", "flac", out_fmt, compression_level=8)
 
 nodes = [
-    ast.make_resample_node(
-        ast.AudioFormat(44100, 2, "f32", planar=True),  # 仅示例：真实输入格式可从首帧推导/约定
-        out_fmt,
+    ast.make_processor_node(
+        "resample",
+        ast.ResampleNodeConfig(
+            ast.AudioFormat(44100, 2, "f32", planar=True),  # 仅示例：真实输入格式可从首帧推导/约定
+            out_fmt,
+        ),
     ),
 ]
 

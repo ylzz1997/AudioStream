@@ -384,6 +384,15 @@ impl Encoder {
         Ok(())
     }
 
+    /// 重置内部状态（清空缓存、回到初始态），可继续接收新的流。
+    fn reset(&mut self) -> PyResult<()> {
+        self.enc.reset().map_err(map_codec_err)?;
+        self.fifo.clear();
+        self.out_q.clear();
+        self.sent_eof = false;
+        Ok(())
+    }
+
     /// 取出一个编码后的 frame（bytes）。
     ///
     /// - 默认：如果 FIFO 剩余不够一个 chunk，则返回 None 并 warnings.warn
