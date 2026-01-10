@@ -202,13 +202,16 @@ impl DynPipeline {
 
     /// 推入一个输入（或 flush），并尽可能把数据跑到末端，返回末端所有可用输出。
     pub fn push_and_drain(&mut self, input: Option<NodeBuffer>) -> CodecResult<Vec<NodeBuffer>> {
-        self.nodes[0].push(input)?;
+        match self.nodes[0].push(input) {
+            Ok(()) | Err(CodecError::Again) => {}
+            Err(e) => return Err(e),
+        }
         self.drain_all()
     }
 
     /// 尽可能推进整条链，把末端所有可用输出取出来。
     pub fn drain_all(&mut self) -> CodecResult<Vec<NodeBuffer>> {
-        // 从前到后：把每一段的输出尽可能推到下一段
+        // 从前到后：把每一段的输出尽可能推到下一段。
         for i in 0..(self.nodes.len() - 1) {
             if self.done[i] {
                 continue;
@@ -216,13 +219,23 @@ impl DynPipeline {
             loop {
                 match self.nodes[i].pull() {
                     Ok(buf) => {
-                        self.nodes[i + 1].push(Some(buf))?;
+                        match self.nodes[i + 1].push(Some(buf)) {
+                            Ok(()) => {}
+                            Err(CodecError::Again) => {
+                                // 下游背压：先进入下一段推进（在本轮 for 循环的后续 i+1.. 中被处理）
+                                break;
+                            }
+                            Err(e) => return Err(e),
+                        }
                     }
                     Err(CodecError::Again) => break,
                     Err(CodecError::Eof) => {
                         // 上游结束，通知下游 flush
                         self.done[i] = true;
-                        self.nodes[i + 1].push(None)?;
+                        match self.nodes[i + 1].push(None) {
+                            Ok(()) | Err(CodecError::Again) => {}
+                            Err(e) => return Err(e),
+                        }
                         break;
                     }
                     Err(e) => return Err(e),
@@ -243,5 +256,3 @@ impl DynPipeline {
         Ok(outs)
     }
 }
-
-
