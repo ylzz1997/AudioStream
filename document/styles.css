@@ -29,9 +29,22 @@ body {
   margin: 0;
   font-family: var(--sans);
   color: var(--text);
-  background: radial-gradient(1100px 600px at 12% 8%, rgba(124, 58, 237, 0.32), transparent 60%),
-    radial-gradient(900px 520px at 92% 6%, rgba(34, 197, 94, 0.18), transparent 60%),
-    radial-gradient(900px 520px at 60% 90%, rgba(59, 130, 246, 0.16), transparent 60%), var(--bg);
+  background: radial-gradient(1100px 600px at 12% 8%, rgba(124, 58, 237, 0.22), transparent 60%),
+    radial-gradient(900px 520px at 92% 6%, rgba(34, 197, 94, 0.14), transparent 60%),
+    radial-gradient(900px 520px at 60% 90%, rgba(59, 130, 246, 0.12), transparent 60%), var(--bg);
+  position: relative;
+}
+
+/* Canvas 动态背景（更易控性能；不影响正文交互） */
+.bgcanvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+  display: block;
+  opacity: 0.95;
 }
 
 code {
@@ -109,6 +122,8 @@ code {
   height: calc(100vh - 68px);
   display: grid;
   grid-template-columns: 320px 1fr;
+  position: relative;
+  z-index: 1;
 }
 
 .nav {
@@ -320,6 +335,28 @@ code {
 .section ul {
   margin: 10px 0 0;
   padding-left: 18px;
+}
+
+/* 文档插图/图注（用于 Pipeline/Runner 示意图等） */
+.figure {
+  margin: 12px 0 0;
+}
+
+.docimg {
+  width: 100%;
+  height: auto;
+  display: block;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.03);
+  box-shadow: var(--shadow);
+}
+
+.figcap {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.55;
 }
 
 pre {

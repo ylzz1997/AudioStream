@@ -320,8 +320,28 @@ print(out.shape, out.max())
               <div class="hero">
                 <div class="hero__kicker">进阶</div>
                 <h1 class="hero__title">IO：AudioFileReader / AudioFileWriter</h1>
-                <p class="hero__desc">Python 侧提供文件读写封装：<code>AudioFileReader</code> 读文件并产出 PCM；<code>AudioFileWriter</code> 接收 PCM 并写出编码文件。</p>
+                <p class="hero__desc">
+                  Python 侧提供文件读写封装：<code>AudioFileReader</code> 读文件并产出 PCM；<code>AudioFileWriter</code> 接收 PCM 并写出编码文件。
+                  同时，它们背后对应 Rust 的统一 IO 抽象：<code>AudioReader</code> / <code>AudioWriter</code>。
+                </p>
               </div>
+
+              <section class="section">
+                <h2>抽象：AudioReader / AudioWriter</h2>
+                <p>AudioStream 把“从哪里读 PCM / 往哪里写 PCM”抽象成两个 trait：</p>
+                <ul>
+                  <li><b>AudioReader</b>：<code>next_frame() -&gt; Option[AudioFrame]</code>（EOF 返回 None）</li>
+                  <li><b>AudioWriter</b>：<code>write_frame(frame)</code> + <code>finalize()</code></li>
+                </ul>
+                <p>
+                  这样做的好处是：Runner 只关心“拉取一帧 → 推进 pipeline → 写出输出”，不关心底层是文件、网络还是内存。
+                  在 Rust 里，任何实现了 <code>AudioReader</code> 的类型会自动成为 <code>AudioSource</code>；实现了 <code>AudioWriter</code> 的类型会自动成为 <code>AudioSink</code>（因此可以直接被 Runner 使用）。
+                </p>
+                <p>
+                  在 Python 里，<code>AudioFileReader</code> / <code>AudioFileWriter</code> 也额外实现了 Runner 需要的 <code>pull</code> / <code>push</code> / <code>finalize</code> 方法，
+                  因而可以直接作为 <code>AsyncDynRunner</code> 的 Source/Sink（见 “Runner” 小节示例）。
+                </p>
+              </section>
 
               <section class="section">
                 <h2>AudioFileReader：从文件读 PCM（numpy）</h2>
@@ -360,8 +380,37 @@ w.finalize()
               <div class="hero">
                 <div class="hero__kicker">进阶</div>
                 <h1 class="hero__title">Pipeline：把多个节点串成一条可运行的链</h1>
-                <p class="hero__desc"><code>AsyncDynPipeline</code> 接收一组动态节点（DynNode），负责在节点之间搬运数据；你可以手动 push/flush/get，也可以交给 Runner 自动驱动。</p>
+                <p class="hero__desc">
+                  Pipeline 用来把多个 Node 串成一条链，并在节点之间搬运数据。
+                  Rust 侧同时提供同步/异步两套 Pipeline；Python 侧目前主要暴露异步动态版本 <code>AsyncDynPipeline</code>（最通用、也最适合与 Runner 搭配）。
+                </p>
               </div>
+
+              <section class="section">
+                <h2>同步 Pipeline vs 异步 Pipeline</h2>
+                <ul>
+                  <li>
+                    <b>同步（Sync）</b>：前台单线程推进，调用 <code>push_and_drain / drain_all</code> 时才会把数据从上游推到下游；
+                    Node 通过 <code>Again</code> 表达“暂无输出/背压”，通过 <code>Eof</code> 表达“flush 后结束”。
+                  </li>
+                  <li>
+                    <b>异步（Async）</b>：<code>push</code> 后后台并行流转，各 stage 通过 channel 串联；末端用 <code>get/try_get</code> 取输出。
+                    这种模式更适合“每帧处理耗时明显、希望流水线并行”的场景（Runner 小节有示意图）。
+                  </li>
+                </ul>
+                <p>
+                  Python 暴露的 <code>AsyncDynPipeline</code> 走 tokio 后台任务；当你把 Python 自定义 Node/Sink/Source 接入时，
+                  内部会使用 <b>current-thread runtime</b>，保证 Python 对象不会跨线程访问（避免 GIL/unsendable 问题）。
+                </p>
+              </section>
+
+              <section class="section">
+                <h2>动态 Pipeline vs 静态 Pipeline（Rust 侧概念）</h2>
+                <ul>
+                  <li><b>动态（Dyn）</b>：节点输入/输出统一用 <code>NodeBuffer(pcm|packet)</code> 做类型擦除，适合“运行时拼装节点列表”。Python 使用的就是这一套。</li>
+                  <li><b>静态（Static）</b>：节点类型在编译期确定，连接关系由泛型保证（更强的类型安全/更少运行时检查），通常用于纯 Rust 场景。</li>
+                </ul>
+              </section>
 
               <section class="section">
                 <h2>用节点工厂组装 Pipeline</h2>
@@ -404,6 +453,49 @@ while True:
                   <li><b>flush</b>：输入结束要 push None 或调用 <code>flush()</code>，才能把内部残留全部排空。</li>
                 </ul>
               </section>
+
+              <section class="section">
+                <h2>Python 自定义 Node（DynNode）：与 Rust 原生节点的区别与注意事项</h2>
+                <p>除内置的 Rust 节点（resample/gain/compressor/encoder/decoder 等）外，你也可以用 Python 实现一个节点，然后用 <code>make_python_node</code> 包装成 DynNode 放进 pipeline。</p>
+                <ul>
+                  <li><b>性能差异</b>：Rust 原生节点在 Rust 内部执行，开销更低；Python 节点需要跨语言回调 + GIL，适合轻量逻辑或做 glue，不建议在其中做很重的逐样本 DSP。</li>
+                  <li><b>NodeBuffer move 语义</b>：<code>NodeBuffer</code> 在 Rust 侧会被 move；同一个 buffer 不能重复使用/重复读取。需要缓存输出时，请创建新的 <code>NodeBuffer.pcm(...)</code> / <code>NodeBuffer.packet(...)</code>。</li>
+                  <li><b>控制流语义</b>：<code>pull()</code> 在 flush 前返回 None 表示 “Again/暂无输出”；flush 后返回 None 表示 “Eof/结束”。也可以显式抛 <code>BlockingIOError</code> / <code>EOFError</code> 表达 Again/Eof。</li>
+                  <li><b>kind 必须匹配</b>：你在 <code>make_python_node(obj, input_kind, output_kind)</code> 声明的 kind，必须与实际 push/pull 的 buffer kind 一致。</li>
+                </ul>
+                <pre><code>
+import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(sample_rate=48000, channels=1, sample_type="f32", planar=True)
+
+class GainNode:
+    def __init__(self, gain: float):
+        self.gain = gain
+        self.q = []
+        self.flushed = False
+
+    def push(self, buf):
+        if buf is None:
+            self.flushed = True
+            return
+        pcm = buf.as_pcm()
+        if pcm is None:
+            raise ValueError("expects pcm")
+        fmt2, pts, (tb_num, tb_den) = buf.pcm_info()
+        out = (pcm * self.gain).astype(np.float32, copy=False)
+        self.q.append(ast.NodeBuffer.pcm(out, fmt2, pts=pts, time_base_num=tb_num, time_base_den=tb_den))
+
+    def pull(self):
+        if self.q:
+            return self.q.pop(0)
+        if self.flushed:
+            raise EOFError()
+        return None  # 暂无输出（Again）
+
+py_gain = ast.make_python_node(GainNode(0.5), input_kind="pcm", output_kind="pcm", name="gain")
+                </code></pre>
+              </section>
             `,
           },{
             id: "py-source",
@@ -413,8 +505,20 @@ while True:
               <div class="hero">
                 <div class="hero__kicker">进阶</div>
                 <h1 class="hero__title">AudioSource：数据从哪里来</h1>
-                <p class="hero__desc">在 Python 里，一个 Source 只需要实现 <code>pull() -&gt; Optional[NodeBuffer]</code>：返回 None 表示输入结束（EOF）。</p>
+                <p class="hero__desc">
+                  Source 表示“只出不进”的数据源。在 Python 里，一个 Source 只需要实现 <code>pull() -&gt; Optional[NodeBuffer]</code>：返回 None 表示输入结束（EOF）。
+                  它通常与 <code>AsyncDynRunner</code> 搭配使用，由 Runner 持续拉取并推进 pipeline。
+                </p>
               </div>
+
+              <section class="section">
+                <h2>注意事项</h2>
+                <ul>
+                  <li><b>返回值约束</b>：必须返回 <code>NodeBuffer</code> 或 None；返回其它类型会报错。</li>
+                  <li><b>一次性消费（move）</b>：Runner 会把你返回的 <code>NodeBuffer</code> move 进 Rust；同一个 buffer 不要重复返回/复用。</li>
+                  <li><b>kind 对齐</b>：Source 的输出 kind 必须与 pipeline 第一个节点的 input kind 对齐（pcm 或 packet）。</li>
+                </ul>
+              </section>
 
               <section class="section">
                 <h2>示例：生成正弦波 PCM Source</h2>
@@ -452,8 +556,19 @@ class SineSource:
               <div class="hero">
                 <div class="hero__kicker">进阶</div>
                 <h1 class="hero__title">AudioSink：数据到哪里去</h1>
-                <p class="hero__desc">在 Python 里，一个 Sink 需要实现 <code>push(buf)</code> 与 <code>finalize()</code>：push 逐个消费输出，finalize 做收尾。</p>
+                <p class="hero__desc">
+                  Sink 表示“只进不出”的数据汇。在 Python 里，一个 Sink 需要实现 <code>push(buf)</code> 与 <code>finalize()</code>：push 逐个消费输出，finalize 做收尾。
+                </p>
               </div>
+
+              <section class="section">
+                <h2>注意事项</h2>
+                <ul>
+                  <li><b>一次性消费（move）</b>：传入 <code>push</code> 的 <code>NodeBuffer</code> 在 Rust 侧会被 move；建议在 push 内立刻提取所需数据（如 <code>buf.as_packet()</code> / <code>buf.as_pcm()</code>）。</li>
+                  <li><b>kind 对齐</b>：Sink 期待的 kind 必须与 pipeline 最后一个节点的 output kind 对齐（pcm 或 packet）。</li>
+                  <li><b>finalize</b>：Runner 结束时一定会调用；用于关闭文件、flush 缓冲、提交尾部索引等。</li>
+                </ul>
+              </section>
 
               <section class="section">
                 <h2>示例：收集所有 Packet 到内存</h2>
@@ -482,8 +597,24 @@ class CollectPackets:
               <div class="hero">
                 <div class="hero__kicker">进阶</div>
                 <h1 class="hero__title">Runner：驱动 Source → Pipeline → Sink</h1>
-                <p class="hero__desc"><code>AsyncDynRunner</code> 是最常用的执行入口：给它一个 Source、一个 nodes 列表、一个 Sink，然后 <code>run()</code> 即可跑完整条流式链路。</p>
+                <p class="hero__desc">
+                  Runner 是最常用的执行入口：它会不断从 Source 拉取数据，推进 pipeline，并把末端输出写入 Sink，最后调用 Sink.finalize()。
+                  Python 侧主要暴露 <code>AsyncDynRunner</code>（内部异步流水线并行），对外提供阻塞式 <code>run()</code>。
+                </p>
               </div>
+
+              <section class="section">
+                <h2>同步 Runner(Pipeline) vs 异步 Runner(Pipeline)</h2>
+                <p>Rust 侧同时存在：</p>
+                <ul>
+                  <li><b>同步 Runner(Pipeline)</b>：前台串行推进（每处理完一帧再处理下一帧），实现简单、调试直观。</li>
+                  <li><b>异步 Runner(Pipeline)</b>：把每个 stage 视为流水线并行处理，不同帧可以在不同 stage 上重叠执行，整体吞吐更高。</li>
+                </ul>
+                <div class="figure">
+                  <img class="docimg" src="../logo/i1.jpg" alt="Runner vs AsyncRunner：串行与流水线并行示意图" />
+                  <div class="figcap">图：串行 Runner（上）需要等一帧完整走完再处理下一帧；AsyncRunner（下）可以让不同帧在 Read/Process/Encode/Send 等阶段上并行重叠，提高吞吐。</div>
+                </div>
+              </section>
 
               <section class="section">
                 <h2>示例：文件读取 → 重采样 → 写出文件</h2>

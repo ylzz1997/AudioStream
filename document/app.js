@@ -288,12 +288,154 @@
     return { lang: decodeURIComponent(lang), id: decodeURIComponent(id) };
   }
 
+  function initBackgroundCanvas() {
+    const canvas = document.getElementById("bgCanvas");
+    if (!(canvas instanceof HTMLCanvasElement)) return;
+
+    const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+    if (!ctx) return;
+
+    // 用“低分辨率渲染 + CSS 拉伸”换性能（移动端更明显）
+    // scale 越小越省，但细节越糊；0.55~0.75 通常比较平衡
+    const computeScale = () => {
+      const isSmall = window.matchMedia && window.matchMedia("(max-width: 980px)").matches;
+      return isSmall ? 0.55 : 0.7;
+    };
+
+    const state = {
+      w: 0,
+      h: 0,
+      scale: computeScale(),
+      running: false,
+      raf: 0,
+      t0: 0,
+      last: 0,
+    };
+
+    const blobs = [
+      { hue: 278, a: 0.22, sx: 0.18, sy: 0.22, r: 0.62, sp: 0.00036, px: 1.3, py: 2.1 },
+      { hue: 145, a: 0.18, sx: 0.82, sy: 0.20, r: 0.56, sp: 0.00033, px: 2.2, py: 1.7 },
+      { hue: 210, a: 0.17, sx: 0.62, sy: 0.86, r: 0.60, sp: 0.00031, px: 1.6, py: 2.6 },
+      { hue: 330, a: 0.14, sx: 0.25, sy: 0.78, r: 0.52, sp: 0.00034, px: 2.9, py: 1.2 },
+      { hue: 50, a: 0.10, sx: 0.80, sy: 0.74, r: 0.48, sp: 0.00032, px: 1.1, py: 3.1 },
+    ];
+
+    const hsl = (h, s, l, a) => `hsla(${h}, ${s}%, ${l}%, ${a})`;
+
+    function resize() {
+      state.scale = computeScale();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const w = Math.max(1, Math.floor(window.innerWidth * dpr * state.scale));
+      const h = Math.max(1, Math.floor(window.innerHeight * dpr * state.scale));
+      if (w === state.w && h === state.h) return;
+      state.w = w;
+      state.h = h;
+      canvas.width = w;
+      canvas.height = h;
+      // CSS 尺寸靠样式控制为 100vw/100vh，这里只管内部像素
+    }
+
+    function draw(now) {
+      if (!state.running) return;
+
+      // 限帧：移动端/低端机器更稳（大概 40fps 上限）
+      if (state.last && now - state.last < 25) {
+        state.raf = window.requestAnimationFrame(draw);
+        return;
+      }
+      state.last = now;
+
+      const t = now - state.t0;
+      const w = state.w;
+      const h = state.h;
+      const minSide = Math.min(w, h);
+
+      // 背景底色
+      ctx.globalCompositeOperation = "source-over";
+      ctx.fillStyle = "#0b1220";
+      ctx.fillRect(0, 0, w, h);
+
+      // 彩色光斑：用径向渐变（软边）而不是 blur filter，成本更低
+      ctx.globalCompositeOperation = "lighter";
+      for (const b of blobs) {
+        const phase = t * b.sp;
+        const x = (b.sx + 0.16 * Math.sin(phase * b.px + b.hue)) * w;
+        const y = (b.sy + 0.14 * Math.cos(phase * b.py + b.hue * 0.7)) * h;
+        const r = (b.r + 0.06 * Math.sin(phase * 1.3 + b.hue)) * minSide;
+        const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+        g.addColorStop(0, hsl(b.hue, 92, 62, b.a));
+        g.addColorStop(0.55, hsl(b.hue, 92, 52, b.a * 0.45));
+        g.addColorStop(1, hsl(b.hue, 92, 45, 0));
+        ctx.fillStyle = g;
+        // 只绘制光斑范围，减少整屏 overdraw
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 轻微暗角，保证正文对比度
+      ctx.globalCompositeOperation = "source-over";
+      const vig = ctx.createRadialGradient(w * 0.5, h * 0.45, minSide * 0.25, w * 0.5, h * 0.5, minSide * 0.85);
+      vig.addColorStop(0, "rgba(11, 18, 32, 0)");
+      vig.addColorStop(1, "rgba(11, 18, 32, 0.55)");
+      ctx.fillStyle = vig;
+      ctx.fillRect(0, 0, w, h);
+
+      state.raf = window.requestAnimationFrame(draw);
+    }
+
+    function start() {
+      if (state.running) return;
+      state.running = true;
+      state.t0 = performance.now();
+      state.last = 0;
+      resize();
+      state.raf = window.requestAnimationFrame(draw);
+    }
+
+    function stop() {
+      state.running = false;
+      if (state.raf) window.cancelAnimationFrame(state.raf);
+      state.raf = 0;
+    }
+
+    // 初始渲染
+    resize();
+    if (reduceMotion) {
+      state.running = true; // 复用 draw 逻辑画一帧
+      state.t0 = performance.now();
+      draw(performance.now());
+      stop();
+    } else {
+      start();
+    }
+
+    window.addEventListener("resize", () => {
+      resize();
+      if (reduceMotion) {
+        state.running = true;
+        state.t0 = performance.now();
+        draw(performance.now());
+        stop();
+      }
+    });
+
+    document.addEventListener("visibilitychange", () => {
+      if (reduceMotion) return;
+      if (document.hidden) stop();
+      else start();
+    });
+  }
+
   function init() {
     const docs = getDocs();
     const tabPy = $("#tabPython");
     const tabRs = $("#tabRust");
     const search = $("#search");
     const btnToggleNav = $("#btnToggleNav");
+
+    initBackgroundCanvas();
 
     tabPy.addEventListener("click", () => selectLanguage("python", { keepItem: true }));
     tabRs.addEventListener("click", () => selectLanguage("rust", { keepItem: true }));
