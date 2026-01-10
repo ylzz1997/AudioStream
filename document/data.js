@@ -499,7 +499,7 @@ nodes = [
     ast.make_processor_node(
         "resample",
         ast.ResampleNodeConfig(
-            ast.AudioFormat(44100, 2, "f32", planar=True),  # 示例：真实输入格式可按约定/从首帧推导
+            None,  # None 表示首帧推断输入格式，更适合接入 NodeBuffer/文件 reader 等“自带格式”的场景，如果需要严格要求输入格式，可以传入 AudioFormat
             out_fmt,
         ),
     ),
