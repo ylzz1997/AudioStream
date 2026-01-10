@@ -77,6 +77,7 @@ dec = ast.Decoder("opus", cfg)
 - `Processor.identity(format=None|AudioFormat)`
 - `Processor.resample(in_format, out_format, out_chunk_samples=None, pad_final=True)`
 - `Processor.gain(format, gain)`
+- `Processor.compressor(format, sample_rate, threshold_db, knee_width_db, ratio, expansion_ratio, expansion_threshold_db, attack_time, release_time, master_gain_db)`
 
 ```python
 import numpy as np
@@ -109,6 +110,32 @@ p.flush()
 out = p.get_frame(force=True)
 ```
 
+压缩器示例：
+
+```python
+import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(48000, 2, "f32", planar=True)
+p = ast.Processor.compressor(
+    fmt,
+    sample_rate=48000.0,
+    threshold_db=-18.0,
+    knee_width_db=6.0,
+    ratio=4.0,
+    expansion_ratio=2.0,
+    expansion_threshold_db=-60.0,
+    attack_time=0.01,
+    release_time=0.10,
+    master_gain_db=0.0,
+)
+
+# (channels, samples) 因为 fmt.planar=True
+p.put_frame(np.random.randn(2, 960).astype(np.float32) * 0.1)
+p.flush()
+out = p.get_frame(force=True)
+```
+
 ### 语义说明
 
 - `put_frame(...)`：只负责把输入写入内部缓冲/驱动 codec 状态机，不保证立刻有输出。
@@ -123,7 +150,7 @@ out = p.get_frame(force=True)
 
 这部分 API 面向“把若干动态节点串成一条链”，并支持：
 
-- 纯 Rust 节点（identity / resample / encoder / decoder）
+- 纯 Rust 节点（identity / resample / gain / compressor / encoder / decoder）
 - Python 侧实现 `AudioSource` / `AudioSink`（通过回调 `pull/push/finalize`）
 
 ### 用节点工厂组装 pipeline
@@ -138,12 +165,49 @@ out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", plan
 
 nodes = [
     ast.make_resample_node(in_fmt, out_fmt, out_chunk_samples=960, pad_final=True),
+    ast.make_compressor_node(
+        out_fmt,
+        sample_rate=48000.0,
+        threshold_db=-18.0,
+        knee_width_db=6.0,
+        ratio=4.0,
+        expansion_ratio=2.0,
+        expansion_threshold_db=-60.0,
+        attack_time=0.01,
+        release_time=0.10,
+        master_gain_db=0.0,
+    ),
+    ast.make_gain_node(out_fmt, gain=0.9),
     ast.make_encoder_node("opus", ast.OpusEncoderConfig(out_fmt, chunk_samples=960, bitrate=96_000)),
+]
+```
+
+你也可以用统一入口 `make_processor_node(kind, config)`（用 dict 传参）来动态选择 processor：
+
+```python
+nodes = [
+    ast.make_processor_node("resample", dict(in_format=in_fmt, out_format=out_fmt, out_chunk_samples=960, pad_final=True)),
+    ast.make_processor_node(
+        "compressor",
+        dict(
+            format=out_fmt,
+            sample_rate=48000.0,
+            threshold_db=-18.0,
+            knee_width_db=6.0,
+            ratio=4.0,
+            expansion_ratio=2.0,
+            expansion_threshold_db=-60.0,
+            attack_time=0.01,
+            release_time=0.10,
+            master_gain_db=0.0,
+        ),
+    ),
+    ast.make_processor_node("gain", dict(format=out_fmt, gain=0.9)),
 ]
 
 p = ast.AsyncDynPipeline(nodes)
 
-pcm = np.zeros((2, 4410), dtype=np.float32)  # 100ms@44.1k
+pcm = np.zeros((2, 4410), dtype=np.float32)  # 100ms @ 44.1kHz
 p.push(ast.NodeBuffer.pcm(pcm, in_fmt))
 p.flush()
 
