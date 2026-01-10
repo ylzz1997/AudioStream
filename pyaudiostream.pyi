@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -257,6 +257,29 @@ def make_resample_node(
     pad_final: bool = ...,
 ) -> DynNode: ...
 
+def make_gain_node(
+    format: AudioFormat,
+    gain: float,
+) -> DynNode: ...
+
+def make_compressor_node(
+    format: AudioFormat,
+    sample_rate: float,
+    threshold_db: float,
+    knee_width_db: float,
+    ratio: float,
+    expansion_ratio: float,
+    expansion_threshold_db: float,
+    attack_time: float,
+    release_time: float,
+    master_gain_db: float,
+) -> DynNode: ...
+
+def make_processor_node(
+    kind: str,
+    config: dict[str, Any],
+) -> DynNode: ...
+
 
 def make_encoder_node(
     codec: Codec,
@@ -340,6 +363,26 @@ class Processor:
         out_format: AudioFormat,
         out_chunk_samples: Optional[int] = ...,
         pad_final: bool = ...,
+    ) -> Processor: ...
+
+    @staticmethod
+    def gain(
+        format: AudioFormat,
+        gain: float,
+    ) -> Processor: ...
+
+    @staticmethod
+    def compressor(
+        format: AudioFormat,
+        sample_rate: float,
+        threshold_db: float,
+        knee_width_db: float,
+        ratio: float,
+        expansion_ratio: float,
+        expansion_threshold_db: float,
+        attack_time: float,
+        release_time: float,
+        master_gain_db: float,
     ) -> Processor: ...
 
     def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = ...) -> None: ...
