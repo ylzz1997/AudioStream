@@ -56,11 +56,12 @@ impl AudioDecoder for Mp3Decoder {
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg_backend {
     use super::*;
+    use crate::common::ffmpeg_util::channel_layout_from_av;
     use core::ptr;
     use std::ffi::CString;
 
     extern crate ffmpeg_sys_next as ff;
-    use crate::common::audio::audio::{ChannelLayout, Rational, SampleFormat};
+    use crate::common::audio::audio::{Rational, SampleFormat};
     use crate::common::ffmpeg_util::map_ff_err;
 
     pub struct Mp3Decoder {
@@ -209,7 +210,7 @@ mod ffmpeg_backend {
                 let format = AudioFormat {
                     sample_rate,
                     sample_format: sf,
-                    channel_layout: ChannelLayout::default_for_channels(channels),
+                    channel_layout: channel_layout_from_av(&(*avf).ch_layout),
                 };
 
                 let bps = format.sample_format.bytes_per_sample();

@@ -62,19 +62,23 @@ impl ProcessorPy {
 
     /// 创建 resample processor（自动选择后端：ffmpeg 优先，否则 linear）。
     ///
-    /// - in_format/out_format 必须完整匹配（channels/planar/sample_type 等）
+    /// - in_format=None：首帧推断输入格式（更适合接入 NodeBuffer/文件 reader 等“自带格式”的场景）
+    /// - in_format=AudioFormat：严格要求输入匹配（channels/planar/sample_type 等）
     /// - out_chunk_samples/pad_final 可用于“重分帧”
     #[staticmethod]
     #[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
     fn resample(
-        in_format: AudioFormat,
+        in_format: Option<AudioFormat>,
         out_format: AudioFormat,
         out_chunk_samples: Option<usize>,
         pad_final: bool,
     ) -> PyResult<Self> {
-        let in_rs = in_format.to_rs()?;
         let out_rs = out_format.to_rs()?;
-        let mut p = ResampleProcessor::new(in_rs, out_rs).map_err(map_codec_err)?;
+        let mut p = if let Some(in_fmt) = in_format {
+            ResampleProcessor::new(in_fmt.to_rs()?, out_rs).map_err(map_codec_err)?
+        } else {
+            ResampleProcessor::new_infer(out_rs).map_err(map_codec_err)?
+        };
         p.set_output_chunker(out_chunk_samples, pad_final).map_err(map_codec_err)?;
         let in_format = p.input_format();
         let out_format = p.output_format();
@@ -88,12 +92,16 @@ impl ProcessorPy {
         })
     }
 
+
     /// 创建 gain processor（线性增益，PCM->PCM，不改变格式）。
     #[staticmethod]
-    #[pyo3(signature = (format, gain))]
-    fn gain(format: AudioFormat, gain: f64) -> PyResult<Self> {
-        let fmt_rs = format.to_rs()?;
-        let p = GainProcessor::new_with_format(fmt_rs, gain).map_err(map_codec_err)?;
+    #[pyo3(signature = (format=None, gain=1.0))]
+    fn gain(format: Option<AudioFormat>, gain: f64) -> PyResult<Self> {
+        let p = if let Some(fmt) = format {
+            GainProcessor::new_with_format(fmt.to_rs()?, gain).map_err(map_codec_err)?
+        } else {
+            GainProcessor::new(gain).map_err(map_codec_err)?
+        };
         let in_format = p.input_format();
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
@@ -107,10 +115,13 @@ impl ProcessorPy {
     }
 
     /// 创建 compressor processor（动态压缩 + 扩展/门，PCM->PCM，不改变格式）。
+    ///
+    /// - format=None：首帧推断输入格式并初始化 compressor（channels 由首帧推断）
+    /// - format=AudioFormat：严格要求输入匹配
     #[staticmethod]
     #[pyo3(signature = (format, sample_rate, threshold_db, knee_width_db, ratio, expansion_ratio, expansion_threshold_db, attack_time, release_time, master_gain_db))]
     fn compressor(
-        format: AudioFormat,
+        format: Option<AudioFormat>,
         sample_rate: f32,
         threshold_db: f32,
         knee_width_db: f32,
@@ -121,7 +132,6 @@ impl ProcessorPy {
         release_time: f32,
         master_gain_db: f32,
     ) -> PyResult<Self> {
-        let fmt_rs = format.to_rs()?;
         let params = DynamicsParams {
             sample_rate,
             threshold_db,
@@ -133,7 +143,11 @@ impl ProcessorPy {
             release_time,
             master_gain_db,
         };
-        let p = CompressorProcessor::new_with_format(fmt_rs, params).map_err(map_codec_err)?;
+        let p = if let Some(fmt) = format {
+            CompressorProcessor::new_with_format(fmt.to_rs()?, params).map_err(map_codec_err)?
+        } else {
+            CompressorProcessor::new(params).map_err(map_codec_err)?
+        };
         let in_format = p.input_format();
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
@@ -146,22 +160,46 @@ impl ProcessorPy {
         })
     }
 
+
     #[getter]
     fn name(&self) -> &'static str {
         self.p.name()
     }
 
     /// 输入一帧 PCM（numpy）。
-    #[pyo3(signature = (pcm, pts=None))]
-    fn put_frame(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>, pts: Option<i64>) -> PyResult<()> {
+    ///
+    /// - 当 Processor 输入格式未知（例如 Processor.identity(format=None) / Processor.gain(format=None)）时，
+    ///   允许通过 `format=...` 在第一次 put_frame 时显式指定输入格式。
+    #[pyo3(signature = (pcm, pts=None, format=None))]
+    fn put_frame(
+        &mut self,
+        py: Python<'_>,
+        pcm: &Bound<'_, PyAny>,
+        pts: Option<i64>,
+        format: Option<AudioFormat>,
+    ) -> PyResult<()> {
         if self.sent_eof {
             return Err(PyRuntimeError::new_err(
                 "Processor 已 flush（输入结束），不能再 put_frame；如需继续输入，请新建一个 Processor",
             ));
         }
-        let in_fmt = self
-            .in_format
-            .ok_or_else(|| PyValueError::new_err("Processor 输入格式未知：请用 Processor.identity(format=...) 或 Processor.resample(in_format=...)"))?;
+        if self.in_format.is_none() {
+            let Some(fmt) = format else {
+                return Err(PyValueError::new_err(
+                    "Processor 输入格式未知：请在 put_frame(..., format=AudioFormat(...)) 里显式提供 format，或在构造 Processor 时指定 format",
+                ));
+            };
+            let rs = fmt.to_rs()?;
+            self.in_sample_type = Some(rs.sample_format.sample_type());
+            self.in_format = Some(rs);
+            // 对于 identity/gain/compressor 等“格式不变”的 processor，这里把 out_format 也同步成已知值；
+            // 其它类型（如 resample）若需要严格 out_format，以实现为准。
+            if self.out_format.is_none() {
+                self.out_format = self.in_format;
+            }
+        }
+
+        let in_fmt = self.in_format.expect("in_format should be set");
         let st = self
             .in_sample_type
             .ok_or_else(|| PyRuntimeError::new_err("missing input sample type"))?;
@@ -276,7 +314,7 @@ impl IdentityNodeConfigPy {
 #[derive(Clone)]
 pub struct ResampleNodeConfigPy {
     #[pyo3(get, set)]
-    pub in_format: AudioFormat,
+    pub in_format: Option<AudioFormat>,
     #[pyo3(get, set)]
     pub out_format: AudioFormat,
     #[pyo3(get, set)]
@@ -289,7 +327,7 @@ pub struct ResampleNodeConfigPy {
 impl ResampleNodeConfigPy {
     #[new]
     #[pyo3(signature = (in_format, out_format, out_chunk_samples=None, pad_final=true))]
-    fn new(in_format: AudioFormat, out_format: AudioFormat, out_chunk_samples: Option<usize>, pad_final: bool) -> Self {
+    fn new(in_format: Option<AudioFormat>, out_format: AudioFormat, out_chunk_samples: Option<usize>, pad_final: bool) -> Self {
         Self {
             in_format,
             out_format,
@@ -304,7 +342,7 @@ impl ResampleNodeConfigPy {
 #[derive(Clone)]
 pub struct GainNodeConfigPy {
     #[pyo3(get, set)]
-    pub format: AudioFormat,
+    pub format: Option<AudioFormat>,
     #[pyo3(get, set)]
     pub gain: f64,
 }
@@ -312,7 +350,8 @@ pub struct GainNodeConfigPy {
 #[pymethods]
 impl GainNodeConfigPy {
     #[new]
-    fn new(format: AudioFormat, gain: f64) -> Self {
+    #[pyo3(signature = (format=None, gain=1.0))]
+    fn new(format: Option<AudioFormat>, gain: f64) -> Self {
         Self { format, gain }
     }
 }
@@ -322,7 +361,7 @@ impl GainNodeConfigPy {
 #[derive(Clone)]
 pub struct CompressorNodeConfigPy {
     #[pyo3(get, set)]
-    pub format: AudioFormat,
+    pub format: Option<AudioFormat>,
     /// None => 使用 format.sample_rate
     #[pyo3(get, set)]
     pub sample_rate: Option<f32>,
@@ -360,7 +399,7 @@ impl CompressorNodeConfigPy {
         master_gain_db=0.0
     ))]
     fn new(
-        format: AudioFormat,
+        format: Option<AudioFormat>,
         sample_rate: Option<f32>,
         threshold_db: f32,
         knee_width_db: f32,
@@ -398,23 +437,36 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
         }
         "resample" => {
             let cfg = config.extract::<ResampleNodeConfigPy>()?;
-            let in_fmt = cfg.in_format.to_rs()?;
             let out_fmt = cfg.out_format.to_rs()?;
-            let mut p = ResampleProcessor::new(in_fmt, out_fmt).map_err(map_codec_err)?;
+            let mut p = if let Some(in_fmt) = cfg.in_format {
+                ResampleProcessor::new(in_fmt.to_rs()?, out_fmt).map_err(map_codec_err)?
+            } else {
+                ResampleProcessor::new_infer(out_fmt).map_err(map_codec_err)?
+            };
             p.set_output_chunker(cfg.out_chunk_samples, cfg.pad_final)
                 .map_err(map_codec_err)?;
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         "gain" => {
             let cfg = config.extract::<GainNodeConfigPy>()?;
-            let fmt = cfg.format.to_rs()?;
-            let p = GainProcessor::new_with_format(fmt, cfg.gain).map_err(map_codec_err)?;
+            let p = if let Some(fmt) = cfg.format {
+                GainProcessor::new_with_format(fmt.to_rs()?, cfg.gain).map_err(map_codec_err)?
+            } else {
+                GainProcessor::new(cfg.gain).map_err(map_codec_err)?
+            };
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         "compressor" => {
             let cfg = config.extract::<CompressorNodeConfigPy>()?;
-            let fmt = cfg.format.to_rs()?;
-            let sample_rate = cfg.sample_rate.unwrap_or(cfg.format.sample_rate as f32);
+            let sample_rate = match (cfg.sample_rate, cfg.format.as_ref()) {
+                (Some(sr), _) => sr,
+                (None, Some(fmt)) => fmt.sample_rate as f32,
+                (None, None) => {
+                    return Err(PyValueError::new_err(
+                        "CompressorNodeConfig.sample_rate is required when format=None",
+                    ))
+                }
+            };
             let params = DynamicsParams {
                 sample_rate,
                 threshold_db: cfg.threshold_db,
@@ -426,7 +478,11 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
                 release_time: cfg.release_time,
                 master_gain_db: cfg.master_gain_db,
             };
-            let p = CompressorProcessor::new_with_format(fmt, params).map_err(map_codec_err)?;
+            let p = if let Some(fmt) = cfg.format {
+                CompressorProcessor::new_with_format(fmt.to_rs()?, params).map_err(map_codec_err)?
+            } else {
+                CompressorProcessor::new(params).map_err(map_codec_err)?
+            };
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         _ => Err(PyValueError::new_err("kind only support: identity/resample/gain/compressor")),

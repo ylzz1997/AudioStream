@@ -14,6 +14,8 @@ pub struct GainProcessor {
     gain: f64,
     // 如果为 None：吃到首帧后再锁定格式（输出格式也随之可得）
     fmt: Option<AudioFormat>,
+    // 是否由构造参数固定（true => reset 不清空；false => reset 清空推断）
+    locked: bool,
     out_q: VecDeque<AudioFrame>,
     flushed: bool,
 }
@@ -27,6 +29,7 @@ impl GainProcessor {
         Ok(Self {
             gain,
             fmt: None,
+            locked: false,
             out_q: VecDeque::new(),
             flushed: false,
         })
@@ -40,6 +43,7 @@ impl GainProcessor {
         Ok(Self {
             gain,
             fmt: Some(fmt),
+            locked: true,
             out_q: VecDeque::new(),
             flushed: false,
         })
@@ -156,8 +160,10 @@ impl AudioProcessor for GainProcessor {
     fn reset(&mut self) -> CodecResult<()> {
         self.out_q.clear();
         self.flushed = false;
-        // reset 以后允许重新锁定格式（更贴近“无 format 约束”的语义）
-        self.fmt = None;
+        // 仅清空“推断出来”的格式；显式指定的 fmt 保持
+        if !self.locked {
+            self.fmt = None;
+        }
         Ok(())
     }
 }

@@ -7,13 +7,31 @@ use crate::function::compressor::{DynamicsCompressor, DynamicsError, DynamicsPar
 use std::collections::VecDeque;
 
 pub struct CompressorProcessor {
-    dyns: DynamicsCompressor,
-    fmt: AudioFormat,
+    // 如果为 None：吃到首帧后再锁定格式并初始化 dyns
+    dyns: Option<DynamicsCompressor>,
+    // 如果为 None：吃到首帧后锁定格式（并校验 sample_rate 与 params.sample_rate）
+    fmt: Option<AudioFormat>,
+    // 初始参数（在 fmt 未锁定前允许修改；锁定后要求 sample_rate 一致）
+    params: DynamicsParams,
+    // 是否由构造参数固定（true => reset 不清空；false => reset 清空推断）
+    locked: bool,
     out_q: VecDeque<AudioFrame>,
     flushed: bool,
 }
 
 impl CompressorProcessor {
+    /// 不指定输入格式：首帧推断并初始化 compressor。
+    pub fn new(params: DynamicsParams) -> CodecResult<Self> {
+        Ok(Self {
+            dyns: None,
+            fmt: None,
+            params,
+            locked: false,
+            out_q: VecDeque::new(),
+            flushed: false,
+        })
+    }
+
     /// 创建并固定输入/输出格式（后续如果输入格式不匹配会报错）。
     pub fn new_with_format(fmt: AudioFormat, params: DynamicsParams) -> CodecResult<Self> {
         if (params.sample_rate - (fmt.sample_rate as f32)).abs() > 1e-3 {
@@ -24,24 +42,32 @@ impl CompressorProcessor {
         let channels = fmt.channels() as usize;
         let dyns = DynamicsCompressor::new(params, channels).map_err(map_dyn_err)?;
         Ok(Self {
-            dyns,
-            fmt,
+            dyns: Some(dyns),
+            fmt: Some(fmt),
+            params,
+            locked: true,
             out_q: VecDeque::new(),
             flushed: false,
         })
     }
 
     pub fn params(&self) -> DynamicsParams {
-        self.dyns.params()
+        self.dyns.as_ref().map(|d| d.params()).unwrap_or(self.params)
     }
 
     pub fn set_params(&mut self, params: DynamicsParams) -> CodecResult<()> {
-        if (params.sample_rate - (self.fmt.sample_rate as f32)).abs() > 1e-3 {
-            return Err(CodecError::InvalidData(
-                "DynamicsParams.sample_rate must match AudioFormat.sample_rate",
-            ));
+        if let Some(fmt) = self.fmt {
+            if (params.sample_rate - (fmt.sample_rate as f32)).abs() > 1e-3 {
+                return Err(CodecError::InvalidData(
+                    "DynamicsParams.sample_rate must match AudioFormat.sample_rate",
+                ));
+            }
         }
-        self.dyns.set_params(params).map_err(map_dyn_err)
+        self.params = params;
+        if let Some(d) = self.dyns.as_mut() {
+            d.set_params(params).map_err(map_dyn_err)?;
+        }
+        Ok(())
     }
 
     fn process_frame(&mut self, frame: &dyn AudioFrameView) -> CodecResult<AudioFrame> {
@@ -70,11 +96,15 @@ impl CompressorProcessor {
             planes.push(p.to_vec());
         }
 
+        let Some(dyns) = self.dyns.as_mut() else {
+            return Err(CodecError::InvalidState("compressor not initialized"));
+        };
+
         // 就地处理
         if fmt.is_planar() {
             // plane_count == channels
             for c in 0..channels {
-                self.dyns
+                dyns
                     .process_planar_channel_bytes_inplace(
                         &mut planes[c],
                         fmt.sample_format.sample_type(),
@@ -84,7 +114,7 @@ impl CompressorProcessor {
             }
         } else {
             // plane_count == 1
-            self.dyns
+            dyns
                 .process_interleaved_bytes_inplace(&mut planes[0], fmt.sample_format.sample_type(), channels)
                 .map_err(map_dyn_err)?;
         }
@@ -100,11 +130,11 @@ impl AudioProcessor for CompressorProcessor {
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
-        Some(self.fmt)
+        self.fmt
     }
 
     fn output_format(&self) -> Option<AudioFormat> {
-        Some(self.fmt)
+        self.fmt
     }
 
     fn send_frame(&mut self, frame: Option<&dyn AudioFrameView>) -> CodecResult<()> {
@@ -125,14 +155,28 @@ impl AudioProcessor for CompressorProcessor {
         }
 
         let actual_fmt = frame.format();
-        if actual_fmt != self.fmt {
-            eprintln!(
-                "CompressorProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
-                crate::common::audio::audio::audio_format_diff(self.fmt, actual_fmt)
-            );
-            return Err(CodecError::InvalidData(
-                "CompressorProcessor input AudioFormat mismatch",
-            ));
+        if let Some(expected) = self.fmt {
+            if actual_fmt != expected {
+                eprintln!(
+                    "CompressorProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                    crate::common::audio::audio::audio_format_diff(expected, actual_fmt)
+                );
+                return Err(CodecError::InvalidData(
+                    "CompressorProcessor input AudioFormat mismatch",
+                ));
+            }
+        } else {
+            // 首帧锁定格式并初始化 dyns
+            if (self.params.sample_rate - (actual_fmt.sample_rate as f32)).abs() > 1e-3 {
+                return Err(CodecError::InvalidData(
+                    "DynamicsParams.sample_rate must match AudioFormat.sample_rate",
+                ));
+            }
+            let channels = actual_fmt.channels() as usize;
+            let dyns = DynamicsCompressor::new(self.params, channels).map_err(map_dyn_err)?;
+            self.dyns = Some(dyns);
+            self.fmt = Some(actual_fmt);
+            self.locked = false;
         }
 
         let out = self.process_frame(frame)?;
@@ -153,7 +197,13 @@ impl AudioProcessor for CompressorProcessor {
     fn reset(&mut self) -> CodecResult<()> {
         self.out_q.clear();
         self.flushed = false;
-        self.dyns.reset();
+        if let Some(d) = self.dyns.as_mut() {
+            d.reset();
+        }
+        if !self.locked {
+            self.dyns = None;
+            self.fmt = None;
+        }
         Ok(())
     }
 }

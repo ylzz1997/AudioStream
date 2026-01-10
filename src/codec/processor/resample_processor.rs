@@ -26,7 +26,8 @@ pub enum ResampleBackend {
 
 pub struct ResampleProcessor {
     backend: ResampleBackend,
-    in_fmt: AudioFormat,
+    // 如果为 None：吃到首帧后再锁定格式并初始化 backend
+    in_fmt: Option<AudioFormat>,
     out_fmt: AudioFormat,
     // 线性 backend 状态：按声道一个 resampler（即使 interleaved 也按声道拆开处理）
     linear: Option<Vec<LinearResampler>>,
@@ -41,9 +42,32 @@ pub struct ResampleProcessor {
 
     out_q: VecDeque<AudioFrame>,
     flushed: bool,
+    // 是否自动选择后端（推断输入格式时使用：优先 ffmpeg，否则 linear）
+    auto_backend: bool,
+    // 是否由构造参数固定（true => reset 不清空；false => reset 清空推断并反初始化）
+    locked: bool,
 }
 
 impl ResampleProcessor {
+    /// 不指定输入格式：首帧推断并初始化 resampler（优先 ffmpeg，否则 linear）。
+    pub fn new_infer(out_fmt: AudioFormat) -> CodecResult<Self> {
+        Ok(Self {
+            backend: ResampleBackend::Linear, // 占位；首帧时如果 ffmpeg 可用会切到 ffmpeg
+            in_fmt: None,
+            out_fmt,
+            linear: None,
+            #[cfg(feature = "ffmpeg")]
+            ff: None,
+            out_chunk_samples: None,
+            out_pad_final: false,
+            out_fifo: None,
+            out_q: VecDeque::new(),
+            flushed: false,
+            auto_backend: true,
+            locked: false,
+        })
+    }
+
     /// 创建一个 resample processor（默认使用纯 Rust 线性后端）。
     ///
     /// 约束（线性后端）：
@@ -62,7 +86,7 @@ impl ResampleProcessor {
         }
         Ok(Self {
             backend: ResampleBackend::Linear,
-            in_fmt,
+            in_fmt: Some(in_fmt),
             out_fmt,
             linear: Some(rs),
             #[cfg(feature = "ffmpeg")]
@@ -72,6 +96,8 @@ impl ResampleProcessor {
             out_fifo: None,
             out_q: VecDeque::new(),
             flushed: false,
+            auto_backend: false,
+            locked: true,
         })
     }
 
@@ -82,7 +108,7 @@ impl ResampleProcessor {
             .map_err(|e| CodecError::Other(format!("ffmpeg resample init failed: {e}")))?;
         Ok(Self {
             backend: ResampleBackend::Ffmpeg,
-            in_fmt,
+            in_fmt: Some(in_fmt),
             out_fmt,
             linear: None,
             ff: Some(ff),
@@ -90,7 +116,9 @@ impl ResampleProcessor {
             out_pad_final: false,
             out_fifo: None,
             out_q: VecDeque::new(),
-            flushed: false
+            flushed: false,
+            auto_backend: false,
+            locked: true,
         })
     }
 
@@ -146,7 +174,7 @@ impl AudioProcessor for ResampleProcessor {
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
-        Some(self.in_fmt)
+        self.in_fmt
     }
 
     fn output_format(&self) -> Option<AudioFormat> {
@@ -164,7 +192,9 @@ impl AudioProcessor for ResampleProcessor {
             match self.backend {
                 ResampleBackend::Linear => {
                     let Some(rs) = self.linear.as_mut() else {
-                        return Err(CodecError::InvalidState("linear resampler not initialized"));
+                        // 可能还没吃到首帧（推断模式）；直接视为无输出
+                        self.flush_output_chunker()?;
+                        return Ok(());
                     };
                     // 每声道补齐尾部
                     let (nb_out, outs) = match self.out_fmt.sample_format.sample_type() {
@@ -215,8 +245,13 @@ impl AudioProcessor for ResampleProcessor {
         }
 
         let frame = frame.unwrap();
+        if frame.nb_samples() == 0 {
+            // 空帧直接忽略（不产生输出，也不锁定格式）
+            return Ok(());
+        }
         let actual_fmt = frame.format();
-        if actual_fmt != self.in_fmt {
+        if let Some(expected) = self.in_fmt {
+            if actual_fmt != expected {
             // eprintln!(
             //     "ResampleProcessor input AudioFormat mismatch\n  expected: {:?}\n  actual:   {:?}\n  diffs: {}",
             //     self.in_fmt,
@@ -225,9 +260,12 @@ impl AudioProcessor for ResampleProcessor {
             // );
             eprintln!(
                 "ResampleProcessor input AudioFormat mismatch:\n  input_output_format_diffs: {}",
-                audio_format_diff(self.in_fmt, actual_fmt)
+                    audio_format_diff(expected, actual_fmt)
             );
             return Err(CodecError::InvalidData("ResampleProcessor input AudioFormat mismatch"));
+            }
+        } else {
+            self.ensure_initialized(actual_fmt)?;
         }
 
         match self.backend {
@@ -253,24 +291,78 @@ impl AudioProcessor for ResampleProcessor {
         if let Some(fifo) = self.out_fifo.as_mut() {
             fifo.clear();
         }
-        if let Some(rs) = self.linear.as_mut() {
-            for r in rs.iter_mut() {
-                r.reset();
+        if self.locked {
+            // 固定格式：只 reset 状态
+            if let Some(rs) = self.linear.as_mut() {
+                for r in rs.iter_mut() {
+                    r.reset();
+                }
             }
-        }
-        #[cfg(feature = "ffmpeg")]
-        if let Some(ff) = self.ff.as_mut() {
-            ff.reset()
-                .map_err(|e| CodecError::Other(format!("ffmpeg resample reset failed: {e}")))?;
+            #[cfg(feature = "ffmpeg")]
+            if let Some(ff) = self.ff.as_mut() {
+                ff.reset()
+                    .map_err(|e| CodecError::Other(format!("ffmpeg resample reset failed: {e}")))?;
+            }
+        } else {
+            // 推断模式：清空推断并反初始化 backend
+            self.in_fmt = None;
+            self.linear = None;
+            #[cfg(feature = "ffmpeg")]
+            {
+                self.ff = None;
+            }
+            // backend 保持占位（Linear），下次首帧会重新选择并 init
         }
         Ok(())
     }
 }
 
 impl ResampleProcessor {
+    fn ensure_initialized(&mut self, in_fmt: AudioFormat) -> CodecResult<()> {
+        if self.in_fmt.is_some() {
+            return Ok(());
+        }
+
+        // auto 选择：有 ffmpeg 且可 init => ffmpeg；否则 linear
+        #[cfg(feature = "ffmpeg")]
+        if self.auto_backend {
+            if let Ok(ff) = FfmpegResampler::new(in_fmt, self.out_fmt) {
+                self.ff = Some(ff);
+                self.linear = None;
+                self.backend = ResampleBackend::Ffmpeg;
+                self.in_fmt = Some(in_fmt);
+                self.locked = false;
+                return Ok(());
+            }
+        }
+
+        // fallback: linear（要求格式可线性重采样）
+        validate_linear_formats(in_fmt, self.out_fmt)?;
+        let ch = in_fmt.channels() as usize;
+        let mut rs = Vec::with_capacity(ch);
+        for _ in 0..ch {
+            rs.push(
+                LinearResampler::new(in_fmt.sample_rate, self.out_fmt.sample_rate)
+                    .map_err(|_| CodecError::InvalidData("invalid sample_rate"))?,
+            );
+        }
+        self.linear = Some(rs);
+        #[cfg(feature = "ffmpeg")]
+        {
+            self.ff = None;
+        }
+        self.backend = ResampleBackend::Linear;
+        self.in_fmt = Some(in_fmt);
+        self.locked = false;
+        Ok(())
+    }
+
     fn send_linear(&mut self, frame: &dyn AudioFrameView) -> CodecResult<()> {
         // 线性重采样目前仅支持 sample_type=f32/i16/i32，且布局/声道一致
-        validate_linear_formats(self.in_fmt, self.out_fmt)?;
+        let in_fmt = self
+            .in_fmt
+            .ok_or(CodecError::InvalidState("resampler input_format missing"))?;
+        validate_linear_formats(in_fmt, self.out_fmt)?;
 
         let Some(rs) = self.linear.as_mut() else {
             return Err(CodecError::InvalidState("linear resampler not initialized"));
@@ -284,8 +376,8 @@ impl ResampleProcessor {
         let out_tb = Rational::new(1, self.out_fmt.sample_rate as i32);
         let pts = frame.pts().and_then(|p| rescale_pts(p, frame.time_base(), out_tb));
 
-        let channels = self.in_fmt.channels() as usize;
-        let maybe_out = match self.in_fmt.sample_format.sample_type() {
+        let channels = in_fmt.channels() as usize;
+        let maybe_out = match in_fmt.sample_format.sample_type() {
             SampleType::F32 => linear_process_frame::<f32>(frame, rs, channels, self.out_fmt, out_tb, pts)?,
             SampleType::I16 => linear_process_frame::<i16>(frame, rs, channels, self.out_fmt, out_tb, pts)?,
             SampleType::I32 => linear_process_frame::<i32>(frame, rs, channels, self.out_fmt, out_tb, pts)?,

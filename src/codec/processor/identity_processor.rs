@@ -6,7 +6,9 @@ use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView};
 use std::collections::VecDeque;
 
 pub struct IdentityProcessor {
-    expected_fmt: Option<AudioFormat>,
+    fmt: Option<AudioFormat>,
+    // 是否由构造参数固定（true => reset 不清空；false => reset 清空推断）
+    locked: bool,
     out_q: VecDeque<AudioFrame>,
     flushed: bool,
 }
@@ -15,16 +17,18 @@ impl IdentityProcessor {
     /// 接受任意输入格式（不做格式约束）。
     pub fn new() -> CodecResult<Self> {
         Ok(Self {
-            expected_fmt: None,
+            fmt: None,
+            locked: false,
             out_q: VecDeque::new(),
             flushed: false,
         })
     }
 
-    /// 约束输入格式必须等于 `expected_fmt`（否则报错）。
-    pub fn new_with_format(expected_fmt: AudioFormat) -> Self {
+    /// 约束输入格式必须等于 `fmt`（否则报错）。
+    pub fn new_with_format(fmt: AudioFormat) -> Self {
         Self {
-            expected_fmt: Some(expected_fmt),
+            fmt: Some(fmt),
+            locked: true,
             out_q: VecDeque::new(),
             flushed: false,
         }
@@ -71,11 +75,11 @@ impl AudioProcessor for IdentityProcessor {
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
-        self.expected_fmt
+        self.fmt
     }
 
     fn output_format(&self) -> Option<AudioFormat> {
-        self.expected_fmt
+        self.fmt
     }
 
     fn send_frame(&mut self, frame: Option<&dyn AudioFrameView>) -> CodecResult<()> {
@@ -94,7 +98,12 @@ impl AudioProcessor for IdentityProcessor {
             return Ok(());
         };
 
-        if let Some(expected) = self.expected_fmt {
+        if frame.nb_samples() == 0 {
+            // 空帧直接忽略（不产生输出，也不锁定格式）。
+            return Ok(());
+        }
+
+        if let Some(expected) = self.fmt {
             let actual_fmt = frame.format();
             if actual_fmt != expected {
                 eprintln!(
@@ -103,11 +112,10 @@ impl AudioProcessor for IdentityProcessor {
                 );
                 return Err(CodecError::InvalidData("IdentityProcessor input AudioFormat mismatch"));
             }
-        }
-
-        if frame.nb_samples() == 0 {
-            // 空帧直接忽略（不产生输出）。
-            return Ok(());
+        } else {
+            // 首帧锁定格式（推断）
+            self.fmt = Some(frame.format());
+            self.locked = false;
         }
 
         let out = self.copy_frame(frame)?;
@@ -128,6 +136,10 @@ impl AudioProcessor for IdentityProcessor {
     fn reset(&mut self) -> CodecResult<()> {
         self.out_q.clear();
         self.flushed = false;
+        if !self.locked {
+            // 仅清空“推断出来”的格式；显式指定的 fmt 保持
+            self.fmt = None;
+        }
         Ok(())
     }
 }

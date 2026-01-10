@@ -260,27 +260,27 @@ class IdentityNodeConfig:
     def __init__(self, kind: Literal["pcm", "packet"]) -> None: ...
 
 class ResampleNodeConfig:
-    in_format: AudioFormat
+    in_format: Optional[AudioFormat]
     out_format: AudioFormat
     out_chunk_samples: Optional[int]
     pad_final: bool
 
     def __init__(
         self,
-        in_format: AudioFormat,
+        in_format: Optional[AudioFormat],
         out_format: AudioFormat,
         out_chunk_samples: Optional[int] = ...,
         pad_final: bool = ...,
     ) -> None: ...
 
 class GainNodeConfig:
-    format: AudioFormat
+    format: Optional[AudioFormat]
     gain: float
 
-    def __init__(self, format: AudioFormat, gain: float) -> None: ...
+    def __init__(self, format: Optional[AudioFormat] = None, gain: float = ...) -> None: ...
 
 class CompressorNodeConfig:
-    format: AudioFormat
+    format: Optional[AudioFormat]
     sample_rate: Optional[float]
     threshold_db: float
     knee_width_db: float
@@ -293,7 +293,7 @@ class CompressorNodeConfig:
 
     def __init__(
         self,
-        format: AudioFormat,
+        format: Optional[AudioFormat],
         sample_rate: Optional[float] = ...,
         threshold_db: float = ...,
         knee_width_db: float = ...,
@@ -392,7 +392,7 @@ class Processor:
 
     @staticmethod
     def resample(
-        in_format: AudioFormat,
+        in_format: Optional[AudioFormat],
         out_format: AudioFormat,
         out_chunk_samples: Optional[int] = None,
         pad_final: bool = True,
@@ -400,13 +400,13 @@ class Processor:
 
     @staticmethod
     def gain(
-        format: AudioFormat,
-        gain: float,
+        format: Optional[AudioFormat] = None,
+        gain: float = ...,
     ) -> Processor: ...
 
     @staticmethod
     def compressor(
-        format: AudioFormat,
+        format: Optional[AudioFormat],
         sample_rate: float,
         threshold_db: float,
         knee_width_db: float,
@@ -418,7 +418,7 @@ class Processor:
         master_gain_db: float,
     ) -> Processor: ...
 
-    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = None) -> None: ...
+    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = None, format: Optional[AudioFormat] = None) -> None: ...
 
     def flush(self) -> None: ...
 
