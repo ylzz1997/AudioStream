@@ -1,12 +1,13 @@
 use crate::codec::error::CodecError;
 use crate::codec::encoder::encoder_interface::AudioEncoder;
 use crate::codec::packet::CodecPacket;
-use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
+use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView, Rational};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::io::io::{AudioReader, AudioWriter};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 
 use crate::common::io::io::{AudioIOResult, AudioIOError};
 
@@ -42,7 +43,7 @@ fn build_opus_head(channels: u8, input_sample_rate: u32) -> Vec<u8> {
 /// 标准 Ogg Opus（.opus）写入配置：编码参数（encoder）+（预留）容器侧参数。
 #[derive(Clone, Debug)]
 pub struct OpusOggWriterConfig {
-    pub encoder: crate::codec::encoder::opus_encoder::OpusEncoderConfig,
+    pub encoder: OpusEncoderConfig,
 }
 
 pub struct OpusPacketWriter {
@@ -278,13 +279,16 @@ mod ogg_ffmpeg_backend {
     }
 
     pub struct OpusOggWriter {
+        cfg: OpusOggWriterConfig,
+        out_c: CString,
         oc: *mut ff::AVFormatContext,
         st: *mut ff::AVStream,
         enc_ctx: *mut ff::AVCodecContext,
-        fifo: AudioFifo,
+        fifo: Option<AudioFifo>,
         frame_samples: usize,
         next_pts: i64,
         finished: bool,
+        initialized: bool,
     }
 
     unsafe impl Send for OpusOggWriter {}
@@ -296,130 +300,18 @@ mod ogg_ffmpeg_backend {
         ) -> AudioIOResult<Self> {
             let out_path = path.as_ref().to_string_lossy();
             let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
-
-            let enc_cfg = cfg.encoder;
-            let in_fmt = enc_cfg.input_format;
-            if in_fmt.sample_rate != 48_000 {
-                return Err(AudioIOError::Format("Ogg Opus writer expects 48kHz input (resample before writing)"));
-            }
-            if in_fmt.sample_format.is_planar() {
-                return Err(AudioIOError::Format("Ogg Opus writer expects packed/interleaved samples"));
-            }
-
-            unsafe {
-                // allocate output context (deduce container by extension: .opus => ogg)
-                let mut oc: *mut ff::AVFormatContext = ptr::null_mut();
-                let ret = ff::avformat_alloc_output_context2(
-                    &mut oc as *mut *mut ff::AVFormatContext,
-                    ptr::null_mut(),
-                    ptr::null(),
-                    out_c.as_ptr(),
-                );
-                if ret < 0 || oc.is_null() {
-                    return Err(map_ff_err(if ret < 0 { ret } else { -1 }));
-                }
-
-                // encoder (prefer libopus)
-                let name = CString::new("libopus").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
-                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
-                if codec.is_null() {
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg libopus encoder not found")));
-                }
-                let enc_ctx = ff::avcodec_alloc_context3(codec);
-                if enc_ctx.is_null() {
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
-                }
-
-                (*enc_ctx).sample_rate = 48_000;
-                (*enc_ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
-                (*enc_ctx).time_base = ff::AVRational { num: 1, den: 48_000 };
-                if let Some(br) = enc_cfg.bitrate {
-                    (*enc_ctx).bit_rate = br as i64;
-                } else {
-                    (*enc_ctx).bit_rate = 96_000;
-                }
-
-                // channel layout
-                let channels = in_fmt.channels() as i32;
-                if in_fmt.channel_layout.mask != 0 {
-                    let ret = ff::av_channel_layout_from_mask(&mut (*enc_ctx).ch_layout, in_fmt.channel_layout.mask);
-                    if ret < 0 {
-                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                        ff::avformat_free_context(oc);
-                        return Err(map_ff_err(ret));
-                    }
-                } else {
-                    ff::av_channel_layout_default(&mut (*enc_ctx).ch_layout, channels);
-                }
-
-                // global header if needed by container
-                if ((*(*oc).oformat).flags & (ff::AVFMT_GLOBALHEADER as i32)) != 0 {
-                    (*enc_ctx).flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
-                }
-
-                let ret = ff::avcodec_open2(enc_ctx, codec, ptr::null_mut());
-                if ret < 0 {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                // stream
-                let st = ff::avformat_new_stream(oc, ptr::null());
-                if st.is_null() {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
-                }
-                (*st).time_base = (*enc_ctx).time_base;
-                let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
-                if ret < 0 {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                // open IO
-                if ((*(*oc).oformat).flags & (ff::AVFMT_NOFILE as i32)) == 0 {
-                    let ret = ff::avio_open(&mut (*oc).pb, out_c.as_ptr(), ff::AVIO_FLAG_WRITE);
-                    if ret < 0 {
-                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                        ff::avformat_free_context(oc);
-                        return Err(map_ff_err(ret));
-                    }
-                }
-
-                // write header
-                let ret = ff::avformat_write_header(oc, ptr::null_mut());
-                if ret < 0 {
-                    if !(*oc).pb.is_null() {
-                        ff::avio_closep(&mut (*oc).pb);
-                    }
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                let frame_samples = if (*enc_ctx).frame_size > 0 {
-                    (*enc_ctx).frame_size as usize
-                } else {
-                    960
-                };
-                let fifo = AudioFifo::new(in_fmt, Rational::new(1, 48_000))
-                    .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
-
-                Ok(Self {
-                    oc,
-                    st,
-                    enc_ctx,
-                    fifo,
-                    frame_samples,
-                    next_pts: 0,
-                    finished: false,
-                })
-            }
+            Ok(Self {
+                cfg,
+                out_c,
+                oc: ptr::null_mut(),
+                st: ptr::null_mut(),
+                enc_ctx: ptr::null_mut(),
+                fifo: None,
+                frame_samples: 0,
+                next_pts: 0,
+                finished: false,
+                initialized: false,
+            })
         }
 
         fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioIOResult<()> {
@@ -566,15 +458,23 @@ mod ogg_ffmpeg_backend {
             if self.finished {
                 return Err(AudioIOError::Codec(CodecError::InvalidState("already finalized")));
             }
-            self.fifo
-                .push_frame(frame)
-                .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
-
-            while let Some(chunk) = self
-                .fifo
-                .pop_frame(self.frame_samples)
-                .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
+            if frame.nb_samples() == 0 {
+                // 空帧不锁定格式
+                return Ok(());
+            }
+            self.ensure_initialized(frame.format())?;
             {
+                let fifo = self.fifo.as_mut().ok_or(AudioIOError::Format("opus writer not initialized"))?;
+                fifo.push_frame(frame)
+                    .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
+            }
+            loop {
+                let next = {
+                    let fifo = self.fifo.as_mut().ok_or(AudioIOError::Format("opus writer not initialized"))?;
+                    fifo.pop_frame(self.frame_samples)
+                        .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
+                };
+                let Some(chunk) = next else { break };
                 self.encode_and_mux(&chunk)?;
             }
             Ok(())
@@ -584,16 +484,27 @@ mod ogg_ffmpeg_backend {
             if self.finished {
                 return Ok(());
             }
+            if !self.initialized {
+                // 从未写入过有效帧：不写 header/trailer，保持空文件
+                self.finished = true;
+                return Ok(());
+            }
             // pad tail to frame_samples
-            let remain = self.fifo.available_samples();
+            let remain = self
+                .fifo
+                .as_ref()
+                .ok_or(AudioIOError::Format("opus writer not initialized"))?
+                .available_samples();
             if remain > 0 {
-                if let Some(partial) = self
-                    .fifo
-                    .pop_frame(remain)
-                    .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
-                {
+                let partial = {
+                    let fifo = self.fifo.as_mut().ok_or(AudioIOError::Format("opus writer not initialized"))?;
+                    fifo.pop_frame(remain)
+                        .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
+                };
+                if let Some(partial) = partial {
                     // pad zeros
-                    let mut padded = AudioFrame::new_alloc(self.fifo.format(), self.frame_samples)
+                    let fmt = self.fifo.as_ref().ok_or(AudioIOError::Format("opus writer not initialized"))?.format();
+                    let mut padded = AudioFrame::new_alloc(fmt, self.frame_samples)
                         .map_err(|_| AudioIOError::Format("failed to alloc padded frame"))?;
                     padded.set_time_base(partial.time_base()).map_err(|_| AudioIOError::Format("invalid time_base"))?;
                     padded.set_pts(partial.pts());
@@ -625,6 +536,134 @@ mod ogg_ffmpeg_backend {
             }
             self.finished = true;
             Ok(())
+        }
+    }
+
+    impl OpusOggWriter {
+        fn ensure_initialized(&mut self, in_fmt: AudioFormat) -> AudioIOResult<()> {
+            if self.initialized {
+                return Ok(());
+            }
+            if let Some(expected) = self.cfg.encoder.input_format {
+                if in_fmt != expected {
+                    return Err(AudioIOError::Format("Ogg Opus writer input AudioFormat mismatch"));
+                }
+            }
+            if in_fmt.sample_rate != 48_000 {
+                return Err(AudioIOError::Format("Ogg Opus writer expects 48kHz input (resample before writing)"));
+            }
+            if in_fmt.sample_format.is_planar() {
+                return Err(AudioIOError::Format("Ogg Opus writer expects packed/interleaved samples"));
+            }
+
+            unsafe {
+                // allocate output context (deduce container by extension: .opus => ogg)
+                let mut oc: *mut ff::AVFormatContext = ptr::null_mut();
+                let ret = ff::avformat_alloc_output_context2(
+                    &mut oc as *mut *mut ff::AVFormatContext,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    self.out_c.as_ptr(),
+                );
+                if ret < 0 || oc.is_null() {
+                    return Err(map_ff_err(if ret < 0 { ret } else { -1 }));
+                }
+
+                // encoder (prefer libopus)
+                let name = CString::new("libopus").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
+                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
+                if codec.is_null() {
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg libopus encoder not found")));
+                }
+                let enc_ctx = ff::avcodec_alloc_context3(codec);
+                if enc_ctx.is_null() {
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
+                }
+
+                (*enc_ctx).sample_rate = 48_000;
+                (*enc_ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
+                (*enc_ctx).time_base = ff::AVRational { num: 1, den: 48_000 };
+                (*enc_ctx).bit_rate = self.cfg.encoder.bitrate.unwrap_or(96_000) as i64;
+
+                // channel layout
+                let channels = in_fmt.channels() as i32;
+                if in_fmt.channel_layout.mask != 0 {
+                    let ret = ff::av_channel_layout_from_mask(&mut (*enc_ctx).ch_layout, in_fmt.channel_layout.mask);
+                    if ret < 0 {
+                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                        ff::avformat_free_context(oc);
+                        return Err(map_ff_err(ret));
+                    }
+                } else {
+                    ff::av_channel_layout_default(&mut (*enc_ctx).ch_layout, channels);
+                }
+
+                // global header if needed by container
+                if ((*(*oc).oformat).flags & (ff::AVFMT_GLOBALHEADER as i32)) != 0 {
+                    (*enc_ctx).flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                }
+
+                let ret = ff::avcodec_open2(enc_ctx, codec, ptr::null_mut());
+                if ret < 0 {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                // stream
+                let st = ff::avformat_new_stream(oc, ptr::null());
+                if st.is_null() {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
+                }
+                (*st).time_base = (*enc_ctx).time_base;
+                let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
+                if ret < 0 {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                // open IO
+                if ((*(*oc).oformat).flags & (ff::AVFMT_NOFILE as i32)) == 0 {
+                    let ret = ff::avio_open(&mut (*oc).pb, self.out_c.as_ptr(), ff::AVIO_FLAG_WRITE);
+                    if ret < 0 {
+                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                        ff::avformat_free_context(oc);
+                        return Err(map_ff_err(ret));
+                    }
+                }
+
+                // write header
+                let ret = ff::avformat_write_header(oc, ptr::null_mut());
+                if ret < 0 {
+                    if !(*oc).pb.is_null() {
+                        ff::avio_closep(&mut (*oc).pb);
+                    }
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                self.frame_samples = if (*enc_ctx).frame_size > 0 {
+                    (*enc_ctx).frame_size as usize
+                } else {
+                    960
+                };
+                let fifo = AudioFifo::new(in_fmt, Rational::new(1, 48_000))
+                    .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
+
+                self.oc = oc;
+                self.st = st;
+                self.enc_ctx = enc_ctx;
+                self.fifo = Some(fifo);
+                self.next_pts = 0;
+                self.initialized = true;
+                Ok(())
+            }
         }
     }
 

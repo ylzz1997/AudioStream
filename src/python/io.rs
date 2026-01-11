@@ -712,76 +712,45 @@ impl AudioFileReaderPy {
 /// Python 侧 AudioFileWriter：可作为 `AsyncDynRunner` 的 sink（实现 push/finalize）。
 #[pyclass(name = "AudioFileWriter", unsendable)]
 pub struct AudioFileWriterPy {
-    w: RsAudioFileWriter,
-    input_format: RsAudioFormat,
-    sample_type: SampleType,
+    path: String,
+    format: String,
+    bitrate: Option<u32>,
+    compression_level: Option<i32>,
+    wav_output_format: Option<String>,
+    w: Option<RsAudioFileWriter>,
+    input_format: Option<RsAudioFormat>,
+    sample_type: Option<SampleType>,
 }
 
 #[pymethods]
 impl AudioFileWriterPy {
     #[new]
-    #[pyo3(signature = (path, format, input_format, bitrate=None, compression_level=None, wav_output_format=None))]
+    #[pyo3(signature = (path, format, input_format=None, bitrate=None, compression_level=None, wav_output_format=None))]
     fn new(
         path: String,
         format: &str,
-        input_format: AudioFormat,
+        input_format: Option<AudioFormat>,
         bitrate: Option<u32>,
         compression_level: Option<i32>,
         wav_output_format: Option<String>,
     ) -> PyResult<Self> {
         let fmt = file_format_from_str(format).ok_or_else(|| PyValueError::new_err("format 仅支持: wav/mp3/aac_adts/flac/opus_ogg"))?;
-        let rs_fmt = input_format.to_rs()?;
-        let st = input_format.sample_type_rs()?;
-
-        let cfg = match fmt {
-            "wav" => {
-                let out_fmt = match wav_output_format.as_deref() {
-                    None | Some("pcm16le") => rs_file::WavOutputSampleFormat::Pcm16Le,
-                    Some("f32le") => rs_file::WavOutputSampleFormat::Float32Le,
-                    Some(_) => return Err(PyValueError::new_err("wav_output_format 仅支持: pcm16le/f32le")),
-                };
-                let c = match out_fmt {
-                    rs_file::WavOutputSampleFormat::Pcm16Le => rs_file::WavWriterConfig::pcm16le(rs_fmt),
-                    rs_file::WavOutputSampleFormat::Float32Le => rs_file::WavWriterConfig::f32le(rs_fmt),
-                };
-                AudioFileWriteConfig::Wav(c)
-            }
-            "mp3" => {
-                let mut c = rs_file::Mp3WriterConfig::new(rs_fmt);
-                if let Some(br) = bitrate {
-                    c.encoder.bitrate = Some(br);
-                }
-                AudioFileWriteConfig::Mp3(c)
-            }
-            "aac_adts" => {
-                let c = rs_file::AacAdtsWriterConfig {
-                    encoder: AacEncoderConfig { input_format: rs_fmt, bitrate },
-                };
-                AudioFileWriteConfig::AacAdts(c)
-            }
-            "flac" => {
-                let c = rs_file::FlacWriterConfig {
-                    encoder: FlacEncoderConfig { input_format: rs_fmt, compression_level },
-                };
-                AudioFileWriteConfig::Flac(c)
-            }
-            "opus_ogg" => {
-                if rs_fmt.sample_rate != 48_000 {
-                    return Err(PyValueError::new_err("opus_ogg writer 需要 48kHz input_format（请先重采样）"));
-                }
-                if rs_fmt.sample_format.is_planar() {
-                    return Err(PyValueError::new_err("opus_ogg writer 需要 interleaved samples（input_format.planar=False）"));
-                }
-                let c = rs_file::OpusOggWriterConfig {
-                    encoder: OpusEncoderConfig { input_format: rs_fmt, bitrate },
-                };
-                AudioFileWriteConfig::OpusOgg(c)
-            }
-            _ => return Err(PyValueError::new_err("unsupported format")),
+        let (w, rs_fmt, st) = if let Some(input_format) = input_format {
+            let rs_fmt = input_format.to_rs()?;
+            let st = input_format.sample_type_rs()?;
+            let cfg = build_file_writer_cfg(fmt, rs_fmt, bitrate, compression_level, wav_output_format.as_deref())?;
+            let w = RsAudioFileWriter::create(path.clone(), cfg).map_err(map_file_err)?;
+            (Some(w), Some(rs_fmt), Some(st))
+        } else {
+            (None, None, None)
         };
 
-        let w = RsAudioFileWriter::create(path, cfg).map_err(map_file_err)?;
         Ok(Self {
+            path,
+            format: fmt.to_string(),
+            bitrate,
+            compression_level,
+            wav_output_format,
             w,
             input_format: rs_fmt,
             sample_type: st,
@@ -790,7 +759,16 @@ impl AudioFileWriterPy {
 
     /// 直接写入一帧 PCM（numpy）
     fn write_pcm(&mut self, py: Python<'_>, pcm: &Bound<'_, PyAny>) -> PyResult<()> {
-        let dtype_name = match self.sample_type {
+        let Some(sample_type) = self.sample_type else {
+            return Err(PyValueError::new_err(
+                "input_format=None 时无法从裸 numpy 推断 sample_rate/format；请在构造时提供 input_format，或改用 push(NodeBuffer) 让首帧自动推断",
+            ));
+        };
+        let input_format = self
+            .input_format
+            .ok_or_else(|| PyValueError::new_err("writer not initialized"))?;
+
+        let dtype_name = match sample_type {
             SampleType::U8 => "uint8",
             SampleType::I16 => "int16",
             SampleType::I32 => "int32",
@@ -799,26 +777,27 @@ impl AudioFileWriterPy {
             SampleType::F64 => "float64",
         };
         let arr_any = ascontig_cast_2d(py, pcm, dtype_name)?;
-        let frame = if self.input_format.is_planar() {
-            match self.sample_type {
-                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, self.input_format)?,
-                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, self.input_format)?,
-                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, self.input_format)?,
-                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, self.input_format)?,
-                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, self.input_format)?,
-                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, self.input_format)?,
+        let frame = if input_format.is_planar() {
+            match sample_type {
+                SampleType::U8 => ndarray_to_frame_planar::<u8>(&arr_any, input_format)?,
+                SampleType::I16 => ndarray_to_frame_planar::<i16>(&arr_any, input_format)?,
+                SampleType::I32 => ndarray_to_frame_planar::<i32>(&arr_any, input_format)?,
+                SampleType::I64 => ndarray_to_frame_planar::<i64>(&arr_any, input_format)?,
+                SampleType::F32 => ndarray_to_frame_planar::<f32>(&arr_any, input_format)?,
+                SampleType::F64 => ndarray_to_frame_planar::<f64>(&arr_any, input_format)?,
             }
         } else {
-            match self.sample_type {
-                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, self.input_format)?,
-                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, self.input_format)?,
-                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, self.input_format)?,
-                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, self.input_format)?,
-                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, self.input_format)?,
-                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, self.input_format)?,
+            match sample_type {
+                SampleType::U8 => ndarray_to_frame_interleaved::<u8>(&arr_any, input_format)?,
+                SampleType::I16 => ndarray_to_frame_interleaved::<i16>(&arr_any, input_format)?,
+                SampleType::I32 => ndarray_to_frame_interleaved::<i32>(&arr_any, input_format)?,
+                SampleType::I64 => ndarray_to_frame_interleaved::<i64>(&arr_any, input_format)?,
+                SampleType::F32 => ndarray_to_frame_interleaved::<f32>(&arr_any, input_format)?,
+                SampleType::F64 => ndarray_to_frame_interleaved::<f64>(&arr_any, input_format)?,
             }
         };
-        AudioWriter::write_frame(&mut self.w, &frame as &dyn AudioFrameView).map_err(map_file_err)?;
+        let w = self.w.as_mut().ok_or_else(|| PyValueError::new_err("writer not initialized"))?;
+        AudioWriter::write_frame(w, &frame as &dyn AudioFrameView).map_err(map_file_err)?;
         Ok(())
     }
 
@@ -828,7 +807,28 @@ impl AudioFileWriterPy {
         let inner = b.take_inner()?;
         match inner {
             NodeBuffer::Pcm(f) => {
-                AudioWriter::write_frame(&mut self.w, &f as &dyn AudioFrameView).map_err(map_file_err)?;
+                if self.w.is_none() {
+                    let rs_fmt = *f.format_ref();
+                    let st = rs_fmt.sample_format.sample_type();
+                    let cfg = build_file_writer_cfg(
+                        &self.format,
+                        rs_fmt,
+                        self.bitrate,
+                        self.compression_level,
+                        self.wav_output_format.as_deref(),
+                    )?;
+                    let w = RsAudioFileWriter::create(self.path.clone(), cfg).map_err(map_file_err)?;
+                    self.w = Some(w);
+                    self.input_format = Some(rs_fmt);
+                    self.sample_type = Some(st);
+                } else if let Some(expected) = self.input_format {
+                    if *f.format_ref() != expected {
+                        return Err(PyValueError::new_err("PCM format 与 writer 首帧推断/配置的 input_format 不一致"));
+                    }
+                }
+
+                let w = self.w.as_mut().ok_or_else(|| PyValueError::new_err("writer not initialized"))?;
+                AudioWriter::write_frame(w, &f as &dyn AudioFrameView).map_err(map_file_err)?;
                 Ok(())
             }
             NodeBuffer::Packet(_) => Err(PyValueError::new_err("AudioFileWriter.push 仅支持 PCM（NodeBuffer kind=pcm）")),
@@ -836,8 +836,68 @@ impl AudioFileWriterPy {
     }
 
     fn finalize(&mut self) -> PyResult<()> {
-        AudioWriter::finalize(&mut self.w).map_err(map_file_err)
+        let Some(w) = self.w.as_mut() else {
+            return Ok(());
+        };
+        AudioWriter::finalize(w).map_err(map_file_err)
     }
+}
+
+fn build_file_writer_cfg(
+    fmt: &str,
+    rs_fmt: RsAudioFormat,
+    bitrate: Option<u32>,
+    compression_level: Option<i32>,
+    wav_output_format: Option<&str>,
+) -> PyResult<AudioFileWriteConfig> {
+    Ok(match fmt {
+        "wav" => {
+            let out_fmt = match wav_output_format {
+                None | Some("pcm16le") => rs_file::WavOutputSampleFormat::Pcm16Le,
+                Some("f32le") => rs_file::WavOutputSampleFormat::Float32Le,
+                Some(_) => return Err(PyValueError::new_err("wav_output_format 仅支持: pcm16le/f32le")),
+            };
+            let c = match out_fmt {
+                rs_file::WavOutputSampleFormat::Pcm16Le => rs_file::WavWriterConfig::pcm16le(rs_fmt),
+                rs_file::WavOutputSampleFormat::Float32Le => rs_file::WavWriterConfig::f32le(rs_fmt),
+            };
+            AudioFileWriteConfig::Wav(c)
+        }
+        "mp3" => {
+            let mut enc_cfg = crate::codec::encoder::mp3_encoder::Mp3EncoderConfig::new(rs_fmt);
+            if let Some(br) = bitrate {
+                enc_cfg.bitrate = Some(br);
+            }
+            AudioFileWriteConfig::Mp3(rs_file::Mp3WriterConfig { encoder: enc_cfg })
+        }
+        "aac_adts" => AudioFileWriteConfig::AacAdts(rs_file::AacAdtsWriterConfig {
+            encoder: AacEncoderConfig {
+                input_format: Some(rs_fmt),
+                bitrate,
+            },
+        }),
+        "flac" => AudioFileWriteConfig::Flac(rs_file::FlacWriterConfig {
+            encoder: FlacEncoderConfig {
+                input_format: Some(rs_fmt),
+                compression_level,
+            },
+        }),
+        "opus_ogg" => {
+            if rs_fmt.sample_rate != 48_000 {
+                return Err(PyValueError::new_err("opus_ogg writer 需要 48kHz input_format（请先重采样）"));
+            }
+            if rs_fmt.sample_format.is_planar() {
+                return Err(PyValueError::new_err("opus_ogg writer 需要 interleaved samples（input_format.planar=False）"));
+            }
+            AudioFileWriteConfig::OpusOgg(rs_file::OpusOggWriterConfig {
+                encoder: OpusEncoderConfig {
+                    input_format: Some(rs_fmt),
+                    bitrate,
+                },
+            })
+        }
+        _ => return Err(PyValueError::new_err("unsupported format")),
+    })
 }
 
 

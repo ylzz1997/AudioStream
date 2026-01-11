@@ -212,6 +212,24 @@ with open("out.mp3", "wb") as f:
                   <li><b>MP3/AAC</b>：通常需要带 <code>ffmpeg</code> feature 构建（见快速开始安装命令）。</li>
                 </ul>
               </section>
+
+              <section class="section">
+                <h2>Encoder 的 input_format 自动推断</h2>
+                <p>
+                  <b>Rust 层</b>：所有 Encoder 的 <code>input_format</code> 支持 <code>None</code>（首帧推断并锁定）。
+                  这在 “上游提供的 PCM 本身携带格式”（例如 Rust 侧 <code>AudioFrame</code>、或 Pipeline 里 <code>NodeBuffer.pcm(...)</code> 自带 <code>AudioFormat</code>）的场景很有用。
+                </p>
+                <ul>
+                  <li><b>推断触发</b>：第一次收到 <b>非空帧</b>（<code>nb_samples &gt; 0</code>）时锁定格式；空帧不会触发推断。</li>
+                  <li><b>一致性</b>：锁定后如果后续帧格式改变，会报 <code>input AudioFormat mismatch</code>（当前库不做隐式重采样/布局转换）。</li>
+                  <li><b>reset</b>：对“推断模式”的 Encoder，<code>reset()</code> 会清空已推断的格式并回到未初始化状态；下次再用首帧重新推断。</li>
+                  <li><b>flush(None)</b>：如果从未收到过非空帧，flush 只会结束流，不会初始化 encoder。</li>
+                </ul>
+                <p>
+                  <b>Python 的 ast.Encoder</b>：目前构造时仍要求显式 <code>AudioFormat</code>（因为需要将 numpy 的 dtype/shape 与格式严格对齐，再拷贝成内部 PCM 帧）。
+                  如果你希望“从首帧 numpy 自动推断 sample_rate/channels/sample_type/planar”，需要额外约定元数据来源（目前未提供）。
+                </p>
+              </section>
             `,
           },
           {
@@ -315,6 +333,20 @@ p.put_frame(np.ones((1, 960), dtype=np.float32))
 out = p.get_frame(force=True)
 print(out.shape, out.max())
                 </code></pre>
+              </section>
+
+              <section class="section">
+                <h2>Processor 的格式自动推断</h2>
+                <p>
+                  多数 Processor 都支持把输入格式参数设为 <code>None</code>，表示：<b>首帧推断输入 AudioFormat</b>。
+                  这是为了方便把 Processor 接到 <code>AudioFileReader</code>/<code>NodeBuffer</code> 这种“帧本身携带格式”的上游。
+                </p>
+                <ul>
+                  <li><b>推断触发</b>：第一次收到 <b>非空帧</b>（<code>nb_samples &gt; 0</code>）时锁定输入格式；空帧不会触发推断。</li>
+                  <li><b>一致性</b>：锁定后如果后续帧格式改变，会报格式不匹配（不会隐式做 resample/convert）。</li>
+                  <li><b>reset</b>：对“推断模式”的 Processor，<code>reset()</code> 会清空已推断的格式并回到未初始化状态；下次再用首帧重新推断。</li>
+                  <li><b>resample</b>：<code>out_format</code> 必须显式给定；<code>in_format=None</code> 只影响输入端推断，不影响输出端。</li>
+                </ul>
               </section>
             `,
           },{

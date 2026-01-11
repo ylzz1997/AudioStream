@@ -1,7 +1,7 @@
 use crate::common::io::io::{AudioIOResult, AudioIOError};
 use crate::codec::error::CodecError;
 use crate::codec::packet::CodecPacket;
-use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
+use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView, Rational};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
@@ -107,13 +107,16 @@ mod ffmpeg_backend {
     }
 
     pub struct FlacWriter {
+        cfg: FlacWriterConfig,
+        out_c: CString,
         oc: *mut ff::AVFormatContext,
         st: *mut ff::AVStream,
         enc_ctx: *mut ff::AVCodecContext,
-        fifo: AudioFifo,
+        fifo: Option<AudioFifo>,
         frame_samples: usize,
         next_pts: i64,
         finished: bool,
+        initialized: bool,
     }
 
     unsafe impl Send for FlacWriter {}
@@ -122,127 +125,18 @@ mod ffmpeg_backend {
         pub fn create<P: AsRef<Path>>(path: P, cfg: FlacWriterConfig) -> AudioIOResult<Self> {
             let out_path = path.as_ref().to_string_lossy();
             let out_c = CString::new(out_path.as_bytes()).map_err(|_| AudioIOError::Format("path contains NUL"))?;
-
-            let enc_cfg = cfg.encoder;
-            let in_fmt = enc_cfg.input_format;
-            let time_base = Rational::new(1, in_fmt.sample_rate as i32);
-            let fifo =
-                AudioFifo::new(in_fmt, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
-
-            unsafe {
-                // allocate output context (deduce container by extension: .flac => flac)
-                let mut oc: *mut ff::AVFormatContext = ptr::null_mut();
-                let ret = ff::avformat_alloc_output_context2(
-                    &mut oc as *mut *mut ff::AVFormatContext,
-                    ptr::null_mut(),
-                    ptr::null(),
-                    out_c.as_ptr(),
-                );
-                if ret < 0 || oc.is_null() {
-                    return Err(map_ff_err(if ret < 0 { ret } else { -1 }));
-                }
-
-                // encoder (flac)
-                let name = CString::new("flac").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
-                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
-                if codec.is_null() {
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg FLAC encoder not found")));
-                }
-                let enc_ctx = ff::avcodec_alloc_context3(codec);
-                if enc_ctx.is_null() {
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
-                }
-
-                (*enc_ctx).sample_rate = in_fmt.sample_rate as i32;
-                (*enc_ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
-                (*enc_ctx).time_base = ff::AVRational {
-                    num: 1,
-                    den: (*enc_ctx).sample_rate,
-                };
-                if let Some(level) = enc_cfg.compression_level {
-                    (*enc_ctx).compression_level = level;
-                }
-
-                // channel layout
-                let channels = in_fmt.channels() as i32;
-                if in_fmt.channel_layout.mask != 0 {
-                    let ret = ff::av_channel_layout_from_mask(&mut (*enc_ctx).ch_layout, in_fmt.channel_layout.mask);
-                    if ret < 0 {
-                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                        ff::avformat_free_context(oc);
-                        return Err(map_ff_err(ret));
-                    }
-                } else {
-                    ff::av_channel_layout_default(&mut (*enc_ctx).ch_layout, channels);
-                }
-
-                // global header if needed by container
-                if ((*(*oc).oformat).flags & (ff::AVFMT_GLOBALHEADER as i32)) != 0 {
-                    (*enc_ctx).flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
-                }
-
-                let ret = ff::avcodec_open2(enc_ctx, codec, ptr::null_mut());
-                if ret < 0 {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                // stream
-                let st = ff::avformat_new_stream(oc, ptr::null());
-                if st.is_null() {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
-                }
-                (*st).time_base = (*enc_ctx).time_base;
-                let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
-                if ret < 0 {
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                // open IO
-                if ((*(*oc).oformat).flags & (ff::AVFMT_NOFILE as i32)) == 0 {
-                    let ret = ff::avio_open(&mut (*oc).pb, out_c.as_ptr(), ff::AVIO_FLAG_WRITE);
-                    if ret < 0 {
-                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                        ff::avformat_free_context(oc);
-                        return Err(map_ff_err(ret));
-                    }
-                }
-
-                // write header
-                let ret = ff::avformat_write_header(oc, ptr::null_mut());
-                if ret < 0 {
-                    if !(*oc).pb.is_null() {
-                        ff::avio_closep(&mut (*oc).pb);
-                    }
-                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
-                    ff::avformat_free_context(oc);
-                    return Err(map_ff_err(ret));
-                }
-
-                // frame size: flac 通常可变，FFmpeg 可能给 0；这里给个稳妥 chunk
-                let frame_samples = if (*enc_ctx).frame_size > 0 {
-                    (*enc_ctx).frame_size as usize
-                } else {
-                    4096
-                };
-
-                Ok(Self {
-                    oc,
-                    st,
-                    enc_ctx,
-                    fifo,
-                    frame_samples,
-                    next_pts: 0,
-                    finished: false,
-                })
-            }
+            Ok(Self {
+                cfg,
+                out_c,
+                oc: ptr::null_mut(),
+                st: ptr::null_mut(),
+                enc_ctx: ptr::null_mut(),
+                fifo: None,
+                frame_samples: 0,
+                next_pts: 0,
+                finished: false,
+                initialized: false,
+            })
         }
 
         fn encode_and_mux(&mut self, frame: &AudioFrame) -> AudioIOResult<()> {
@@ -251,7 +145,8 @@ mod ffmpeg_backend {
                 if fmt.sample_rate as i32 != (*self.enc_ctx).sample_rate {
                     return Err(AudioIOError::Format("FLAC writer expects fixed sample_rate"));
                 }
-                if fmt != self.fifo.format() {
+                let fifo_fmt = self.fifo.as_ref().map(|f| f.format()).ok_or(AudioIOError::Format("FLAC writer not initialized"))?;
+                if fmt != fifo_fmt {
                     return Err(AudioIOError::Format("FLAC writer format mismatch (no resample/convert layer yet)"));
                 }
 
@@ -413,15 +308,32 @@ mod ffmpeg_backend {
             if self.finished {
                 return Err(AudioIOError::Codec(CodecError::InvalidState("already finalized")));
             }
-            self.fifo
+            if frame.nb_samples() == 0 {
+                // 空帧不锁定格式
+                return Ok(());
+            }
+            self.ensure_initialized(frame.format())?;
+
+            {
+                let fifo = self
+                    .fifo
+                    .as_mut()
+                    .ok_or(AudioIOError::Format("FLAC writer not initialized"))?;
+                fifo
                 .push_frame(frame)
                 .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
+            }
 
-            while let Some(chunk) = self
-                .fifo
-                .pop_frame(self.frame_samples)
-                .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
-            {
+            loop {
+                let next = {
+                    let fifo = self
+                        .fifo
+                        .as_mut()
+                        .ok_or(AudioIOError::Format("FLAC writer not initialized"))?;
+                    fifo.pop_frame(self.frame_samples)
+                        .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
+                };
+                let Some(chunk) = next else { break };
                 self.encode_and_mux(&chunk)?;
             }
             Ok(())
@@ -431,15 +343,28 @@ mod ffmpeg_backend {
             if self.finished {
                 return Ok(());
             }
+            if !self.initialized {
+                // 从未写入过有效帧：不写 header/trailer，保持空文件
+                self.finished = true;
+                return Ok(());
+            }
 
             // flush FIFO tail（允许 < frame_samples，FLAC 可变帧长）
-            let remain = self.fifo.available_samples();
+            let remain = self
+                .fifo
+                .as_ref()
+                .ok_or(AudioIOError::Format("FLAC writer not initialized"))?
+                .available_samples();
             if remain > 0 {
-                if let Some(last) = self
-                    .fifo
-                    .pop_frame(remain)
-                    .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
-                {
+                let last = {
+                    let fifo = self
+                        .fifo
+                        .as_mut()
+                        .ok_or(AudioIOError::Format("FLAC writer not initialized"))?;
+                    fifo.pop_frame(remain)
+                        .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
+                };
+                if let Some(last) = last {
                     self.encode_and_mux(&last)?;
                 }
             }
@@ -460,6 +385,135 @@ mod ffmpeg_backend {
             }
             self.finished = true;
             Ok(())
+        }
+    }
+
+    impl FlacWriter {
+        fn ensure_initialized(&mut self, in_fmt: AudioFormat) -> AudioIOResult<()> {
+            if self.initialized {
+                return Ok(());
+            }
+            if let Some(expected) = self.cfg.encoder.input_format {
+                if in_fmt != expected {
+                    return Err(AudioIOError::Format("FLAC writer input AudioFormat mismatch"));
+                }
+            }
+
+            let time_base = Rational::new(1, in_fmt.sample_rate as i32);
+            let fifo = AudioFifo::new(in_fmt, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
+
+            unsafe {
+                // allocate output context (deduce container by extension: .flac => flac)
+                let mut oc: *mut ff::AVFormatContext = ptr::null_mut();
+                let ret = ff::avformat_alloc_output_context2(
+                    &mut oc as *mut *mut ff::AVFormatContext,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    self.out_c.as_ptr(),
+                );
+                if ret < 0 || oc.is_null() {
+                    return Err(map_ff_err(if ret < 0 { ret } else { -1 }));
+                }
+
+                // encoder (flac)
+                let name = CString::new("flac").map_err(|_| AudioIOError::Format("codec name contains NUL"))?;
+                let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
+                if codec.is_null() {
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Unsupported("FFmpeg FLAC encoder not found")));
+                }
+                let enc_ctx = ff::avcodec_alloc_context3(codec);
+                if enc_ctx.is_null() {
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Other("avcodec_alloc_context3 failed".into())));
+                }
+
+                (*enc_ctx).sample_rate = in_fmt.sample_rate as i32;
+                (*enc_ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
+                (*enc_ctx).time_base = ff::AVRational {
+                    num: 1,
+                    den: (*enc_ctx).sample_rate,
+                };
+                if let Some(level) = self.cfg.encoder.compression_level {
+                    (*enc_ctx).compression_level = level;
+                }
+
+                // channel layout
+                let channels = in_fmt.channels() as i32;
+                if in_fmt.channel_layout.mask != 0 {
+                    let ret = ff::av_channel_layout_from_mask(&mut (*enc_ctx).ch_layout, in_fmt.channel_layout.mask);
+                    if ret < 0 {
+                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                        ff::avformat_free_context(oc);
+                        return Err(map_ff_err(ret));
+                    }
+                } else {
+                    ff::av_channel_layout_default(&mut (*enc_ctx).ch_layout, channels);
+                }
+
+                // global header if needed by container
+                if ((*(*oc).oformat).flags & (ff::AVFMT_GLOBALHEADER as i32)) != 0 {
+                    (*enc_ctx).flags |= ff::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+                }
+
+                let ret = ff::avcodec_open2(enc_ctx, codec, ptr::null_mut());
+                if ret < 0 {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                // stream
+                let st = ff::avformat_new_stream(oc, ptr::null());
+                if st.is_null() {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(AudioIOError::Codec(CodecError::Other("avformat_new_stream failed".into())));
+                }
+                (*st).time_base = (*enc_ctx).time_base;
+                let ret = ff::avcodec_parameters_from_context((*st).codecpar, enc_ctx);
+                if ret < 0 {
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                // open IO
+                if ((*(*oc).oformat).flags & (ff::AVFMT_NOFILE as i32)) == 0 {
+                    let ret = ff::avio_open(&mut (*oc).pb, self.out_c.as_ptr(), ff::AVIO_FLAG_WRITE);
+                    if ret < 0 {
+                        ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                        ff::avformat_free_context(oc);
+                        return Err(map_ff_err(ret));
+                    }
+                }
+
+                // write header
+                let ret = ff::avformat_write_header(oc, ptr::null_mut());
+                if ret < 0 {
+                    if !(*oc).pb.is_null() {
+                        ff::avio_closep(&mut (*oc).pb);
+                    }
+                    ff::avcodec_free_context(&mut (enc_ctx as *mut _));
+                    ff::avformat_free_context(oc);
+                    return Err(map_ff_err(ret));
+                }
+
+                // frame size: flac 通常可变，FFmpeg 可能给 0；这里给个稳妥 chunk
+                self.frame_samples = if (*enc_ctx).frame_size > 0 {
+                    (*enc_ctx).frame_size as usize
+                } else {
+                    4096
+                };
+
+                self.oc = oc;
+                self.st = st;
+                self.enc_ctx = enc_ctx;
+                self.fifo = Some(fifo);
+                self.next_pts = 0;
+                self.initialized = true;
+                Ok(())
+            }
         }
     }
 

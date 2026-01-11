@@ -73,7 +73,7 @@ fn opus_pipeline_dynamic_and_static() {
     // Opus 常用 20ms@48k => 960 samples；flush 时补齐尾巴，避免非法帧长
     resample.set_output_chunker(Some(960), true).unwrap();
     let enc = OpusEncoder::new(OpusEncoderConfig {
-        input_format: mid_fmt,
+        input_format: Some(mid_fmt),
         bitrate: Some(64_000),
     })
     .unwrap();
@@ -132,7 +132,7 @@ fn opus_pipeline_dynamic_and_static() {
     let mut resample = ResampleProcessor::new(in_fmt, mid_fmt).unwrap();
     resample.set_output_chunker(Some(960), true).unwrap();
     let enc = OpusEncoder::new(OpusEncoderConfig {
-        input_format: mid_fmt,
+        input_format: Some(mid_fmt),
         bitrate: Some(64_000),
     })
     .unwrap();

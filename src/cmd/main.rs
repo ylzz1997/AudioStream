@@ -132,7 +132,7 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
 
             AudioFileWriteConfig::OpusOgg(OpusOggWriterConfig {
                 encoder: OpusEncoderConfig {
-                    input_format: target_fmt,
+                    input_format: Some(target_fmt),
                     bitrate: Some(96_000),
                 },
             })
@@ -148,11 +148,20 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
                 let proc = ResampleProcessor::new(fmt, target_fmt)?;
                 resampler = Some(proc);
             }
-            AudioFileWriteConfig::Flac(FlacWriterConfig { encoder: FlacEncoderConfig::new(target_fmt) })
+            AudioFileWriteConfig::Flac(FlacWriterConfig {
+                encoder: FlacEncoderConfig::new(target_fmt),
+            })
         }
         "wav" => AudioFileWriteConfig::Wav(WavWriterConfig::pcm16le(fmt)),
-        "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig::new(fmt)),
-        "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacAdtsWriterConfig { encoder: AacEncoderConfig { input_format: fmt, bitrate: Some(128_000) } }),
+        "mp3" => AudioFileWriteConfig::Mp3(Mp3WriterConfig {
+            encoder: audiostream::codec::encoder::mp3_encoder::Mp3EncoderConfig::new(fmt),
+        }),
+        "aac" | "adts" => AudioFileWriteConfig::AacAdts(AacAdtsWriterConfig {
+            encoder: AacEncoderConfig {
+                input_format: Some(fmt),
+                bitrate: Some(128_000),
+            },
+        }),
         _ => return Err(format!("unsupported output extension: {out_ext}").into()),
     };
     let w = AudioFileWriter::create(output, out_cfg)?;

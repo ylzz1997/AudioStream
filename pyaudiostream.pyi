@@ -369,7 +369,7 @@ class AudioFileWriter:
         self,
         path: str,
         format: Literal["wav", "mp3", "aac_adts", "flac", "opus_ogg"],
-        input_format: AudioFormat,
+        input_format: Optional[AudioFormat] = None,
         bitrate: Optional[int] = None,
         compression_level: Optional[int] = None,
         # None 等价于 "pcm16le"

@@ -7,21 +7,26 @@ use crate::common::audio::audio::{AudioFormat, AudioFrameView};
 /// “原始 PCM packet”的 encoder，方便走统一的 send/receive pipeline。
 #[derive(Clone, Debug)]
 pub struct WavEncoderConfig {
-    pub input_format: AudioFormat,
+    /// - Some(fmt)：强制要求输入格式匹配
+    /// - None：首帧自动推断并锁定
+    pub input_format: Option<AudioFormat>,
 }
 
 pub struct WavEncoder {
     cfg: WavEncoderConfig,
     queued: Option<CodecPacket>,
     flushed: bool,
+    locked: bool,
 }
 
 impl WavEncoder {
     pub fn new(cfg: WavEncoderConfig) -> CodecResult<Self> {
+        let locked = cfg.input_format.is_some();
         Ok(Self {
             cfg,
             queued: None,
             flushed: false,
+            locked,
         })
     }
 }
@@ -32,7 +37,7 @@ impl AudioEncoder for WavEncoder {
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
-        Some(self.cfg.input_format)
+        self.cfg.input_format
     }
 
     fn preferred_frame_samples(&self) -> Option<usize> {
@@ -52,10 +57,21 @@ impl AudioEncoder for WavEncoder {
         }
         let frame = frame.unwrap();
         let fmt = frame.format();
-        if fmt != self.cfg.input_format {
+        if frame.nb_samples() == 0 {
+            // 空帧不锁定格式，也不产生输出
+            return Ok(());
+        }
+        if self.cfg.input_format.is_none() {
+            self.cfg.input_format = Some(fmt);
+        }
+        let expected = self
+            .cfg
+            .input_format
+            .ok_or(CodecError::InvalidState("WavEncoder missing input_format"))?;
+        if fmt != expected {
             eprintln!(
                 "WavEncoder input AudioFormat mismatch:\n  input_output_format_diffs: {}",
-                crate::common::audio::audio::audio_format_diff(self.cfg.input_format, fmt)
+                crate::common::audio::audio::audio_format_diff(expected, fmt)
             );
             return Err(CodecError::InvalidData("input AudioFormat mismatch"));
         }
@@ -103,6 +119,9 @@ impl AudioEncoder for WavEncoder {
     fn reset(&mut self) -> CodecResult<()> {
         self.queued = None;
         self.flushed = false;
+        if !self.locked {
+            self.cfg.input_format = None;
+        }
         Ok(())
     }
 }

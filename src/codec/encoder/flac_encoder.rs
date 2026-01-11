@@ -9,7 +9,9 @@ use crate::common::audio::audio::{AudioFormat, AudioFrameView};
 /// - `feature="ffmpeg"`：libavcodec（flac encoder）
 #[derive(Clone, Debug)]
 pub struct FlacEncoderConfig {
-    pub input_format: AudioFormat,
+    /// - Some(fmt)：强制要求输入格式匹配
+    /// - None：首帧自动推断并锁定
+    pub input_format: Option<AudioFormat>,
     /// FLAC 压缩等级（FFmpeg 通常是 0..=12；越大越慢/更小）。
     pub compression_level: Option<i32>,
 }
@@ -17,7 +19,14 @@ pub struct FlacEncoderConfig {
 impl FlacEncoderConfig {
     pub fn new(input_format: AudioFormat) -> Self {
         Self {
-            input_format,
+            input_format: Some(input_format),
+            compression_level: None,
+        }
+    }
+
+    pub fn new_infer() -> Self {
+        Self {
+            input_format: None,
             compression_level: None,
         }
     }
@@ -27,12 +36,18 @@ impl FlacEncoderConfig {
 pub struct FlacEncoder {
     cfg: FlacEncoderConfig,
     flushed: bool,
+    locked: bool,
 }
 
 #[cfg(not(feature = "ffmpeg"))]
 impl FlacEncoder {
     pub fn new(cfg: FlacEncoderConfig) -> CodecResult<Self> {
-        Ok(Self { cfg, flushed: false })
+        let locked = cfg.input_format.is_some();
+        Ok(Self {
+            cfg,
+            flushed: false,
+            locked,
+        })
     }
 }
 
@@ -43,7 +58,7 @@ impl AudioEncoder for FlacEncoder {
     }
 
     fn input_format(&self) -> Option<AudioFormat> {
-        Some(self.cfg.input_format)
+        self.cfg.input_format
     }
 
     fn preferred_frame_samples(&self) -> Option<usize> {
@@ -71,6 +86,9 @@ impl AudioEncoder for FlacEncoder {
 
     fn reset(&mut self) -> CodecResult<()> {
         self.flushed = false;
+        if !self.locked {
+            self.cfg.input_format = None;
+        }
         Ok(())
     }
 }
@@ -89,6 +107,8 @@ mod ffmpeg_backend {
         cfg: FlacEncoderConfig,
         flushed: bool,
         ctx: *mut ff::AVCodecContext,
+        initialized: bool,
+        locked: bool,
     }
 
     unsafe impl Send for FlacEncoder {}
@@ -118,6 +138,32 @@ mod ffmpeg_backend {
 
     impl FlacEncoder {
         pub fn new(cfg: FlacEncoderConfig) -> CodecResult<Self> {
+            let locked = cfg.input_format.is_some();
+            let mut this = Self {
+                cfg,
+                flushed: false,
+                ctx: ptr::null_mut(),
+                initialized: false,
+                locked,
+            };
+            if let Some(fmt) = this.cfg.input_format {
+                this.ensure_initialized(fmt)?;
+            }
+            Ok(this)
+        }
+
+        fn ensure_initialized(&mut self, in_fmt: AudioFormat) -> CodecResult<()> {
+            if self.initialized {
+                return Ok(());
+            }
+            if let Some(expected) = self.cfg.input_format {
+                if expected != in_fmt {
+                    return Err(CodecError::InvalidData("input AudioFormat mismatch (no resample/convert layer yet)"));
+                }
+            } else {
+                self.cfg.input_format = Some(in_fmt);
+            }
+
             unsafe {
                 let name = CString::new("flac").map_err(|_| CodecError::InvalidData("codec name contains NUL"))?;
                 let codec = ff::avcodec_find_encoder_by_name(name.as_ptr());
@@ -130,9 +176,9 @@ mod ffmpeg_backend {
                     return Err(CodecError::Other("avcodec_alloc_context3 failed".into()));
                 }
 
-                (*ctx).sample_rate = cfg.input_format.sample_rate as i32;
-                let channels = cfg.input_format.channels() as i32;
-                let ch_layout = cfg.input_format.channel_layout;
+                (*ctx).sample_rate = in_fmt.sample_rate as i32;
+                let channels = in_fmt.channels() as i32;
+                let ch_layout = in_fmt.channel_layout;
                 if ch_layout.mask != 0 {
                     let ret = ff::av_channel_layout_from_mask(&mut (*ctx).ch_layout, ch_layout.mask);
                     if ret < 0 {
@@ -143,12 +189,12 @@ mod ffmpeg_backend {
                     ff::av_channel_layout_default(&mut (*ctx).ch_layout, channels);
                 }
 
-                (*ctx).sample_fmt = map_sample_format(cfg.input_format.sample_format)?;
+                (*ctx).sample_fmt = map_sample_format(in_fmt.sample_format)?;
                 (*ctx).time_base = ff::AVRational {
                     num: 1,
                     den: (*ctx).sample_rate,
                 };
-                if let Some(level) = cfg.compression_level {
+                if let Some(level) = self.cfg.compression_level {
                     (*ctx).compression_level = level;
                 }
 
@@ -158,11 +204,9 @@ mod ffmpeg_backend {
                     return Err(map_ff_err(ret));
                 }
 
-                Ok(Self {
-                    cfg,
-                    flushed: false,
-                    ctx,
-                })
+                self.ctx = ctx;
+                self.initialized = true;
+                Ok(())
             }
         }
 
@@ -172,6 +216,9 @@ mod ffmpeg_backend {
 
         /// 返回 encoder extradata（对 FLAC 来说通常是 STREAMINFO 等元数据）。
         pub fn extradata(&self) -> Option<Vec<u8>> {
+            if !self.initialized || self.ctx.is_null() {
+                return None;
+            }
             unsafe {
                 let size = (*self.ctx).extradata_size as usize;
                 if size == 0 || (*self.ctx).extradata.is_null() {
@@ -199,7 +246,7 @@ mod ffmpeg_backend {
         }
 
         fn input_format(&self) -> Option<AudioFormat> {
-            Some(self.cfg.input_format)
+            self.cfg.input_format
         }
 
         fn preferred_frame_samples(&self) -> Option<usize> {
@@ -213,6 +260,10 @@ mod ffmpeg_backend {
                     return Err(CodecError::InvalidState("already flushed"));
                 }
                 if frame.is_none() {
+                    if !self.initialized || self.ctx.is_null() {
+                        self.flushed = true;
+                        return Ok(());
+                    }
                     let ret = ff::avcodec_send_frame(self.ctx, ptr::null());
                     if ret < 0 {
                         return Err(map_ff_err(ret));
@@ -222,15 +273,23 @@ mod ffmpeg_backend {
                 }
 
                 let frame = frame.unwrap();
+                if frame.nb_samples() == 0 {
+                    return Ok(());
+                }
                 let fmt = frame.format();
-                if fmt != self.cfg.input_format {
+                if !self.initialized {
+                    self.ensure_initialized(fmt)?;
+                }
+                let expected = self
+                    .cfg
+                    .input_format
+                    .ok_or(CodecError::InvalidState("FlacEncoder missing input_format"))?;
+                if fmt != expected {
                     eprintln!(
                         "FlacEncoder input AudioFormat mismatch:\n  input_output_format_diffs: {}",
-                        crate::common::audio::audio::audio_format_diff(self.cfg.input_format, fmt)
+                        crate::common::audio::audio::audio_format_diff(expected, fmt)
                     );
-                    return Err(CodecError::InvalidData(
-                        "input AudioFormat mismatch (no resample/convert layer yet)",
-                    ));
+                    return Err(CodecError::InvalidData("input AudioFormat mismatch (no resample/convert layer yet)"));
                 }
 
                 let avf = ff::av_frame_alloc();
@@ -296,6 +355,9 @@ mod ffmpeg_backend {
 
         fn receive_packet(&mut self) -> CodecResult<CodecPacket> {
             unsafe {
+                if !self.initialized || self.ctx.is_null() {
+                    return Err(if self.flushed { CodecError::Eof } else { CodecError::Again });
+                }
                 let pkt = ff::av_packet_alloc();
                 if pkt.is_null() {
                     return Err(CodecError::Other("av_packet_alloc failed".into()));
@@ -328,8 +390,21 @@ mod ffmpeg_backend {
         }
 
         fn reset(&mut self) -> CodecResult<()> {
-            unsafe {
-                ff::avcodec_flush_buffers(self.ctx);
+            if !self.locked {
+                unsafe {
+                    if !self.ctx.is_null() {
+                        ff::avcodec_free_context(&mut self.ctx);
+                        self.ctx = ptr::null_mut();
+                    }
+                }
+                self.initialized = false;
+                self.cfg.input_format = None;
+            } else {
+                unsafe {
+                    if !self.ctx.is_null() {
+                        ff::avcodec_flush_buffers(self.ctx);
+                    }
+                }
             }
             self.flushed = false;
             Ok(())

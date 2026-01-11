@@ -240,7 +240,9 @@ impl Encoder {
                 let sample_type = cfg.input_format.sample_type_rs()?;
                 let fifo =
                     AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
-                let enc = Box::new(WavEncoder::new(WavEncoderConfig { input_format }).map_err(map_codec_err)?)
+                let enc = Box::new(
+                    WavEncoder::new(WavEncoderConfig { input_format: Some(input_format) }).map_err(map_codec_err)?,
+                )
                     as Box<dyn AudioEncoder>;
                 Ok(Self {
                     codec: "wav".into(),
@@ -260,7 +262,7 @@ impl Encoder {
                 let fifo =
                     AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
                 let enc_cfg = Mp3EncoderConfig {
-                    input_format,
+                    input_format: Some(input_format),
                     bitrate: cfg.bitrate,
                 };
                 let enc = Box::new(Mp3Encoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
@@ -282,7 +284,7 @@ impl Encoder {
                 let fifo =
                     AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
                 let enc_cfg = AacEncoderConfig {
-                    input_format,
+                    input_format: Some(input_format),
                     bitrate: cfg.bitrate,
                 };
                 let enc = Box::new(AacEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
@@ -304,7 +306,7 @@ impl Encoder {
                 let fifo =
                     AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
                 let enc_cfg = OpusEncoderConfig {
-                    input_format,
+                    input_format: Some(input_format),
                     bitrate: cfg.bitrate,
                 };
                 let enc = Box::new(OpusEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
@@ -326,7 +328,7 @@ impl Encoder {
                 let fifo =
                     AudioFifo::new(input_format, Rational::new(1, input_format.sample_rate as i32)).map_err(map_audio_err)?;
                 let enc_cfg = FlacEncoderConfig {
-                    input_format,
+                    input_format: Some(input_format),
                     compression_level: cfg.compression_level,
                 };
                 let enc = Box::new(FlacEncoder::new(enc_cfg).map_err(map_codec_err)?) as Box<dyn AudioEncoder>;
@@ -545,13 +547,15 @@ pub fn make_encoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>
         "wav" => {
             let cfg = config.extract::<WavEncoderConfigPy>()?;
             let input_format = cfg.input_format.to_rs()?;
-            Box::new(WavEncoder::new(WavEncoderConfig { input_format }).map_err(map_codec_err)?)
+            Box::new(
+                WavEncoder::new(WavEncoderConfig { input_format: Some(input_format) }).map_err(map_codec_err)?,
+            )
         }
         "mp3" => {
             let cfg = config.extract::<Mp3EncoderConfigPy>()?;
             let input_format = cfg.input_format.to_rs()?;
             Box::new(Mp3Encoder::new(Mp3EncoderConfig {
-                input_format,
+                input_format: Some(input_format),
                 bitrate: cfg.bitrate,
             })
             .map_err(map_codec_err)?)
@@ -560,7 +564,7 @@ pub fn make_encoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>
             let cfg = config.extract::<AacEncoderConfigPy>()?;
             let input_format = cfg.input_format.to_rs()?;
             Box::new(AacEncoder::new(AacEncoderConfig {
-                input_format,
+                input_format: Some(input_format),
                 bitrate: cfg.bitrate,
             })
             .map_err(map_codec_err)?)
@@ -569,7 +573,7 @@ pub fn make_encoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>
             let cfg = config.extract::<OpusEncoderConfigPy>()?;
             let input_format = cfg.input_format.to_rs()?;
             Box::new(OpusEncoder::new(OpusEncoderConfig {
-                input_format,
+                input_format: Some(input_format),
                 bitrate: cfg.bitrate,
             })
             .map_err(map_codec_err)?)
@@ -578,7 +582,7 @@ pub fn make_encoder_node(_py: Python<'_>, codec: &str, config: &Bound<'_, PyAny>
             let cfg = config.extract::<FlacEncoderConfigPy>()?;
             let input_format = cfg.input_format.to_rs()?;
             Box::new(FlacEncoder::new(FlacEncoderConfig {
-                input_format,
+                input_format: Some(input_format),
                 compression_level: cfg.compression_level,
             })
             .map_err(map_codec_err)?)

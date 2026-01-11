@@ -1,4 +1,4 @@
-use crate::common::io::io::{AudioIOResult, AudioIOError};
+use crate::common::io::io::{AudioIOError, AudioIOResult};
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::common::audio::fifo::AudioFifo;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
@@ -15,16 +15,13 @@ pub struct Mp3WriterConfig {
     pub encoder: Mp3EncoderConfig,
 }
 
-impl Mp3WriterConfig {
-    pub fn new(input_format: crate::common::audio::audio::AudioFormat) -> Self {
-        Self {
-            encoder: Mp3EncoderConfig::new(input_format),
-        }
-    }
-}
-
 pub struct Mp3Writer {
     w: BufWriter<File>,
+    cfg: Mp3WriterConfig,
+    inner: Option<Mp3WriterInner>,
+}
+
+struct Mp3WriterInner {
     enc: crate::codec::encoder::mp3_encoder::Mp3Encoder,
     fifo: AudioFifo,
     frame_samples: usize,
@@ -32,36 +29,55 @@ pub struct Mp3Writer {
 
 impl Mp3Writer {
     pub fn create<P: AsRef<Path>>(path: P, cfg: Mp3WriterConfig) -> AudioIOResult<Self> {
-        use crate::codec::encoder::encoder_interface::AudioEncoder;
         let w = BufWriter::new(File::create(path)?);
-        let enc_cfg = cfg.encoder;
-        let fmt = enc_cfg.input_format;
-        let sample_rate = fmt.sample_rate;
-        let enc = crate::codec::encoder::mp3_encoder::Mp3Encoder::new(enc_cfg)?;
-        // MP3 常见 1152；若编码器未声明，则退回 1152
-        let frame_samples = enc.preferred_frame_samples().unwrap_or(1152);
-        let time_base = Rational::new(1, sample_rate as i32);
-        let fifo = AudioFifo::new(fmt, time_base)
-            .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
-        Ok(Self { w, enc, fifo, frame_samples })
+        Ok(Self { w, cfg, inner: None })
     }
 }
 
 impl AudioWriter for Mp3Writer {
     fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
+        if frame.nb_samples() == 0 {
+            // 空帧不锁定格式
+            return Ok(());
+        }
+
+        if self.inner.is_none() {
+            let actual = frame.format();
+            if let Some(expected) = self.cfg.encoder.input_format {
+                if actual != expected {
+                    return Err(AudioIOError::Format("MP3 writer input AudioFormat mismatch"));
+                }
+            }
+            let mut enc_cfg = self.cfg.encoder.clone();
+            if enc_cfg.input_format.is_none() {
+                enc_cfg.input_format = Some(actual);
+            }
+            let enc = crate::codec::encoder::mp3_encoder::Mp3Encoder::new(enc_cfg)?;
+            // MP3 常见 1152；若编码器未声明，则退回 1152
+            let frame_samples = enc.preferred_frame_samples().unwrap_or(1152);
+            let time_base = Rational::new(1, actual.sample_rate as i32);
+            let fifo = AudioFifo::new(actual, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
+            self.inner = Some(Mp3WriterInner { enc, fifo, frame_samples });
+        }
+
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or(AudioIOError::Format("MP3 writer not initialized"))?;
         // 先入 FIFO，再按 mp3 frame_size 重分帧输出
-        self.fifo
+        inner
+            .fifo
             .push_frame(frame)
             .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
-        while let Some(chunk) = self
+        while let Some(chunk) = inner
             .fifo
-            .pop_frame(self.frame_samples)
+            .pop_frame(inner.frame_samples)
             .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
         {
-            self.enc.send_frame(Some(&chunk))?;
-            drain_mp3_packets(&mut self.enc, &mut self.w)?;
+            inner.enc.send_frame(Some(&chunk))?;
+            drain_mp3_packets(&mut inner.enc, &mut self.w)?;
         }
         Ok(())
     }
@@ -69,23 +85,28 @@ impl AudioWriter for Mp3Writer {
     fn finalize(&mut self) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
         use crate::codec::error::CodecError;
+        let Some(inner) = self.inner.as_mut() else {
+            // 从未写入过有效帧：直接 flush 文件句柄即可
+            self.w.flush()?;
+            return Ok(());
+        };
         // 先把 FIFO 里剩余数据作为“最后一帧”（允许 < frame_samples）送入
-        let remain = self.fifo.available_samples();
+        let remain = inner.fifo.available_samples();
         if remain > 0 {
-            if let Some(last) = self
+            if let Some(last) = inner
                 .fifo
                 .pop_frame(remain)
                 .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
             {
-                self.enc.send_frame(Some(&last))?;
-                drain_mp3_packets(&mut self.enc, &mut self.w)?;
+                inner.enc.send_frame(Some(&last))?;
+                drain_mp3_packets(&mut inner.enc, &mut self.w)?;
             }
         }
 
         // flush encoder
-        self.enc.send_frame(None)?;
+        inner.enc.send_frame(None)?;
         loop {
-            match self.enc.receive_packet() {
+            match inner.enc.receive_packet() {
                 Ok(pkt) => self.w.write_all(&pkt.data)?,
                 Err(CodecError::Again) => continue,
                 Err(CodecError::Eof) => break,

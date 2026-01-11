@@ -116,6 +116,11 @@ fn build_adts_header_from_asc(asc: &[u8], aac_payload_len: usize) -> Option<[u8;
 
 pub struct AacAdtsWriter {
     file: File,
+    cfg: AacAdtsWriterConfig,
+    inner: Option<AacAdtsWriterInner>,
+}
+
+struct AacAdtsWriterInner {
     encoder: crate::codec::encoder::aac_encoder::AacEncoder,
     asc: Vec<u8>,
     fifo: AudioFifo,
@@ -128,73 +133,93 @@ impl AacAdtsWriter {
         cfg: AacAdtsWriterConfig,
     ) -> AudioIOResult<Self> {
         let file = File::create(path)?;
-        let encoder = crate::codec::encoder::aac_encoder::AacEncoder::new(cfg.encoder)?;
-
-        // 真实 FFmpeg backend 下这里应当能拿到 ASC；占位实现下会是 None。
-        let asc = encoder
-            .audio_specific_config()
-            .ok_or(AudioIOError::Codec(CodecError::Unsupported(
-                "AAC encoder did not provide ASC/extradata (need ffmpeg backend)",
-            )))?;
-
-        let sample_rate = encoder
-            .input_format()
-            .map(|f| f.sample_rate)
-            .unwrap_or(48_000);
-        let time_base = Rational::new(1, sample_rate as i32);
-        let input_format = encoder
-            .input_format()
-            .ok_or(AudioIOError::Format("AAC encoder missing input_format"))?;
-        let fifo = AudioFifo::new(input_format, time_base)
-            .map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
-        let frame_samples = encoder.preferred_frame_samples().unwrap_or(1024);
-
-        Ok(Self {
-            file,
-            encoder,
-            asc,
-            fifo,
-            frame_samples,
-        })
+        Ok(Self { file, cfg, inner: None })
     }
 
     pub fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
-        use crate::codec::encoder::encoder_interface::AudioEncoder;
-        self.fifo
+        if frame.nb_samples() == 0 {
+            // 空帧不锁定格式
+            return Ok(());
+        }
+
+        if self.inner.is_none() {
+            let actual = frame.format();
+            if let Some(expected) = self.cfg.encoder.input_format {
+                if actual != expected {
+                    return Err(AudioIOError::Format("AAC-ADTS writer input AudioFormat mismatch"));
+                }
+            }
+
+            let mut enc_cfg = self.cfg.encoder.clone();
+            if enc_cfg.input_format.is_none() {
+                enc_cfg.input_format = Some(actual);
+            }
+            let encoder = crate::codec::encoder::aac_encoder::AacEncoder::new(enc_cfg)?;
+
+            // 真实 FFmpeg backend 下这里应当能拿到 ASC；占位实现下会是 None。
+            let asc = encoder.audio_specific_config().ok_or(AudioIOError::Codec(CodecError::Unsupported(
+                "AAC encoder did not provide ASC/extradata (need ffmpeg backend)",
+            )))?;
+
+            let time_base = Rational::new(1, actual.sample_rate as i32);
+            let fifo = AudioFifo::new(actual, time_base).map_err(|_| AudioIOError::Format("failed to create AudioFifo"))?;
+            let frame_samples = encoder.preferred_frame_samples().unwrap_or(1024);
+
+            self.inner = Some(AacAdtsWriterInner {
+                encoder,
+                asc,
+                fifo,
+                frame_samples,
+            });
+        }
+
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or(AudioIOError::Format("AAC-ADTS writer not initialized"))?;
+        let file = &mut self.file;
+
+        inner.fifo
             .push_frame(frame)
             .map_err(|_| AudioIOError::Format("AudioFifo push failed (format mismatch?)"))?;
 
-        while let Some(chunk) = self
-            .fifo
-            .pop_frame(self.frame_samples)
-            .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?
-        {
-            self.encoder.send_frame(Some(&chunk))?;
-            self.drain_packets()?;
+        loop {
+            let next = inner
+                .fifo
+                .pop_frame(inner.frame_samples)
+                .map_err(|_| AudioIOError::Format("AudioFifo pop failed"))?;
+            let Some(chunk) = next else { break };
+            inner.encoder.send_frame(Some(&chunk))?;
+            drain_packets_inner(inner, file)?;
         }
         Ok(())
     }
 
     pub fn finalize(&mut self) -> AudioIOResult<()> {
         use crate::codec::encoder::encoder_interface::AudioEncoder;
+        let Some(inner) = self.inner.as_mut() else {
+            // 从未写入过有效帧：空文件直接结束
+            return Ok(());
+        };
+        let file = &mut self.file;
 
         // FIFO 剩余样本作为“最后一帧”（允许 < frame_samples）送入
-        let remain = self.fifo.available_samples();
+        let remain = inner.fifo.available_samples();
         if remain > 0 {
-            if let Some(last) = self
+            if let Some(last) = inner
                 .fifo
                 .pop_frame(remain)
                 .map_err(|_| AudioIOError::Format("AudioFifo pop last failed"))?
             {
-                self.encoder.send_frame(Some(&last))?;
-                self.drain_packets()?;
+                inner.encoder.send_frame(Some(&last))?;
+                drain_packets_inner(inner, file)?;
             }
         }
 
-        self.encoder.send_frame(None)?;
+        inner.encoder.send_frame(None)?;
         loop {
-            match self.encoder.receive_packet() {
-                Ok(pkt) => self.write_one_packet(&pkt)?,
+            match inner.encoder.receive_packet() {
+                Ok(pkt) => write_one_packet_inner(&inner.asc, file, &pkt)?,
                 Err(CodecError::Again) => continue,
                 Err(CodecError::Eof) => break,
                 Err(e) => return Err(e.into()),
@@ -203,24 +228,25 @@ impl AacAdtsWriter {
         Ok(())
     }
 
-    fn drain_packets(&mut self) -> AudioIOResult<()> {
-        use crate::codec::encoder::encoder_interface::AudioEncoder;
-        loop {
-            match self.encoder.receive_packet() {
-                Ok(pkt) => self.write_one_packet(&pkt)?,
-                Err(CodecError::Again) => break,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    }
+}
 
-    fn write_one_packet(&mut self, pkt: &CodecPacket) -> AudioIOResult<()> {
-        let hdr = build_adts_header_from_asc(&self.asc, pkt.data.len()).ok_or(AudioIOError::Format("invalid ASC"))?;
-        self.file.write_all(&hdr)?;
-        self.file.write_all(&pkt.data)?;
-        Ok(())
+fn drain_packets_inner(inner: &mut AacAdtsWriterInner, file: &mut File) -> AudioIOResult<()> {
+    use crate::codec::encoder::encoder_interface::AudioEncoder;
+    loop {
+        match inner.encoder.receive_packet() {
+            Ok(pkt) => write_one_packet_inner(&inner.asc, file, &pkt)?,
+            Err(CodecError::Again) => break,
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
+}
+
+fn write_one_packet_inner(asc: &[u8], file: &mut File, pkt: &CodecPacket) -> AudioIOResult<()> {
+    let hdr = build_adts_header_from_asc(asc, pkt.data.len()).ok_or(AudioIOError::Format("invalid ASC"))?;
+    file.write_all(&hdr)?;
+    file.write_all(&pkt.data)?;
+    Ok(())
 }
 
 impl AudioWriter for AacAdtsWriter {

@@ -1,4 +1,4 @@
-use crate::common::io::io::{AudioReader, AudioWriter, AudioIOResult, AudioIOError};
+use crate::common::io::io::{AudioReader, AudioWriter, AudioIOError, AudioIOResult};
 use crate::common::audio::audio::{AudioFormat, AudioFrame, AudioFrameView, ChannelLayout, Rational, SampleFormat};
 use crate::codec::encoder::wav_encoder::WavEncoderConfig;
 use std::fs::File;
@@ -25,14 +25,18 @@ impl WavWriterConfig {
     /// 默认行为：写出 PCM16LE（与旧实现一致）。
     pub fn pcm16le(input_format: AudioFormat) -> Self {
         Self {
-            encoder: WavEncoderConfig { input_format },
+            encoder: WavEncoderConfig {
+                input_format: Some(input_format),
+            },
             output_format: WavOutputSampleFormat::Pcm16Le,
         }
     }
 
     pub fn f32le(input_format: AudioFormat) -> Self {
         Self {
-            encoder: WavEncoderConfig { input_format },
+            encoder: WavEncoderConfig {
+                input_format: Some(input_format),
+            },
             output_format: WavOutputSampleFormat::Float32Le,
         }
     }
@@ -71,15 +75,24 @@ pub struct WavWriter {
     cfg: WavWriterConfig,
     data_bytes: u32,
     header_written: bool,
+    expected_sample_rate: Option<u32>,
+    expected_channels: Option<u16>,
 }
 
 impl WavWriter {
     pub fn create<P: AsRef<Path>>(path: P, cfg: WavWriterConfig) -> AudioIOResult<Self> {
+        let (sr, ch) = cfg
+            .encoder
+            .input_format
+            .map(|f| (Some(f.sample_rate), Some(f.channels())))
+            .unwrap_or((None, None));
         Ok(Self {
             w: BufWriter::new(File::create(path)?),
             cfg,
             data_bytes: 0,
             header_written: false,
+            expected_sample_rate: sr,
+            expected_channels: ch,
         })
     }
 
@@ -100,11 +113,13 @@ impl WavWriter {
             WavOutputSampleFormat::Float32Le => (3u16, 32u16),
         };
         write_u16_le(&mut self.w, audio_format)?;
-        write_u16_le(&mut self.w, self.cfg.encoder.input_format.channels())?;
-        write_u32_le(&mut self.w, self.cfg.encoder.input_format.sample_rate)?;
+        let ch = self.expected_channels.ok_or(AudioIOError::Format("WAV writer missing channels"))?;
+        let sr = self.expected_sample_rate.ok_or(AudioIOError::Format("WAV writer missing sample_rate"))?;
+        write_u16_le(&mut self.w, ch)?;
+        write_u32_le(&mut self.w, sr)?;
 
-        let block_align = self.cfg.encoder.input_format.channels() * (bits_per_sample / 8);
-        let byte_rate = self.cfg.encoder.input_format.sample_rate * (block_align as u32);
+        let block_align = ch * (bits_per_sample / 8);
+        let byte_rate = sr * (block_align as u32);
         write_u32_le(&mut self.w, byte_rate)?;
         write_u16_le(&mut self.w, block_align)?;
         write_u16_le(&mut self.w, bits_per_sample)?;
@@ -134,17 +149,30 @@ impl WavWriter {
 
 impl AudioWriter for WavWriter {
     fn write_frame(&mut self, frame: &dyn AudioFrameView) -> AudioIOResult<()> {
-        self.write_header()?;
         let fmt = frame.format();
         let ch = fmt.channels() as usize;
         if ch == 0 {
             return Err(AudioIOError::Format("channels=0"));
         }
-        if fmt.sample_rate != self.cfg.encoder.input_format.sample_rate
-            || fmt.channels() != self.cfg.encoder.input_format.channels()
-        {
-            return Err(AudioIOError::Format("WAV writer expects fixed sample_rate/channels (no resample layer yet)"));
+        if frame.nb_samples() == 0 {
+            // 空帧不锁定格式
+            return Ok(());
         }
+
+        // 首帧推断/锁定 sample_rate/channels
+        if self.expected_sample_rate.is_none() {
+            self.expected_sample_rate = Some(fmt.sample_rate);
+        }
+        if self.expected_channels.is_none() {
+            self.expected_channels = Some(fmt.channels());
+        }
+        if Some(fmt.sample_rate) != self.expected_sample_rate || Some(fmt.channels()) != self.expected_channels {
+            return Err(AudioIOError::Format(
+                "WAV writer expects fixed sample_rate/channels (no resample layer yet)",
+            ));
+        }
+
+        self.write_header()?;
 
         let ns = frame.nb_samples();
         match self.cfg.output_format {
@@ -250,6 +278,10 @@ impl AudioWriter for WavWriter {
     }
 
     fn finalize(&mut self) -> AudioIOResult<()> {
+        if !self.header_written {
+            // 从未写入过任何有效帧：不产生 WAV 头，保持空文件
+            return Ok(());
+        }
         self.w.flush()?;
 
         // 回写 RIFF/data size
