@@ -1233,7 +1233,8 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                 <ul>
                   <li><b>push(nb: NodeBuffer)</b></li>
                   <li><b>pull() -&gt; Optional[NodeBuffer]</b></li>
-                  <li><b>flush()</b>（可选）</li>
+                  <li><b>flush()</b></li>
+                  <li><b>reset()</b></li>
                 </ul>
                 <h3>控制流异常</h3>
                 <ul>
@@ -1250,10 +1251,20 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                   <li><b>push(buf=None)</b>：推入一帧输入。</li>
                   <li><b>try_get()</b>：非阻塞取输出。</li>
                   <li><b>get()</b>：阻塞等待输出或 EOF（内部会释放 GIL）。</li>
+                  <li><b>reset(force=False)</b>：重置 pipeline（从起点向终点 reset，直到完成）。</li>
                 </ul>
                 <h3>push 参数说明</h3>
                 <ul>
                   <li><b>buf</b>：<code>NodeBuffer</code> 或 None。None 等价于 flush（输入结束）。buf.kind 必须与 pipeline input_kind 匹配。</li>
+                </ul>
+                <h3>reset 参数说明</h3>
+                <ul>
+                  <li><b>force</b>：
+                    <ul>
+                      <li><code>False</code>：如果 Node 内有尚未结束的处理 flow，不会强制停止；会等待其处理到边界后再 reset。</li>
+                      <li><code>True</code>：强制 reset（丢弃内部缓存/残留）。</li>
+                    </ul>
+                  </li>
                 </ul>
               </section>
 

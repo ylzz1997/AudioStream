@@ -22,6 +22,9 @@ pub trait DynNode: Send {
     /// - `Err(Again)`: 暂无输出，需要更多输入或继续驱动
     /// - `Err(Eof)`: flush 后已无更多输出
     fn pull(&mut self) -> CodecResult<NodeBuffer>;
+    fn reset(&mut self) -> CodecResult<()> {
+        Ok(())
+    }
 }
 
 pub struct ProcessorNode<P: AudioProcessor> {
@@ -57,6 +60,10 @@ impl<P: AudioProcessor> DynNode for ProcessorNode<P> {
 
     fn pull(&mut self) -> CodecResult<NodeBuffer> {
         self.p.receive_frame().map(NodeBuffer::Pcm)
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.p.reset()
     }
 }
 
@@ -102,6 +109,12 @@ impl DynNode for IdentityNode {
         }
         Err(CodecError::Again)
     }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.q.clear();
+        self.flushed = false;
+        Ok(())
+    }
 }
 
 pub struct EncoderNode<E: AudioEncoder> {
@@ -138,6 +151,10 @@ impl<E: AudioEncoder> DynNode for EncoderNode<E> {
     fn pull(&mut self) -> CodecResult<NodeBuffer> {
         self.e.receive_packet().map(NodeBuffer::Packet)
     }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.e.reset()
+    }
 }
 
 pub struct DecoderNode<D: AudioDecoder> {
@@ -173,6 +190,10 @@ impl<D: AudioDecoder> DynNode for DecoderNode<D> {
 
     fn pull(&mut self) -> CodecResult<NodeBuffer> {
         self.d.receive_frame().map(NodeBuffer::Pcm)
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.d.reset()
     }
 }
 
@@ -254,5 +275,30 @@ impl DynPipeline {
             }
         }
         Ok(outs)
+    }
+
+    /// 重置整条 pipeline。
+    ///
+    /// - `force=false`：先尽可能把当前链路“跑完”（flush + drain），再 reset（不强行打断节点正在处理的 flow）
+    /// - `force=true`：直接 reset（丢弃内部缓存/残留）
+    ///
+    /// reset 顺序：从起点到终点。
+    pub fn reset(&mut self, force: bool) -> CodecResult<()> {
+        if !force {
+            // 尝试 flush，并把残留尽可能跑到末端（输出直接丢弃）
+            let _ = self.push_and_drain(None);
+            loop {
+                let outs = self.drain_all()?;
+                if outs.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        for n in self.nodes.iter_mut() {
+            n.reset()?;
+        }
+        self.done.fill(false);
+        Ok(())
     }
 }

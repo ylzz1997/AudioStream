@@ -396,6 +396,24 @@ impl DynNode for PyCallbackNode {
             Ok(inner)
         })
     }
+
+    fn reset(&mut self) -> crate::codec::error::CodecResult<()> {
+        Python::with_gil(|py| {
+            self.flushed = false;
+            let o = self.obj.bind(py);
+            // reset() 是可选的；不存在则忽略
+            match o.call_method0("reset") {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if e.is_instance_of::<PyAttributeError>(py) {
+                        Ok(())
+                    } else {
+                        Err(pyerr_to_codec_err(e))
+                    }
+                }
+            }
+        })
+    }
 }
 
 /// python 侧的 Node 基类
@@ -547,6 +565,20 @@ impl AsyncDynPipelinePy {
             Err(CodecError::Eof) => Ok(None),
             Err(e) => Err(map_codec_err(e)),
         }
+    }
+
+    /// reset：从起点向终点 reset，直到完成。
+    ///
+    /// - force=false：不强制打断正在处理的 flow（等它处理到边界后再 reset）
+    /// - force=true：强制 reset（丢弃内部缓存/残留）
+    #[pyo3(signature = (force=false))]
+    fn reset(&mut self, py: Python<'_>, force: bool) -> PyResult<()> {
+        let fut = self.p.reset(force);
+        let res = py.allow_threads(|| {
+            let _guard = self.rt.enter();
+            self.rt.block_on(fut)
+        });
+        res.map_err(map_codec_err)
     }
 }
 

@@ -6,9 +6,10 @@
 
 use crate::codec::packet::CodecPacket;
 use crate::common::audio::audio::AudioFrame;
-use crate::codec::error::CodecResult;
+use crate::codec::error::{CodecError, CodecResult};
 use async_trait::async_trait;
 use std::collections::VecDeque;
+use tokio::sync::oneshot;
 
 /// node 之间传递的数据类型（运行时版 pipeline 用）。
 #[derive(Debug)]
@@ -68,6 +69,20 @@ pub trait AsyncPipelineConsumer: Send {
     type Out: Send + 'static;
     fn try_get_frame(&mut self) -> CodecResult<Self::Out>;
     async fn get_frame(&mut self) -> CodecResult<Self::Out>;
+}
+
+/// tokio 后台 pipeline 内部消息（用于 async_* pipeline）。
+///
+/// - `Data(Ok(Some(v)))`：一条数据
+/// - `Data(Ok(None))`：flush（输入结束）
+/// - `Data(Err(e))`：错误（会沿链路传递到末端）
+/// - `Reset{...}`：重置（沿链路从起点到终点传播，最后一段通过 ack 通知完成）
+pub enum AsyncPipelineMsg<T> {
+    Data(Result<Option<T>, CodecError>),
+    Reset {
+        force: bool,
+        ack: Option<oneshot::Sender<Result<(), CodecError>>>,
+    },
 }
 
 

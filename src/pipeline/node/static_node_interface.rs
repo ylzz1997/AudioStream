@@ -16,6 +16,9 @@ pub trait StaticNode {
     fn name(&self) -> &'static str;
     fn push(&mut self, input: Option<Self::In>) -> CodecResult<()>;
     fn pull(&mut self) -> CodecResult<Self::Out>;
+    fn reset(&mut self) -> CodecResult<()> {
+        Ok(())
+    }
 }
 
 pub struct ProcessorStaticNode<P: AudioProcessor> {
@@ -45,6 +48,10 @@ impl<P: AudioProcessor> StaticNode for ProcessorStaticNode<P> {
 
     fn pull(&mut self) -> CodecResult<Self::Out> {
         self.p.receive_frame()
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.p.reset()
     }
 }
 
@@ -76,6 +83,10 @@ impl<E: AudioEncoder> StaticNode for EncoderStaticNode<E> {
     fn pull(&mut self) -> CodecResult<Self::Out> {
         self.e.receive_packet()
     }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.e.reset()
+    }
 }
 
 pub struct DecoderStaticNode<D: AudioDecoder> {
@@ -102,6 +113,10 @@ impl<D: AudioDecoder> StaticNode for DecoderStaticNode<D> {
 
     fn pull(&mut self) -> CodecResult<Self::Out> {
         self.d.receive_frame()
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.d.reset()
     }
 }
 
@@ -162,6 +177,12 @@ impl<T> StaticNode for IdentityStaticNode<T> {
             return Err(CodecError::Eof);
         }
         Err(CodecError::Again)
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.q.clear();
+        self.flushed = false;
+        Ok(())
     }
 }
 
@@ -242,6 +263,31 @@ where
             }
         }
         Ok(outs)
+    }
+
+    /// 重置整条 pipeline。
+    ///
+    /// - `force=false`：先尽可能把当前链路“跑完”（flush + drain），再 reset（不强行打断节点正在处理的 flow）
+    /// - `force=true`：直接 reset（丢弃内部缓存/残留）
+    ///
+    /// reset 顺序：从起点到终点。
+    pub fn reset(&mut self, force: bool) -> CodecResult<()> {
+        if !force {
+            let _ = self.push_and_drain(None);
+            loop {
+                let outs = self.drain_all()?;
+                if outs.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        self.n1.reset()?;
+        self.n2.reset()?;
+        self.n3.reset()?;
+        self.done1 = false;
+        self.done2 = false;
+        Ok(())
     }
 }
 

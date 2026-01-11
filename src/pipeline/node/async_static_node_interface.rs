@@ -2,11 +2,14 @@
 
 use crate::codec::error::{CodecError, CodecResult};
 use crate::pipeline::node::static_node_interface::StaticNode;
-use crate::pipeline::node::node_interface::{AsyncPipeline, AsyncPipelineConsumer, AsyncPipelineProducer, AsyncPipelineEndpoint};
+use crate::pipeline::node::node_interface::{
+    AsyncPipeline, AsyncPipelineConsumer, AsyncPipelineEndpoint, AsyncPipelineMsg, AsyncPipelineProducer,
+};
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use async_trait::async_trait;
 
-type Msg<T> = Result<Option<T>, CodecError>;
+type Msg<T> = AsyncPipelineMsg<T>;
 
 fn drain_typed<N, TOut>(node: &mut N, tx_next: &mpsc::UnboundedSender<Msg<TOut>>) -> Result<(), CodecError>
 where
@@ -16,12 +19,12 @@ where
     loop {
         match node.pull() {
             Ok(v) => {
-                let _ = tx_next.send(Ok(Some(v)));
+                let _ = tx_next.send(Msg::Data(Ok(Some(v))));
             }
             Err(CodecError::Again) => return Ok(()),
             Err(CodecError::Eof) => return Ok(()),
             Err(e) => {
-                let _ = tx_next.send(Err(e.clone()));
+                let _ = tx_next.send(Msg::Data(Err(e.clone())));
                 return Err(e);
             }
         }
@@ -40,32 +43,43 @@ fn spawn_stage<N, TIn, TOut>(
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                Err(e) => {
-                    let _ = tx_next.send(Err(e));
+                Msg::Data(Err(e)) => {
+                    let _ = tx_next.send(Msg::Data(Err(e)));
                     break;
                 }
-                Ok(None) => {
+                Msg::Data(Ok(None)) => {
                     let _ = node.push(None);
                     let _ = drain_typed(&mut node, &tx_next);
-                    let _ = tx_next.send(Ok(None));
-                    break;
+                    let _ = tx_next.send(Msg::Data(Ok(None)));
                 }
-                Ok(Some(v)) => match node.push(Some(v)) {
+                Msg::Data(Ok(Some(v))) => match node.push(Some(v)) {
                     Ok(()) | Err(CodecError::Again) => {
                         let _ = drain_typed(&mut node, &tx_next);
                     }
                     Err(CodecError::Eof) => {
-                        let _ = tx_next.send(Ok(None));
-                        break;
+                        let _ = tx_next.send(Msg::Data(Ok(None)));
                     }
                     Err(e) => {
-                        let _ = tx_next.send(Err(e));
+                        let _ = tx_next.send(Msg::Data(Err(e)));
                         break;
                     }
                 },
+                Msg::Reset { force, ack } => {
+                    if !force {
+                        let _ = drain_typed(&mut node, &tx_next);
+                    }
+                    if let Err(e) = node.reset() {
+                        let _ = tx_next.send(Msg::Data(Err(e.clone())));
+                        if let Some(tx) = ack {
+                            let _ = tx.send(Err(e));
+                        }
+                        break;
+                    }
+                    let _ = tx_next.send(Msg::Reset { force, ack });
+                }
             }
         }
-        let _ = tx_next.send(Ok(None));
+        let _ = tx_next.send(Msg::Data(Ok(None)));
     });
 }
 
@@ -81,11 +95,11 @@ fn spawn_last_stage<N, TIn, TOut>(
     tokio::task::spawn_blocking(move || {
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                Err(e) => {
+                Msg::Data(Err(e)) => {
                     let _ = out_tx.send(Err(e));
                     return;
                 }
-                Ok(None) => {
+                Msg::Data(Ok(None)) => {
                     let _ = node.push(None);
                     loop {
                         match node.pull() {
@@ -95,16 +109,16 @@ fn spawn_last_stage<N, TIn, TOut>(
                             Err(CodecError::Again) => continue,
                             Err(CodecError::Eof) => {
                                 let _ = out_tx.send(Err(CodecError::Eof));
-                                return;
+                                break;
                             }
                             Err(e) => {
                                 let _ = out_tx.send(Err(e));
-                                return;
+                                break;
                             }
                         }
                     }
                 }
-                Ok(Some(v)) => match node.push(Some(v)) {
+                Msg::Data(Ok(Some(v))) => match node.push(Some(v)) {
                     Ok(()) | Err(CodecError::Again) => {
                         loop {
                             match node.pull() {
@@ -114,7 +128,7 @@ fn spawn_last_stage<N, TIn, TOut>(
                                 Err(CodecError::Again) => break,
                                 Err(CodecError::Eof) => {
                                     let _ = out_tx.send(Err(CodecError::Eof));
-                                    return;
+                                    break;
                                 }
                                 Err(e) => {
                                     let _ = out_tx.send(Err(e));
@@ -125,13 +139,39 @@ fn spawn_last_stage<N, TIn, TOut>(
                     }
                     Err(CodecError::Eof) => {
                         let _ = out_tx.send(Err(CodecError::Eof));
-                        return;
                     }
                     Err(e) => {
                         let _ = out_tx.send(Err(e));
                         return;
                     }
                 },
+                Msg::Reset { force, mut ack } => {
+                    if !force {
+                        loop {
+                            match node.pull() {
+                                Ok(v) => {
+                                    let _ = out_tx.send(Ok(v));
+                                }
+                                Err(CodecError::Again) | Err(CodecError::Eof) => break,
+                                Err(e) => {
+                                    let _ = out_tx.send(Err(e.clone()));
+                                    if let Some(tx) = ack.take() {
+                                        let _ = tx.send(Err(e));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    let res = node.reset();
+                    if let Err(e) = &res {
+                        let _ = out_tx.send(Err(e.clone()));
+                    }
+                    if let Some(tx) = ack.take() {
+                        let _ = tx.send(res);
+                    }
+                }
             }
         }
         // 上游断开：视为结束
@@ -169,13 +209,13 @@ where
 {
     pub fn push_frame(&self, input: TIn) -> CodecResult<()> {
         self.tx
-            .send(Ok(Some(input)))
+            .send(Msg::Data(Ok(Some(input))))
             .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
     }
 
     pub fn flush(&self) -> CodecResult<()> {
         self.tx
-            .send(Ok(None))
+            .send(Msg::Data(Ok(None)))
             .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
     }
 }
@@ -263,6 +303,22 @@ where
             AsyncPipeline3Consumer { rx: self.out_rx },
         )
     }
+
+    /// reset：从起点向终点传播，直到最后一段完成。
+    ///
+    /// - `force=false`：不强行打断节点正在处理的 flow（按顺序等它“处理到当前边界”后再 reset）
+    /// - `force=true`：强制 reset（节点可丢弃内部缓存/残留）
+    pub async fn reset(&self, force: bool) -> CodecResult<()> {
+        let (tx, rx) = oneshot::channel::<Result<(), CodecError>>();
+        self.in_tx
+            .send(Msg::Reset { force, ack: Some(tx) })
+            .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(CodecError::InvalidState("tokio pipeline reset ack dropped")),
+        }
+    }
 }
 
 
@@ -282,13 +338,13 @@ where
 
     fn push_frame(&self, input: Self::In) -> CodecResult<()> {
         self.in_tx
-            .send(Ok(Some(input)))
+            .send(Msg::Data(Ok(Some(input))))
             .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
     }
 
     fn flush(&self) -> CodecResult<()> {
         self.in_tx
-            .send(Ok(None))
+            .send(Msg::Data(Ok(None)))
             .map_err(|_| CodecError::InvalidState("tokio pipeline input channel closed"))
     }
 
