@@ -822,12 +822,22 @@ if out is not None:
                 </ul>
                 <h3>方法</h3>
                 <ul>
-                  <li><b>put_frame(pcm)</b></li>
+                  <li><b>put_frame(pcm, pts=None, format=None)</b></li>
                   <li><b>get_frame(force=False) -&gt; Optional[bytes]</b></li>
                   <li><b>get_packet(force=False) -&gt; Optional[Packet]</b></li>
                   <li><b>reset()</b></li>
                   <li><b>pending_samples() -&gt; int</b></li>
                   <li><b>state() -&gt; str</b></li>
+                </ul>
+                <h3>参数说明</h3>
+                <ul>
+                  <li><b>put_frame.pcm</b>：2D numpy。planar=True 时 shape=(channels, samples)；planar=False 时 shape=(samples, channels)。dtype 需与 format.sample_type 对齐。</li>
+                  <li><b>put_frame.pts</b>：可选时间戳（int）。单位由 time_base 决定；Encoder 侧一般按“samples/每声道”推进。</li>
+                  <li><b>put_frame.format</b>：可选 <code>AudioFormat</code>。当你用 <code>*EncoderConfig(input_format=None)</code> 构造时，第一次 <code>put_frame</code> 必须传入，用于首帧推断并锁定格式。</li>
+                  <li><b>get_frame.force</b>：是否强制 flush 尾巴。False：不足一个 chunk 默认不返回；True：会尝试把最后不足 chunk 的残留也编码输出（若 codec 支持）。</li>
+                  <li><b>get_packet.force</b>：同上（但返回 <code>Packet</code>）。</li>
+                  <li><b>pending_samples()</b>：当前 FIFO 内累计的样本数（每声道）。</li>
+                  <li><b>state()</b>：返回 <code>"ready"</code>/<code>"need_more"</code>/<code>"empty"</code>，用于快速判断是否可取输出。</li>
                 </ul>
                 <h3>属性（只读）</h3>
                 <ul>
@@ -841,24 +851,53 @@ if out is not None:
               </section>
 
               <section class="section">
-                <h2>*EncoderConfig</h2>
-                <h3>WavEncoderConfig</h3>
-                <pre><code class="language-python">ast.WavEncoderConfig(input_format: AudioFormat, chunk_samples: int)</code></pre>
-                <h3>Mp3EncoderConfig</h3>
-                <pre><code class="language-python">ast.Mp3EncoderConfig(input_format: AudioFormat, chunk_samples: int, bitrate: Optional[int] = 128_000)</code></pre>
-                <h3>AacEncoderConfig</h3>
-                <pre><code class="language-python">ast.AacEncoderConfig(input_format: AudioFormat, chunk_samples: int, bitrate: Optional[int] = None)</code></pre>
-                <h3>OpusEncoderConfig</h3>
-                <pre><code class="language-python">ast.OpusEncoderConfig(input_format: AudioFormat, chunk_samples: int, bitrate: Optional[int] = 96_000)</code></pre>
-                <h3>FlacEncoderConfig</h3>
-                <pre><code class="language-python">ast.FlacEncoderConfig(input_format: AudioFormat, chunk_samples: int, compression_level: Optional[int] = None)</code></pre>
+                <h2>make_encoder_node</h2>
+                <pre><code class="language-python">ast.make_encoder_node(codec: str, config: Any) -&gt; DynNode</code></pre>
+                <ul>
+                  <li><b>codec</b>：同 <code>ast.Encoder</code> 的 codec。</li>
+                  <li><b>config</b>：对应的 *EncoderConfig。注意：此处 config 内 <code>chunk_samples</code> 会被忽略（由上游分帧决定）。</li>
+                </ul>
+                <p><b>注意</b>：config 内 <code>chunk_samples</code> 在这里会被忽略（由上游分帧决定）。</p>
+                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
               </section>
 
               <section class="section">
-                <h2>make_encoder_node</h2>
-                <pre><code class="language-python">ast.make_encoder_node(codec: str, config: Any) -&gt; DynNode</code></pre>
-                <p><b>注意</b>：config 内 <code>chunk_samples</code> 在这里会被忽略（由上游分帧决定）。</p>
-                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
+                <h2>*EncoderConfig</h2>
+                <h3>WavEncoderConfig</h3>
+                <pre><code class="language-python">ast.WavEncoderConfig(input_format: Optional[AudioFormat] = None, chunk_samples: int = 1024)</code></pre>
+                <ul>
+                  <li><b>input_format</b>：输入 PCM 格式。None 表示首帧推断（此时第一次 put_frame 必须提供 format）。</li>
+                  <li><b>chunk_samples</b>：每次编码的 samples/每声道；仅用于面向对象 Encoder（make_encoder_node 会忽略）。</li>
+                </ul>
+                <h3>Mp3EncoderConfig</h3>
+                <pre><code class="language-python">ast.Mp3EncoderConfig(input_format: Optional[AudioFormat] = None, chunk_samples: int = 1152, bitrate: Optional[int] = 128_000)</code></pre>
+                <ul>
+                  <li><b>input_format</b>：同上（None=首帧推断）。</li>
+                  <li><b>chunk_samples</b>：MP3 常见 1152。</li>
+                  <li><b>bitrate</b>：目标码率（bps）。</li>
+                </ul>
+                <h3>AacEncoderConfig</h3>
+                <pre><code class="language-python">ast.AacEncoderConfig(input_format: Optional[AudioFormat] = None, chunk_samples: int = 1024, bitrate: Optional[int] = None)</code></pre>
+                <ul>
+                  <li><b>input_format</b>：同上（None=首帧推断）。</li>
+                  <li><b>chunk_samples</b>：AAC-LC 常见 1024。</li>
+                  <li><b>bitrate</b>：目标码率（bps）。None 表示使用默认策略。</li>
+                </ul>
+                <h3>OpusEncoderConfig</h3>
+                <pre><code class="language-python">ast.OpusEncoderConfig(input_format: Optional[AudioFormat] = None, chunk_samples: int = 960, bitrate: Optional[int] = 96_000)</code></pre>
+                <ul>
+                  <li><b>input_format</b>：同上（None=首帧推断）。</li>
+                  <li><b>chunk_samples</b>：常用 20ms@48k =&gt; 960。</li>
+                  <li><b>bitrate</b>：目标码率（bps）。</li>
+                  <li><b>约束</b>：Opus encoder 目前要求 48kHz 输入；如需 44.1kHz 等，请先重采样。</li>
+                </ul>
+                <h3>FlacEncoderConfig</h3>
+                <pre><code class="language-python">ast.FlacEncoderConfig(input_format: Optional[AudioFormat] = None, chunk_samples: int = 4096, compression_level: Optional[int] = None)</code></pre>
+                <ul>
+                  <li><b>input_format</b>：同上（None=首帧推断）。</li>
+                  <li><b>chunk_samples</b>：用于内部重分帧（FLAC 本身支持可变帧长）。</li>
+                  <li><b>compression_level</b>：压缩等级（常见 0..=12；越大越慢/更小）。</li>
+                </ul>
               </section>
             `,
           },
@@ -888,6 +927,16 @@ if out is not None:
                   <li><b>state()</b></li>
                   <li><b>output_format()</b></li>
                 </ul>
+                <h3>参数说明</h3>
+                <ul>
+                  <li><b>Decoder(codec, config).codec</b>：<code>"wav"|"mp3"|"aac"|"opus"|"flac"</code>。</li>
+                  <li><b>Decoder(codec, config).config</b>：对应的 *DecoderConfig。</li>
+                  <li><b>put_frame.frame</b>：一段编码数据（bytes）。适合你自己做“按帧切分”的场景。</li>
+                  <li><b>put_packet.pkt</b>：<code>Packet</code>（带 time_base/pts/duration 等元数据）。</li>
+                  <li><b>get_frame.force</b>：是否强制 flush 尾巴。通常用于输入结束时把残留全部吐出。</li>
+                  <li><b>get_frame.layout</b>：输出 numpy 布局：<code>"planar"</code>=&gt;(channels,samples)，<code>"interleaved"</code>=&gt;(samples,channels)。</li>
+                  <li><b>get_frame_info(...)</b>：比 get_frame 多返回 pts 与 time_base，用于你自己做时间戳同步。</li>
+                </ul>
                 <h3>Notes</h3>
                 <ul>
                   <li><b>layout</b>：支持 <code>planar</code>/<code>interleaved</code> 输出。</li>
@@ -895,26 +944,52 @@ if out is not None:
               </section>
 
               <section class="section">
+                <h2>make_decoder_node</h2>
+                <pre><code class="language-python">ast.make_decoder_node(codec: str, config: Any) -&gt; DynNode</code></pre>
+                <ul>
+                  <li><b>codec</b>：同 <code>ast.Decoder</code> 的 codec。</li>
+                  <li><b>config</b>：对应的 *DecoderConfig。注意：此处 config 内 <code>chunk_samples</code> 会被忽略（由下游取帧决定）。</li>
+                </ul>
+                <p><b>注意</b>：config 内 <code>chunk_samples</code> 在这里会被忽略（由下游取帧决定）。</p>
+                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
+              </section>
+              
+              <section class="section">
                 <h2>*DecoderConfig</h2>
                 <h3>WavDecoderConfig</h3>
                 <pre><code class="language-python">ast.WavDecoderConfig(output_format: AudioFormat, chunk_samples: int)</code></pre>
                 <p><b>约束</b>：WAV/PCM 的 <code>output_format.planar</code> 必须为 False。</p>
+                <ul>
+                  <li><b>output_format</b>：解码输出 PCM 的格式（采样率/通道数/类型/布局）。</li>
+                  <li><b>chunk_samples</b>：每次 get_frame 返回的 samples/每声道。</li>
+                </ul>
                 <h3>Mp3DecoderConfig</h3>
                 <pre><code class="language-python">ast.Mp3DecoderConfig(chunk_samples: int, packet_time_base_den: int = 48000)</code></pre>
+                <ul>
+                  <li><b>chunk_samples</b>：每次 get_frame 返回的 samples/每声道。</li>
+                  <li><b>packet_time_base_den</b>：输入 packet 的 time_base 分母（time_base = 1/den）。如果你的 packet 以 samples 为单位，通常用采样率。</li>
+                </ul>
                 <h3>AacDecoderConfig</h3>
                 <pre><code class="language-python">ast.AacDecoderConfig(chunk_samples: int, packet_time_base_den: int = 48000)</code></pre>
+                <ul>
+                  <li><b>chunk_samples</b>：每次 get_frame 返回的 samples/每声道。</li>
+                  <li><b>packet_time_base_den</b>：同上。</li>
+                </ul>
                 <h3>OpusDecoderConfig</h3>
                 <pre><code class="language-python">ast.OpusDecoderConfig(chunk_samples: int, packet_time_base_den: int = 48000, extradata: Optional[bytes] = None)</code></pre>
+                <ul>
+                  <li><b>chunk_samples</b>：每次 get_frame 返回的 samples/每声道。</li>
+                  <li><b>packet_time_base_den</b>：同上。Opus 常用 48000（samples）。</li>
+                  <li><b>extradata</b>：可选 OpusHead 等头信息；某些输入流需要它来获知声道数等。</li>
+                </ul>
                 <h3>FlacDecoderConfig</h3>
                 <pre><code class="language-python">ast.FlacDecoderConfig(chunk_samples: int, packet_time_base_den: int = 48000)</code></pre>
+                <ul>
+                  <li><b>chunk_samples</b>：每次 get_frame 返回的 samples/每声道。</li>
+                  <li><b>packet_time_base_den</b>：同上。</li>
+                </ul>
               </section>
 
-              <section class="section">
-                <h2>make_decoder_node</h2>
-                <pre><code class="language-python">ast.make_decoder_node(codec: str, config: Any) -&gt; DynNode</code></pre>
-                <p><b>注意</b>：config 内 <code>chunk_samples</code> 在这里会被忽略（由下游取帧决定）。</p>
-                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
-              </section>
             `,
           },
 
@@ -926,16 +1001,13 @@ if out is not None:
               <div class="hero">
                 <div class="hero__kicker">API · 处理</div>
                 <h1 class="hero__title">Processor</h1>
-                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / compressor；也支持创建 pipeline 节点。</p>
+                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / compressor；也支持创建 pipeline 节点。推荐使用make_processor_node创建节点，不推荐直接构造Processor对象。</p>
               </div>
 
               <section class="section">
-                <h2>Processor（面向对象）</h2>
-                <pre><code class="language-python">ast.Processor.identity(format=None)
-ast.Processor.resample(in_format: Optional[AudioFormat], out_format: AudioFormat, out_chunk_samples: Optional[int]=None, pad_final: bool=True)
-ast.Processor.gain(format: Optional[AudioFormat]=None, gain: float=1.0)
-ast.Processor.compressor(format: Optional[AudioFormat], sample_rate: float, threshold_db: float, knee_width_db: float, ratio: float, expansion_ratio: float, expansion_threshold_db: float, attack_time: float, release_time: float, master_gain_db: float)</code></pre>
-                <h3>方法</h3>
+                <h2>Processor（通用）</h2>
+                <p>Processor 用于 <b>PCM -&gt; PCM</b> 处理。你可以用下面 4 个构造函数创建不同处理器。</p>
+                <h3>通用方法</h3>
                 <ul>
                   <li><b>put_frame(pcm, pts=None, format=None)</b>：输入一帧 PCM。若输入格式未知，第一次必须提供 <code>format</code>。</li>
                   <li><b>flush()</b></li>
@@ -943,16 +1015,48 @@ ast.Processor.compressor(format: Optional[AudioFormat], sample_rate: float, thre
                   <li><b>reset()</b></li>
                   <li><b>output_format()</b></li>
                 </ul>
+                <h3>通用方法参数说明</h3>
+                <ul>
+                  <li><b>put_frame.pcm</b>：2D numpy。布局/ dtype 需与 format（或已锁定的输入格式）一致。</li>
+                  <li><b>put_frame.pts</b>：可选时间戳（int）。</li>
+                  <li><b>put_frame.format</b>：可选 <code>AudioFormat</code>。当 Processor 以 format=None 推断模式创建时，第一次 put_frame 必须传入。</li>
+                  <li><b>get_frame.force</b>：是否强制 flush 尾巴（不同 processor 行为可能略有差异）。</li>
+                  <li><b>get_frame.layout</b>：输出 numpy 布局：<code>planar</code>/<code>interleaved</code>。</li>
+                </ul>
               </section>
 
               <section class="section">
+                <h2>make_processor_node</h2>
+                <pre><code class="language-python">ast.make_processor_node(kind: str, config: Any) -&gt; DynNode</code></pre>
+                <p><b>kind</b>：<code>identity</code>/<code>resample</code>/<code>gain</code>/<code>compressor</code></p>
+                <ul>
+                  <li><b>kind</b>：节点类型字符串（见上）。</li>
+                  <li><b>config</b>：对应的 *NodeConfig。</li>
+                </ul>
+                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
+              </section>
+
+                            <section class="section">
                 <h2>*NodeConfig（用于 make_processor_node）</h2>
                 <h3>IdentityNodeConfig</h3>
                 <pre><code class="language-python">ast.IdentityNodeConfig(kind: str)  # "pcm" | "packet"</code></pre>
+                <ul>
+                  <li><b>kind</b>：节点类型：<code>"pcm"</code> 或 <code>"packet"</code>。</li>
+                </ul>
                 <h3>ResampleNodeConfig</h3>
                 <pre><code class="language-python">ast.ResampleNodeConfig(in_format: Optional[AudioFormat], out_format: AudioFormat, out_chunk_samples: Optional[int]=None, pad_final: bool=True)</code></pre>
+                <ul>
+                  <li><b>in_format</b>：输入格式；None=首帧推断。</li>
+                  <li><b>out_format</b>：输出格式（必须给定）。</li>
+                  <li><b>out_chunk_samples</b>：可选输出重分帧长度（samples/每声道）。</li>
+                  <li><b>pad_final</b>：flush 时是否补齐最后一块。</li>
+                </ul>
                 <h3>GainNodeConfig</h3>
                 <pre><code class="language-python">ast.GainNodeConfig(format: Optional[AudioFormat]=None, gain: float=1.0)</code></pre>
+                <ul>
+                  <li><b>format</b>：输入格式；None=首帧推断。</li>
+                  <li><b>gain</b>：线性增益倍率。</li>
+                </ul>
                 <h3>CompressorNodeConfig</h3>
                 <pre><code class="language-python">ast.CompressorNodeConfig(
     format: Optional[AudioFormat],
@@ -966,13 +1070,84 @@ ast.Processor.compressor(format: Optional[AudioFormat], sample_rate: float, thre
     release_time: float=0.10,
     master_gain_db: float=0.0,
 )</code></pre>
+                <ul>
+                  <li><b>format</b>：输入格式；None=首帧推断。</li>
+                  <li><b>sample_rate</b>：采样率（Hz）。None 时通常从 format.sample_rate 推断。</li>
+                  <li><b>threshold_db</b>：压缩阈值（dB）。</li>
+                  <li><b>knee_width_db</b>：knee 宽度（dB）。</li>
+                  <li><b>ratio</b>：压缩比。</li>
+                  <li><b>expansion_ratio</b>：扩展比。</li>
+                  <li><b>expansion_threshold_db</b>：扩展阈值（dB）。</li>
+                  <li><b>attack_time</b>：attack时间（秒）。</li>
+                  <li><b>release_time</b>：release时间（秒）。</li>
+                  <li><b>master_gain_db</b>：总输出增益（dB）。</li>
+                </ul>
               </section>
 
               <section class="section">
-                <h2>make_processor_node</h2>
-                <pre><code class="language-python">ast.make_processor_node(kind: str, config: Any) -&gt; DynNode</code></pre>
-                <p><b>kind</b>：<code>identity</code>/<code>resample</code>/<code>gain</code>/<code>compressor</code></p>
-                <p>相关类型请见：<a href="#python/py-api-pipeline-io">Pipeline / IO</a></p>
+                <h2>构造：identity</h2>
+                <pre><code class="language-python">ast.Processor.identity(format: Optional[AudioFormat] = None)</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>format</b>：可选输入格式。None 表示首帧推断并锁定。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：不做任何处理（透传）。常用于占位/调试/做 “pcm pipeline 的 identity 节点”。</li>
+                </ul>
+              </section>
+
+              <section class="section">
+                <h2>构造：resample</h2>
+                <pre><code class="language-python">ast.Processor.resample(in_format: Optional[AudioFormat], out_format: AudioFormat, out_chunk_samples: Optional[int] = None, pad_final: bool = True)</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>in_format</b>：输入格式；None 表示首帧推断并锁定。</li>
+                  <li><b>out_format</b>：输出格式（必须给定）。</li>
+                  <li><b>out_chunk_samples</b>：可选“输出重分帧”长度（samples/每声道）。例如 Opus 常用 960@48k（20ms）。</li>
+                  <li><b>pad_final</b>：flush 时如果不足 out_chunk_samples，是否补 0 到整块（True 推荐用于严格按帧长编码的下游）。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：重采样/通道与布局转换（以 out_format 为准）。</li>
+                  <li><b>注意</b>：本库不会在其它 Processor 中自动 resample；如果上下游格式不一致，需要显式插入 resample。</li>
+                </ul>
+              </section>
+
+              <section class="section">
+                <h2>构造：gain</h2>
+                <pre><code class="language-python">ast.Processor.gain(format: Optional[AudioFormat] = None, gain: float = 1.0)</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
+                  <li><b>gain</b>：线性增益倍率（1.0=不变）。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：对 PCM 做乘法增益。</li>
+                </ul>
+              </section>
+
+              <section class="section">
+                <h2>构造：compressor</h2>
+                <pre><code class="language-python">ast.Processor.compressor(format: Optional[AudioFormat], sample_rate: float, threshold_db: float, knee_width_db: float, ratio: float, expansion_ratio: float, expansion_threshold_db: float, attack_time: float, release_time: float, master_gain_db: float)</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>format</b>：输入格式（部分版本可传 None 表示首帧推断）。</li>
+                  <li><b>sample_rate</b>：采样率（Hz），用于计算 attack/release 等时间常数（通常应与 format.sample_rate 一致）。</li>
+                  <li><b>threshold_db</b>：阈值（dB）。</li>
+                  <li><b>knee_width_db</b>：knee 宽度（dB）。</li>
+                  <li><b>ratio</b>：压缩比（&gt;=1）。</li>
+                  <li><b>expansion_ratio</b>：扩展比（噪声门/向下扩展；常见 &gt;=1）。</li>
+                  <li><b>expansion_threshold_db</b>：扩展阈值（dB）。</li>
+                  <li><b>attack_time</b>：attack时间（秒）。</li>
+                  <li><b>release_time</b>：release 时间（秒）。</li>
+                  <li><b>master_gain_db</b>：总输出增益（dB）。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：动态范围压缩/扩展。</li>
+                </ul>
               </section>
             `,
           },
@@ -992,16 +1167,38 @@ ast.Processor.compressor(format: Optional[AudioFormat], sample_rate: float, thre
                 <h2>Packet</h2>
                 <pre><code class="language-python">ast.Packet(data, time_base_num=1, time_base_den=48000, pts=None, dts=None, duration=None, flags=0)</code></pre>
                 <p>用于 Decoder 输入、Pipeline 交互、或你自己维护时间戳。</p>
+                <h3>参数说明</h3>
+                <ul>
+                  <li><b>data</b>：packet payload（bytes）。</li>
+                  <li><b>time_base_num/time_base_den</b>：时间基（Rational）。实际 time_base = num/den。</li>
+                  <li><b>pts</b>：可选显示时间戳（int）。单位由 time_base 决定。</li>
+                  <li><b>dts</b>：可选解码时间戳（int）。</li>
+                  <li><b>duration</b>：可选持续时间（int）。单位由 time_base 决定；音频里常用 samples。</li>
+                  <li><b>flags</b>：内部 flags bitmask（u32 透传）。</li>
+                </ul>
               </section>
 
               <section class="section">
                 <h2>NodeBuffer</h2>
                 <pre><code class="language-python">ast.NodeBuffer.pcm(pcm, format: AudioFormat, pts=None, time_base_num=None, time_base_den=None)
 ast.NodeBuffer.packet(pkt: Packet)</code></pre>
+                <h3>参数说明</h3>
                 <ul>
+                  <li><b>NodeBuffer.pcm.pcm</b>：2D numpy。planar=True 时 (channels,samples)，planar=False 时 (samples,channels)。</li>
+                  <li><b>NodeBuffer.pcm.format</b>：该 PCM 的 AudioFormat。</li>
+                  <li><b>NodeBuffer.pcm.pts</b>：可选时间戳（int）。</li>
+                  <li><b>NodeBuffer.pcm.time_base_num/time_base_den</b>：可选时间基。None 时使用默认 time_base（通常是 1/sample_rate）。</li>
+                  <li><b>NodeBuffer.packet.pkt</b>：一个 Packet。</li>
                   <li><b>kind</b>：<code>pcm</code>/<code>packet</code></li>
                   <li><b>as_pcm/as_pcm_with_layout/as_packet/pcm_info</b></li>
                   <li><b>重要</b>：被 Pipeline/Runner 消费后不可复用（move 语义）。</li>
+                </ul>
+                <h3>方法参数说明</h3>
+                <ul>
+                  <li><b>as_pcm()</b>：无参数。返回 numpy（默认 planar）或 None（若不是 pcm）。</li>
+                  <li><b>as_pcm_with_layout(layout)</b>：<b>layout</b> 为 <code>"planar"</code> 或 <code>"interleaved"</code>。</li>
+                  <li><b>as_packet()</b>：无参数。返回 Packet 或 None（若不是 packet）。</li>
+                  <li><b>pcm_info()</b>：无参数。返回 (AudioFormat, pts, (time_base_num,time_base_den)) 或 None。</li>
                 </ul>
               </section>
 
@@ -1017,11 +1214,21 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
               <section class="section">
                 <h2>make_identity_node</h2>
                 <pre><code class="language-python">ast.make_identity_node(kind: str) -&gt; DynNode  # kind: "pcm"|"packet"</code></pre>
+                <ul>
+                  <li><b>kind</b>：<code>"pcm"</code> 或 <code>"packet"</code>。</li>
+                </ul>
               </section>
 
               <section class="section">
                 <h2>make_python_node</h2>
                 <pre><code class="language-python">ast.make_python_node(obj, input_kind: str, output_kind: str, name: str = "py-node") -&gt; DynNode</code></pre>
+                <h3>参数说明</h3>
+                <ul>
+                  <li><b>obj</b>：你的 Python 节点对象。需要实现 <code>push</code>/<code>pull</code>（可选 <code>flush</code>）。</li>
+                  <li><b>input_kind</b>：<code>"pcm"</code> 或 <code>"packet"</code>。</li>
+                  <li><b>output_kind</b>：<code>"pcm"</code> 或 <code>"packet"</code>。</li>
+                  <li><b>name</b>：节点名称（调试/日志用）。</li>
+                </ul>
                 <h3>Python 侧约定</h3>
                 <ul>
                   <li><b>push(nb: NodeBuffer)</b></li>
@@ -1039,9 +1246,14 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                 <h2>AsyncDynPipeline</h2>
                 <pre><code class="language-python">ast.AsyncDynPipeline(nodes: list[DynNode])</code></pre>
                 <ul>
-                  <li><b>push(buf=None)</b>：None 等价于 flush。</li>
+                  <li><b>nodes</b>：DynNode 列表。会被 move，不能复用。</li>
+                  <li><b>push(buf=None)</b>：推入一帧输入。</li>
                   <li><b>try_get()</b>：非阻塞取输出。</li>
                   <li><b>get()</b>：阻塞等待输出或 EOF（内部会释放 GIL）。</li>
+                </ul>
+                <h3>push 参数说明</h3>
+                <ul>
+                  <li><b>buf</b>：<code>NodeBuffer</code> 或 None。None 等价于 flush（输入结束）。buf.kind 必须与 pipeline input_kind 匹配。</li>
                 </ul>
               </section>
 
@@ -1049,6 +1261,9 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                 <h2>AsyncDynRunner</h2>
                 <pre><code class="language-python">ast.AsyncDynRunner(source, nodes: list[DynNode], sink)</code></pre>
                 <ul>
+                  <li><b>source</b>：实现 <code>pull()</code> 的对象（返回 NodeBuffer 或 None）。</li>
+                  <li><b>nodes</b>：DynNode 列表（会被 move）。</li>
+                  <li><b>sink</b>：实现 <code>push(buf)</code> + <code>finalize()</code> 的对象。</li>
                   <li><b>source.pull() -&gt; Optional[NodeBuffer]</b></li>
                   <li><b>sink.push(buf: NodeBuffer)</b></li>
                   <li><b>sink.finalize()</b></li>
@@ -1060,19 +1275,41 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                 <h2>AudioFileReader</h2>
                 <pre><code class="language-python">ast.AudioFileReader(path: str, format: str, chunk_samples: Optional[int] = None)</code></pre>
                 <ul>
+                  <li><b>path</b>：文件路径。</li>
+                  <li><b>format</b>：容器格式字符串：wav/mp3/aac_adts/flac/opus_ogg（支持别名）。</li>
+                  <li><b>chunk_samples</b>：每次读出 PCM 的 samples/每声道（目前主要对 wav 生效）。</li>
                   <li><b>next_frame(layout="planar")</b>：手动读 PCM。</li>
                   <li><b>pull()</b>：Runner 兼容（输出 PCM）。</li>
                   <li><b>format</b> 支持：wav/mp3/aac_adts/flac/opus_ogg（aac/adts、opus/ogg_opus 也可作为别名）。</li>
+                </ul>
+                <h3>next_frame 参数说明</h3>
+                <ul>
+                  <li><b>layout</b>：返回 PCM numpy 的布局：<code>"planar"</code> 或 <code>"interleaved"</code>。</li>
                 </ul>
               </section>
 
               <section class="section">
                 <h2>AudioFileWriter</h2>
-                <pre><code class="language-python">ast.AudioFileWriter(path, format, input_format, bitrate=None, compression_level=None, wav_output_format=None)</code></pre>
+                <pre><code class="language-python">ast.AudioFileWriter(path, format, input_format=None, bitrate=None, compression_level=None, wav_output_format=None)</code></pre>
                 <ul>
+                  <li><b>path</b>：输出文件路径。</li>
+                  <li><b>format</b>：输出格式：wav/mp3/aac_adts/flac/opus_ogg。</li>
+                  <li><b>input_format</b>：输入 PCM 格式。None 表示首帧推断（建议通过 <code>push(NodeBuffer)</code> 方式写入）。</li>
+                  <li><b>bitrate</b>：可选码率（bps），用于 mp3/aac/opus。</li>
+                  <li><b>compression_level</b>：可选压缩等级，用于 flac。</li>
+                  <li><b>wav_output_format</b>：wav 输出样本格式：<code>"pcm16le"</code>（默认）或 <code>"f32le"</code>。</li>
                   <li><b>opus_ogg</b>：要求 48kHz 且 interleaved（<code>input_format.planar=False</code>）。</li>
-                  <li><b>wav_output_format</b>：<code>pcm16le</code>（默认）或 <code>f32le</code>。</li>
-                  <li><b>write_pcm()</b> / <b>push()</b> / <b>finalize()</b></li>
+                  <li><b>write_pcm(pcm)</b>：直接写入 numpy（要求已知 input_format；input_format=None 时不支持）。</li>
+                  <li><b>push(buf)</b>：Runner 兼容写入（buf 必须是 pcm）。input_format=None 时会从首帧推断。</li>
+                  <li><b>finalize()</b>：写尾/flush。</li>
+                </ul>
+                <h3>write_pcm 参数说明</h3>
+                <ul>
+                  <li><b>pcm</b>：2D numpy。shape/dtype 必须与 input_format 对齐。</li>
+                </ul>
+                <h3>push 参数说明</h3>
+                <ul>
+                  <li><b>buf</b>：NodeBuffer（必须是 pcm）。当 input_format=None 时会用首帧的 format 进行推断并锁定。</li>
                 </ul>
               </section>
 

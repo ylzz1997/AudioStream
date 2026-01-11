@@ -27,34 +27,34 @@ class AudioFormat:
 
 
 class WavEncoderConfig:
-    input_format: AudioFormat
+    input_format: Optional[AudioFormat]
     chunk_samples: int
 
-    def __init__(self, input_format: AudioFormat, chunk_samples: int) -> None: ...
+    def __init__(self, input_format: Optional[AudioFormat] = None, chunk_samples: int = 1024) -> None: ...
 
 
 class Mp3EncoderConfig:
-    input_format: AudioFormat
+    input_format: Optional[AudioFormat]
     chunk_samples: int
     bitrate: Optional[int]
 
     def __init__(
         self,
-        input_format: AudioFormat,
-        chunk_samples: int,
+        input_format: Optional[AudioFormat] = None,
+        chunk_samples: int = 1152,
         bitrate: Optional[int] = 128000,
     ) -> None: ...
 
 
 class AacEncoderConfig:
-    input_format: AudioFormat
+    input_format: Optional[AudioFormat]
     chunk_samples: int
     bitrate: Optional[int]
 
     def __init__(
         self,
-        input_format: AudioFormat,
-        chunk_samples: int,
+        input_format: Optional[AudioFormat] = None,
+        chunk_samples: int = 1024,
         bitrate: Optional[int] = None,
     ) -> None: ...
 
@@ -80,27 +80,27 @@ class AacDecoderConfig:
     def __init__(self, chunk_samples: int, packet_time_base_den: int = 48000) -> None: ...
 
 class OpusEncoderConfig:
-    input_format: AudioFormat
+    input_format: Optional[AudioFormat]
     chunk_samples: int
     bitrate: Optional[int]
 
     def __init__(
         self,
-        input_format: AudioFormat,
-        chunk_samples: int,
+        input_format: Optional[AudioFormat] = None,
+        chunk_samples: int = 960,
         bitrate: Optional[int] = 96000,
     ) -> None: ...
 
 
 class FlacEncoderConfig:
-    input_format: AudioFormat
+    input_format: Optional[AudioFormat]
     chunk_samples: int
     compression_level: Optional[int]
 
     def __init__(
         self,
-        input_format: AudioFormat,
-        chunk_samples: int,
+        input_format: Optional[AudioFormat] = None,
+        chunk_samples: int = 4096,
         compression_level: Optional[int] = None,
     ) -> None: ...
 
@@ -135,7 +135,7 @@ class Encoder:
         config: WavEncoderConfig | Mp3EncoderConfig | AacEncoderConfig | OpusEncoderConfig | FlacEncoderConfig,
     ) -> None: ...
 
-    def put_frame(self, pcm: NDArray[np.generic]) -> None: ...
+    def put_frame(self, pcm: NDArray[np.generic], pts: Optional[int] = None, format: Optional[AudioFormat] = None) -> None: ...
 
     def get_frame(self, force: bool = False) -> Optional[bytes]: ...
 
