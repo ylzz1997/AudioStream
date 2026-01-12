@@ -20,7 +20,7 @@ pub use crate::python::processor::{
 };
 pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
-    DynNodePy, NodeBase, NodeBufferPy, PacketPy, make_identity_node, make_python_node,
+    DynNodePy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy, make_identity_node, make_python_node,
 };
 
 use pyo3::prelude::*;
@@ -64,6 +64,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AsyncDynRunnerPy>()?;
     m.add_class::<AudioFileReaderPy>()?;
     m.add_class::<AudioFileWriterPy>()?;
+    m.add_class::<ParallelAudioWriterPy>()?;
 
     // functions
     m.add_function(wrap_pyfunction!(io::make_identity_node, m)?)?;

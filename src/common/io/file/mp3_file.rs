@@ -1,7 +1,7 @@
 use crate::common::io::io::{AudioIOError, AudioIOResult};
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::common::audio::fifo::AudioFifo;
-use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational};
+use crate::common::audio::audio::{AudioFrame, AudioFrameView, Rational, SampleType};
 use crate::codec::encoder::mp3_encoder::Mp3EncoderConfig;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -44,6 +44,23 @@ impl AudioWriter for Mp3Writer {
 
         if self.inner.is_none() {
             let actual = frame.format();
+            // libmp3lame（以及多数 mp3 编码器）仅支持 planar 样本格式：
+            // - s16p / s32p / fltp
+            // 用户如果传 interleaved（例如 i16 + planar=false => s16）会在底层报 "Invalid argument"。
+            // 这里提前拦截，给出更明确的错误信息。
+            if !actual.sample_format.is_planar() {
+                return Err(AudioIOError::Format(
+                    "MP3 writer expects planar samples (planar=true). Supported: i16p/i32p/f32p (s16p/s32p/fltp).",
+                ));
+            }
+            match actual.sample_format.sample_type() {
+                SampleType::I16 | SampleType::I32 | SampleType::F32 => {}
+                _ => {
+                    return Err(AudioIOError::Format(
+                        "MP3 writer sample_type must be one of: i16/i32/f32 (planar).",
+                    ))
+                }
+            }
             if let Some(expected) = self.cfg.encoder.input_format {
                 if actual != expected {
                     return Err(AudioIOError::Format("MP3 writer input AudioFormat mismatch"));

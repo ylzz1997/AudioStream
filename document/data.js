@@ -744,7 +744,7 @@ dst.finalize()
                   <li><b>编码</b>：<a href="#python/py-api-encode">Encoder / *EncoderConfig / make_encoder_node</a></li>
                   <li><b>解码</b>：<a href="#python/py-api-decode">Decoder / *DecoderConfig / make_decoder_node</a></li>
                   <li><b>处理</b>：<a href="#python/py-api-process">Processor / *NodeConfig / make_processor_node</a></li>
-                  <li><b>Pipeline / IO</b>：<a href="#python/py-api-pipeline-io">Packet / NodeBuffer / DynNode / AsyncDynPipeline / AsyncDynRunner / AudioFileReader / AudioFileWriter / make_identity_node / make_python_node</a></li>
+                  <li><b>Pipeline / IO</b>：<a href="#python/py-api-pipeline-io">Packet / NodeBuffer / DynNode / AsyncDynPipeline / AsyncDynRunner / AudioFileReader / AudioFileWriter / ParallelAudioWriter / make_identity_node / make_python_node</a></li>
                 </ul>
               </section>
 
@@ -1322,6 +1322,40 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                 <ul>
                   <li><b>buf</b>：NodeBuffer（必须是 pcm）。当 input_format=None 时会用首帧的 format 进行推断并锁定。</li>
                 </ul>
+              </section>
+
+              <section class="section">
+                <h2>ParallelAudioWriter</h2>
+                <pre><code class="language-python">ast.ParallelAudioWriter(writers: list[AudioFileWriter])</code></pre>
+                <p>
+                  把多个 <code>AudioFileWriter</code> 绑定成一个 writer，并在每次 <code>push()</code> / <code>finalize()</code> 时并行执行所有 writer。
+                  适合“一路处理结果写多份文件”的场景。
+                </p>
+                <ul>
+                  <li><b>writers</b>：要绑定的 <code>AudioFileWriter</code> 列表（会被 move）。</li>
+                  <li><b>bind(writer)</b>：追加绑定一个 <code>AudioFileWriter</code>（同样会被 move）。</li>
+                  <li><b>push(buf)</b>：Runner 兼容写入（buf 必须是 pcm）。</li>
+                  <li><b>finalize()</b>：并行 finalize 所有 writer。</li>
+                  <li><b>len</b>：当前绑定数量。</li>
+                </ul>
+                <h3>重要限制</h3>
+                <ul>
+                  <li><b>仅支持已初始化的 AudioFileWriter</b>：也就是构造 <code>AudioFileWriter</code> 时显式传入 <code>input_format</code> 的那种。</li>
+                  <li><b>绑定后原 AudioFileWriter 不可再用</b>：内部 writer 会被取走（move）。</li>
+                </ul>
+                <h3>示例</h3>
+                <pre><code class="language-python">import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
+w1 = ast.AudioFileWriter("a.wav", "wav", input_format=fmt)
+w2 = ast.AudioFileWriter("b.wav", "wav", input_format=fmt)
+
+pw = ast.ParallelAudioWriter([w1, w2])
+pcm = np.zeros((2, 960), dtype=np.float32)
+pw.push(ast.NodeBuffer.pcm(pcm, fmt))
+pw.finalize()
+                </code></pre>
               </section>
 
               <section class="section">

@@ -386,6 +386,20 @@ class AudioFileWriter:
     def finalize(self) -> None: ...
 
 
+class ParallelAudioWriter(AudioSink):
+    # 绑定的 writer 数量
+    len: int
+
+    def __init__(self, writers: list[AudioFileWriter]) -> None: ...
+
+    def bind(self, writer: AudioFileWriter) -> None: ...
+
+    # AsyncDynRunner 兼容：push(buf) + finalize()
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+
 class Processor:
     name: str
 
