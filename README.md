@@ -1,56 +1,64 @@
 <p align="center">
-  <img src="logo/logo.png" alt="AudioStream" width="720" />
+<img src="logo/logo.png" alt="AudioStream" width="720" />
 </p>
+
+[中文README(Chinese README)](README_CN.md)
 
 # AudioStream
 
-一个面向**音频流式处理**的 Rust 库，并通过 PyO3 暴露给 Python 使用：你可以把 **PCM（numpy）** 按 chunk 推给 `Encoder`，拿到 **编码后的 frame(bytes)**；或把 **编码帧(bytes)** 推给 `Decoder` 按 chunk 取回 **PCM（numpy）**。
+A Rust library designed for **audio stream processing**, exposed to Python via PyO3: You can push **PCM (numpy)** chunks to the `Encoder` to obtain **encoded frames (bytes)**; or push **encoded frames (bytes)** to the `Decoder` to retrieve **PCM (numpy)** chunks.
 
-目前 Python 侧最常用的场景是：
+Currently, the most common scenarios on the Python side are:
 
-- **Python 生成/读取 PCM → 编码成 MP3/AAC 帧 → 通过网络推流**
-- **Python/网络接收 MP3/AAC 帧 → 解码成 PCM → 做进一步处理/落盘**
+* **Python Generates/Reads PCM → Encodes to MP3/AAC Frames → Pushes Stream over Network**
+* **Python/Network Receives MP3/AAC Frames → Decodes to PCM → Further Processing/Saving to Disk**
 
-> 说明：MP3/AAC 编码/解码通常依赖 `ffmpeg` feature（见下文安装方式）。
-
----
-
-## 功能概览
-
-- **Python API（PyO3）**：`Encoder` / `Decoder`
-- **输入/输出**：
-  - **Encoder**：`put_frame(pcm_numpy)` → `get_frame() -> bytes`
-  - **Decoder**：`put_frame(frame_bytes)` → `get_frame() -> pcm_numpy`
-- **Chunk 语义**：
-  - 内部会把输入缓存到 FIFO，累计到 `chunk_samples` 才会产出一个 output frame
-  - `get_frame(force=True)` 会在结束时尽可能把残留数据 flush 出来（包含对底层 codec 的 EOF flush）
+> Note: MP3/AAC encoding/decoding usually depends on the `ffmpeg` feature (see installation instructions below).
 
 ---
 
-## 依赖与构建（Python）
+## Features Overview
 
-**注意⚠️：需要先安装FFMPEG！！！！！**
+* **Python API (PyO3)**: `Encoder` / `Decoder`
+* **Input/Output**:
+* **Encoder**: `put_frame(pcm_numpy)` → `get_frame() -> bytes`
+* **Decoder**: `put_frame(frame_bytes)` → `get_frame() -> pcm_numpy`
 
-**否则 MP3/AAC encoder 会报需要 ffmpeg**
 
-在项目根目录：
+* **Chunk Semantics**:
+* Internally buffers input into a FIFO; only produces an output frame when accumulated data reaches `chunk_samples`.
+* `get_frame(force=True)` flushes residual data at the end (including EOF flush for the underlying codec).
+
+
+
+---
+
+## Dependencies & Build (Python)
+
+**Warning⚠️: FFMPEG MUST BE INSTALLED FIRST!!!!!**
+
+**Otherwise, the MP3/AAC encoder will report that ffmpeg is required.**
+
+In the project root directory:
 
 ```bash
 python -m pip install -U maturin numpy
 maturin develop -F python -F ffmpeg
+
 ```
 
-安装后 Python 侧可：
+After installation, you can use it in Python:
 
 ```python
 import pyaudiostream as ast
+
 ```
 
 ---
 
-## Python API 快速示例
+## Python API Quick Start
 
-### Encoder（PCM → 编码帧 bytes）
+### Encoder (PCM → Encoded Frame bytes)
 
 ```python
 import numpy as np
@@ -67,14 +75,15 @@ pkt = enc.get_frame()
 if pkt is not None:
     assert isinstance(pkt, (bytes, bytearray))
 
-# 结束时建议 flush
+# It is recommended to flush at the end
 while True:
     last = enc.get_frame(force=True)
     if last is None:
         break
+
 ```
 
-### Decoder（编码帧 bytes → PCM numpy）
+### Decoder (Encoded Frame bytes → PCM numpy)
 
 ```python
 import pyaudiostream as ast
@@ -87,146 +96,159 @@ pcm = dec.get_frame()
 if pcm is not None:
     # numpy ndarray, shape=(channels, samples)
     print(pcm.shape, pcm.dtype)
+
 ```
 
 ---
 
-## Example 1：`example/server.py`（Python 编码推流 → 浏览器解码流式播放）
+## Example 1: `example/server.py` (Python Encoding/Streaming → Browser Decoding/Playback)
 
-这个示例包含三种模式，覆盖完整链路：
+This example includes three modes covering the full pipeline:
 
-- **server**：提供网页 + WebSocket 广播；同时开一个 TCP ingest 端口接收“按帧”推送
-- **sender**：使用 `pyaudiostream` 从 PCM（wav 或正弦）编码成 MP3/AAC 帧，按 framing 推给 ingest
-- **demo**：同一进程里同时跑 server + sender（方便一条命令自测）
+* **server**: Provides a Web page + WebSocket broadcast; also opens a TCP ingest port to receive "frame-based" pushes.
+* **sender**: Uses `pyaudiostream` to encode PCM (wav or sine wave) into MP3/AAC frames and pushes them to the ingest port via custom framing.
+* **demo**: Runs both server and sender in the same process (convenient for one-command self-testing).
 
-### 安装依赖
+### Install Dependencies
 
 ```bash
 python -m pip install -U aiohttp
+
 ```
 
-（并确保你已 `maturin develop -F python -F ffmpeg`）
+(Ensure you have run `maturin develop -F python -F ffmpeg`)
 
-### 一条命令自测（推荐）
+### One-Command Self-Test (Recommended)
 
 ```bash
 python example/server.py --mode demo --codec mp3
+
 ```
 
-浏览器打开：`http://127.0.0.1:23456`，点击“开始播放”。
+Open in browser: `http://127.0.0.1:23456` and click "Start Playback".
 
-### 分开跑（server / sender）
+### Running Separately (server / sender)
 
-启动 server（HTTP+WS + TCP ingest）：
+Start server (HTTP+WS + TCP ingest):
 
 ```bash
 python example/server.py --mode server --codec mp3 --http-port 23456 --ingest-port 23457
+
 ```
 
-启动 sender（从 wav 编码并推送）：
+Start sender (Encode from wav and push):
 
 ```bash
 python example/server.py --mode sender --codec mp3 --host 127.0.0.1 --ingest-port 23457 --wav "/abs/path/to/input.wav" --seconds 0
+
 ```
 
-#### 关键参数说明
+#### Key Parameters
 
-- `--wav`
-  - 目前示例要求 **16-bit PCM WAV**（sampwidth=2）
-  - 且 wav 的 **采样率/声道数** 要和 `--sample-rate/--channels` 一致，否则会报错（避免“音调变高/变低”）
-- `--chunk-samples`
-  - PCM chunk 大小；越小延迟越低，但编码器/浏览器端可能更容易 buffer underrun
-  - MP3 常见每声道 1152 samples（示例默认 1152）
-  - AAC 常见为 1024
+* `--wav`
+* Currently, the example requires **16-bit PCM WAV** (sampwidth=2).
+* The wav's **sample rate/channels** must match `--sample-rate/--channels`, otherwise it will error out (to avoid "pitch shifting").
 
-### 浏览器端说明
 
-- **MP3**：使用 MSE（MediaSource）`audio/mpeg` 流式 append，兼容性最好
-- **AAC(ADTS)**：不同浏览器对 `audio/aac` 的 MSE 支持不一致；建议优先用 MP3 验证链路
+* `--chunk-samples`
+* PCM chunk size; smaller means lower latency, but the encoder/browser side may suffer from buffer underrun.
+* MP3 usually uses 1152 samples per channel (example default is 1152).
+* AAC usually uses 1024.
 
-## 框架设计：AudioFlowModel
 
-AudioFlowModel 是作者针对 Audio 的**流式计算**设计的抽象层：它将持续到达的音频数据视为一条“流”，将编码、解码、DSP 处理等模块视为可组合的“算子”（Operator），通过标准化的协议构建出灵活的音频处理链路。
 
-### 1. 核心设计理念
+### Browser Note
 
-我们采用 **流式数据流（Dataflow）** 模型来统一描述音频处理过程：
+* **MP3**: Uses MSE (MediaSource) with `audio/mpeg` streaming append; has the best compatibility.
+* **AAC(ADTS)**: MSE support for `audio/aac` varies across browsers; it is recommended to prioritize MP3 for pipeline verification.
 
-* **流（Stream）**：数据在时间轴上的持续流动。在本项目中，流的载体（Payload）被严格类型化为两类 `NodeBuffer`：
-* `PCM`：原始音频帧 (`AudioFrame`)
-* `Packet`：编码后的数据包 (`CodecPacket`)
+## Framework Design: AudioFlowModel
 
-* **算子（Operator/Node）**：对流进行变换的计算单元。算子是有状态的（Stateful），可能包含编码器延迟、滤波器状态或内部缓存。
-* **组合（Composition）**：算子之间遵循统一的输入输出协议，可以像积木一样串联，形成端到端的处理管线。
+AudioFlowModel is an abstraction layer designed by the author for **streaming audio computation**: It treats continuously arriving audio data as a "Stream" and modules like encoding, decoding, and DSP processing as composable "Operators," building a flexible audio processing pipeline through a standardized protocol.
 
-### 2. 组件架构
+### 1. Core Design Philosophy
 
-#### 2.1 Codec (核心算子)
+We use a **Dataflow Model** to unify the description of the audio processing workflow:
 
-这是音频处理的原子计算单元，直接作用于数据内容。
+* **Stream**: The continuous flow of data along the time axis. In this project, the payload of a stream is strictly typed into two categories of `NodeBuffer`:
+* `PCM`: Raw audio frames (`AudioFrame`).
+* `Packet`: Encoded data packets (`CodecPacket`).
 
-* **Encoder**：接收 PCM 输入，维持内部状态（如 Lookahead、Bit Reservoir），产出编码包。 (将音频信号压缩为比特流 `PCM -> CodecPacket`)
-* **Decoder**：接收编码包输入，产出 PCM 音频。 (将比特流还原为音频信号 `CodecPacket -> PCM`)
-* **Processor**：PCM 到 PCM 的变换。 (在时域上对音频信号进行处理，如增益、混音、重采样)
-* *特殊实现* `IdentityProcessor`：一个“直通”算子 (`id: PCM -> PCM`)，不做任何修改地透传数据。常用于占位、链路测试或接口对齐。
 
-#### 2.2 IO (源与汇)
+* **Operator/Node**: The computation unit that transforms the stream. Operators are **Stateful**, potentially containing encoder latency, filter states, or internal caches.
+* **Composition**: Operators follow a unified input/output protocol and can be chained like building blocks to form an end-to-end processing pipeline.
 
-负责将计算图连接到外部世界：
+### 2. Component Architecture
 
-* **AudioReader (Source)**：流的**生产者**。负责从外部（文件、网络流、设备）读取数据，并将其转换为系统内的 `PCM` 或 `Packet` 流引入计算图。
-* **AudioWriter (Sink)**：流的**消费者**。负责接收计算图输出的 `PCM` 或 `Packet`，并将其写入外部存储或发送至网络/声卡。
+#### 2.1 Codec (Core Operator)
 
-#### 2.3 Node (节点封装层)
+This is the atomic computation unit for audio processing, acting directly on the data content.
 
-`Node` 是对上述 Codec 和 IO 的标准化封装，目的是让不同的算子能够被 Pipeline 统一调度。它定义了流式处理的生命周期与交互协议：
+* **Encoder**: Receives PCM input, maintains internal state (e.g., Lookahead, Bit Reservoir), and produces encoded packets. (Compresses audio signals into bitstreams: `PCM -> CodecPacket`)
+* **Decoder**: Receives encoded packet input and produces PCM audio. (Restores bitstreams to audio signals: `CodecPacket -> PCM`)
+* **Processor**: PCM to PCM transformation. (Processes audio signals in the time domain, such as gain, mixing, resampling).
+* *Special Implementation* `IdentityProcessor`: A "pass-through" operator (`id: PCM -> PCM`) that transmits data without modification. Often used for placeholders, pipeline testing, or interface alignment.
 
-* **协议（Push/Pull）**：外部向节点 Push 数据，从节点 Pull 结果。
-* **背压（Backpressure）**：
-* `Again`：当节点需要更多输入才能产生输出（例如编码器缓存未满），或输出暂时不可用时，返回此信号让调度器稍后重试。
+#### 2.2 IO (Source & Sink)
 
-* **生命周期（EOF & Flush）**：
-* 当输入流结束时，通过 Push `None` 触发 **Flush** 操作，强制节点排空内部所有残留缓存。
-* 当 Flush 完成且无更多输出时，返回 `Eof`。
+Responsible for connecting the computation graph to the external world:
 
-**实现形态：**
+* **AudioReader (Source)**: The **Producer** of the stream. Responsible for reading data from external sources (files, network streams, devices) and converting it into system `PCM` or `Packet` streams to introduce into the computation graph.
+* **AudioWriter (Sink)**: The **Consumer** of the stream. Responsible for receiving `PCM` or `Packet` output from the computation graph and writing it to external storage or sending it to a network/sound card.
 
-* **DynNode (动态)**：使用 `NodeBuffer` 枚举进行类型擦除，允许通过 `Vec<Box<dyn DynNode>>` 在运行时动态组装任意复杂的链路（Python暴露这个接口）。
-* **StaticNode (静态)**：利用 Rust 泛型系统在编译期确定类型，提供更强的类型安全和更少的运行时开销（Python接口不能用！）。
-* *特殊实现* `IdentityNode`：节点层的“直通管”。它将输入 Buffer 所有权原样转移到输出（Zero-copy move）。常用于构建测试脚手架，验证 Runner 的驱动逻辑和背压传播机制。
+#### 2.3 Node (Wrapper Layer)
 
-#### 2.4 Pipeline (管线)
+`Node` is the standardized encapsulation of the aforementioned Codec and IO, allowing different operators to be uniformly scheduled by the Pipeline. It defines the lifecycle and interaction protocol for stream processing:
 
-Pipeline 是对“节点组合”的抽象。它将一组 `Node` 按顺序连接（Chaining），自动处理节点间的数据传递。
+* **Protocol (Push/Pull)**: External callers Push data to the node and Pull results from the node.
+* **Backpressure**:
+* `Again`: Returns this signal to let the scheduler retry later when the node needs more input to produce output (e.g., encoder buffer not full) or when output is temporarily unavailable.
 
-典型链路示例：
+
+* **Lifecycle (EOF & Flush)**:
+* When the input stream ends, a **Flush** operation is triggered by Pushing `None`, forcing the node to drain all internal residual buffers.
+* When Flush is complete and there is no more output, `Eof` is returned.
+
+
+
+**Implementation Forms:**
+
+* **DynNode (Dynamic)**: Uses the `NodeBuffer` enum for type erasure, allowing arbitrarily complex pipelines to be assembled dynamically at runtime via `Vec<Box<dyn DynNode>>` (This interface is exposed to Python).
+* **StaticNode (Static)**: Uses the Rust generic system to determine types at compile time, providing stronger type safety and less runtime overhead (Not usable via Python interface!).
+* *Special Implementation* `IdentityNode`: A "straight pipe" at the node layer. It transfers input Buffer ownership to output as-is (Zero-copy move). Often used to build test scaffolds to verify Runner driver logic and backpressure propagation mechanisms.
+
+#### 2.4 Pipeline
+
+Pipeline is the abstraction for "Node Composition". It connects a set of `Node`s in sequence (Chaining), automatically handling data transfer between nodes.
+
+Typical pipeline examples:
 
 ```text
 [Source] -> PCM --(Processor)--> PCM --(Encoder)--> Packet -> [Sink]
 
 ```
 
-或者：
+Or:
 
 ```text
 [Source] -> Packet --(Decoder)--> PCM --(Processor)--> PCM -> [Sink]
 
 ```
 
-* **AsyncPipeline**：专为异步环境（Tokio）设计的管线。它通常将管线拆分为 Producer（输入端）和 Consumer（输出端），支持非阻塞的 Push/Pull，便于在多任务环境中并行驱动。
+* **AsyncPipeline**: A pipeline designed for asynchronous environments (Tokio). It typically splits the pipeline into a Producer (input end) and Consumer (output end), supporting non-blocking Push/Pull, facilitating parallel driving in multi-tasking environments.
 
-也就是说，Pipeline必须有个输入和输出，但是输入输出可以是`PCM` 或 `Packet`（Runner可以不用，但需要指定Source和Sink）
+In short, a Pipeline must have an input and an output, but the input/output can be `PCM` or `Packet` (The Runner doesn't strictly need a Pipeline, but requires a Source and Sink to be specified).
 
-#### 2.5 Runner (调度器)
+#### 2.5 Runner (Scheduler)
 
-Runner 是赋予静态计算图“生命”的执行引擎。它负责驱动整个 Pipeline 运转：
+The Runner is the execution engine that gives "life" to the static computation graph. It acts as the driver for the entire Pipeline:
 
-1. 从 Source 读取数据并 Push 进 Pipeline。
-2. 持续 Pull Pipeline 的输出并写入 Sink。
-3. 正确处理 `Again`（等待/让出时间片）。
-4. 在输入结束时，负责传播 Flush 信号，直到所有节点处理完毕 (`Eof`)。
+1. Reads data from Source and Pushes into Pipeline.
+2. Continuously Pulls Pipeline output and writes to Sink.
+3. Correctly handles `Again` (wait/yield time slice).
+4. Propagates the Flush signal when input ends until all nodes finish processing (`Eof`).
 
-* **AsyncRunner**：Runner 的异步实现。它将计算逻辑与底层 I/O（如网络 Ingest、WebSocket 广播、文件读写）的异步特性完美结合，构建端到端的实时流式处理应用。
+* **AsyncRunner**: The asynchronous implementation of Runner. It combines computation logic with the async nature of underlying I/O (like Network Ingest, WebSocket Broadcast, File I/O) to build end-to-end real-time stream processing applications.
 
-调度方式可参考下图
+Refer to the diagram below for the scheduling method:
 ![调度流程图](logo/i1.jpg)
