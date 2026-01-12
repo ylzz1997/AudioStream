@@ -11,6 +11,7 @@ use crate::common::io::file::{
     AudioFileReadConfig, AudioFileReader as RsAudioFileReader, AudioFileWriteConfig, AudioFileWriter as RsAudioFileWriter,
 };
 use crate::common::io::boundwriter::{MultiAudioWriter, ParallelAudioWriter as RsParallelAudioWriter};
+use crate::common::io::LineAudioWriter as RsLineAudioWriter;
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
@@ -32,6 +33,7 @@ use crate::python::format::{
     ascontig_cast_2d, audio_format_from_rs, frame_to_numpy, ndarray_to_frame_interleaved, ndarray_to_frame_planar,
     AudioFormat,
 };
+use crate::python::processor::ProcessorPy;
 
 // 上面 import 里用到的 `node_kind_from_str` 在 format.rs 不存在；
 // 这里用私有实现，避免模块间循环依赖。
@@ -902,21 +904,19 @@ impl ParallelAudioWriterPy {
     ///
     /// 绑定后传入的 `AudioFileWriter` 会被“搬空”，不可再使用。
     #[new]
-    fn new(py: Python<'_>, writers: Vec<Py<AudioFileWriterPy>>) -> PyResult<Self> {
+    fn new(py: Python<'_>, writers: Vec<PyObject>) -> PyResult<Self> {
         let mut inner = RsParallelAudioWriter::with_capacity(writers.len());
         for w in writers {
-            let mut ww = w.bind(py).borrow_mut();
-            let rs_w = ww.take_rs_writer()?;
-            inner.bind(Box::new(rs_w));
+            let boxed = take_any_audio_writer(py, w)?;
+            inner.bind(boxed);
         }
         Ok(Self { inner })
     }
 
     /// 追加绑定一个 `AudioFileWriter`。
-    fn bind(&mut self, py: Python<'_>, writer: Py<AudioFileWriterPy>) -> PyResult<()> {
-        let mut ww = writer.bind(py).borrow_mut();
-        let rs_w = ww.take_rs_writer()?;
-        self.inner.bind(Box::new(rs_w));
+    fn bind(&mut self, py: Python<'_>, writer: PyObject) -> PyResult<()> {
+        let boxed = take_any_audio_writer(py, writer)?;
+        self.inner.bind(boxed);
         Ok(())
     }
 
@@ -944,6 +944,120 @@ impl ParallelAudioWriterPy {
 
     fn finalize(&mut self, py: Python<'_>) -> PyResult<()> {
         py.allow_threads(|| AudioWriter::finalize(&mut self.inner)).map_err(map_file_err)
+    }
+}
+
+fn take_any_audio_writer(py: Python<'_>, obj: PyObject) -> PyResult<Box<dyn AudioWriter + Send>> {
+    let any = obj.bind(py);
+
+    // 1) AudioFileWriter
+    if let Ok(w) = any.extract::<Py<AudioFileWriterPy>>() {
+        let mut ww = w.bind(py).borrow_mut();
+        let rs_w = ww.take_rs_writer()?;
+        return Ok(Box::new(rs_w));
+    }
+
+    // 2) LineAudioWriter
+    if let Ok(w) = any.extract::<Py<LineAudioWriterPy>>() {
+        let mut ww = w.bind(py).borrow_mut();
+        let rs_w = ww.take_rs_writer()?;
+        return Ok(Box::new(rs_w));
+    }
+
+    Err(PyValueError::new_err(
+        "ParallelAudioWriter only supports AudioFileWriter / LineAudioWriter",
+    ))
+}
+
+/// Python 侧 LineAudioWriter：`processors (PCM->PCM)* -> AudioWriter`。
+///
+/// - 目前 final writer 仅支持 `AudioFileWriter`（会被 move/搬空）。
+/// - processors 支持 `Processor`（会被 move/搬空）。
+#[pyclass(name = "LineAudioWriter", unsendable)]
+pub struct LineAudioWriterPy {
+    inner: Option<RsLineAudioWriter>,
+}
+
+#[pymethods]
+impl LineAudioWriterPy {
+    /// 构造：绑定一个最终 writer，并可选绑定一组 processors（按顺序执行）。
+    ///
+    /// 绑定后传入的 `AudioFileWriter` / `Processor` 会被“搬空”，不可再使用。
+    #[new]
+    #[pyo3(signature = (writer, processors=None))]
+    fn new(py: Python<'_>, writer: Py<AudioFileWriterPy>, processors: Option<Vec<Py<ProcessorPy>>>) -> PyResult<Self> {
+        let rs_writer = {
+            let mut ww = writer.bind(py).borrow_mut();
+            ww.take_rs_writer()?
+        };
+
+        let mut ps: Vec<Box<dyn crate::codec::processor::processor_interface::AudioProcessor>> = Vec::new();
+        if let Some(procs) = processors {
+            ps.reserve(procs.len());
+            for p in procs {
+                let mut pp = p.bind(py).borrow_mut();
+                ps.push(pp.take_rs_processor()?);
+            }
+        }
+
+        Ok(Self {
+            inner: Some(RsLineAudioWriter::with_processors(ps, Box::new(rs_writer))),
+        })
+    }
+
+    /// 追加绑定一个 processor（追加到链末端）。
+    ///
+    /// 传入的 `Processor` 会被“搬空”，不可再使用。
+    fn add_processor(&mut self, py: Python<'_>, p: Py<ProcessorPy>) -> PyResult<()> {
+        let mut pp = p.bind(py).borrow_mut();
+        let rs_p = pp.take_rs_processor()?;
+        let inner = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("LineAudioWriter is already taken"))?;
+        inner.push_processor(rs_p);
+        Ok(())
+    }
+
+    /// `AsyncDynRunner` 兼容：push(buf: NodeBuffer)（仅支持 PCM）。
+    fn push(&mut self, py: Python<'_>, buf: Py<NodeBufferPy>) -> PyResult<()> {
+        let inner_buf = {
+            let mut b = buf.bind(py).borrow_mut();
+            b.take_inner()?
+        };
+
+        match inner_buf {
+            NodeBuffer::Pcm(f) => {
+                let inner = self
+                    .inner
+                    .as_mut()
+                    .ok_or_else(|| PyRuntimeError::new_err("LineAudioWriter is already taken"))?;
+                // 末端 writer 现在要求 Send，可安全 allow_threads
+                py.allow_threads(|| inner.write_frame(&f as &dyn AudioFrameView))
+                    .map_err(map_file_err)?;
+                Ok(())
+            }
+            NodeBuffer::Packet(_) => Err(PyValueError::new_err("LineAudioWriter.push 仅支持 PCM（NodeBuffer kind=pcm）")),
+        }
+    }
+
+    fn finalize(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        py.allow_threads(|| AudioWriter::finalize(inner)).map_err(map_file_err)
+    }
+}
+
+impl LineAudioWriterPy {
+    /// 把内部 Rust `LineAudioWriter` 取出（move）。
+    ///
+    /// 用于把 `LineAudioWriter` 绑定到 `ParallelAudioWriter`。
+    /// 被取出后，这个 Python 对象将不再可用。
+    fn take_rs_writer(&mut self) -> PyResult<RsLineAudioWriter> {
+        self.inner
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("LineAudioWriter is already taken"))
     }
 }
 

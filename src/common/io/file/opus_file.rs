@@ -546,6 +546,10 @@ mod ogg_ffmpeg_backend {
             }
             if let Some(expected) = self.cfg.encoder.input_format {
                 if in_fmt != expected {
+                    eprintln!(
+                        "Ogg Opus writer input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                        crate::common::audio::audio::audio_format_diff(expected, in_fmt)
+                    );
                     return Err(AudioIOError::Format("Ogg Opus writer input AudioFormat mismatch"));
                 }
             }

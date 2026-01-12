@@ -26,7 +26,9 @@ use crate::python::io::DynNodePy;
 /// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor / GainProcessor / CompressorProcessor。
 #[pyclass(name = "Processor")]
 pub struct ProcessorPy {
-    p: Box<dyn AudioProcessor>,
+    // NOTE: Processor 可能会被 move 进其它 Rust 组件（例如 LineAudioWriter）。
+    // 被 move 后，这个 Python 对象将不可再用（后续调用会报错）。
+    p: Option<Box<dyn AudioProcessor>>,
     in_format: Option<crate::common::audio::audio::AudioFormat>,
     out_format: Option<crate::common::audio::audio::AudioFormat>,
     // 若 input_format 已知，则在 numpy<->frame 时可用来选择 dtype
@@ -52,7 +54,7 @@ impl ProcessorPy {
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
         Ok(Self {
-            p,
+            p: Some(p),
             in_format,
             out_format,
             in_sample_type,
@@ -84,7 +86,7 @@ impl ProcessorPy {
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
         Ok(Self {
-            p: Box::new(p),
+            p: Some(Box::new(p)),
             in_format,
             out_format,
             in_sample_type,
@@ -106,7 +108,7 @@ impl ProcessorPy {
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
         Ok(Self {
-            p: Box::new(p),
+            p: Some(Box::new(p)),
             in_format,
             out_format,
             in_sample_type,
@@ -152,7 +154,7 @@ impl ProcessorPy {
         let out_format = p.output_format();
         let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
         Ok(Self {
-            p: Box::new(p),
+            p: Some(Box::new(p)),
             in_format,
             out_format,
             in_sample_type,
@@ -162,8 +164,13 @@ impl ProcessorPy {
 
 
     #[getter]
-    fn name(&self) -> &'static str {
-        self.p.name()
+    fn name(&self) -> PyResult<&'static str> {
+        let Some(p) = self.p.as_deref() else {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已被 move（例如被 LineAudioWriter 使用），当前对象不可再用",
+            ));
+        };
+        Ok(p.name())
     }
 
     /// 输入一帧 PCM（numpy）。
@@ -234,8 +241,12 @@ impl ProcessorPy {
         if let Some(p) = pts {
             frame.set_pts(Some(p));
         }
-        self.p
-            .send_frame(Some(&frame as &dyn AudioFrameView))
+        let Some(p) = self.p.as_deref_mut() else {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已被 move（例如被 LineAudioWriter 使用），当前对象不可再用",
+            ));
+        };
+        p.send_frame(Some(&frame as &dyn AudioFrameView))
             .map_err(map_codec_err)?;
         Ok(())
     }
@@ -245,14 +256,24 @@ impl ProcessorPy {
         if self.sent_eof {
             return Ok(());
         }
-        self.p.send_frame(None).map_err(map_codec_err)?;
+        let Some(p) = self.p.as_deref_mut() else {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已被 move（例如被 LineAudioWriter 使用），当前对象不可再用",
+            ));
+        };
+        p.send_frame(None).map_err(map_codec_err)?;
         self.sent_eof = true;
         Ok(())
     }
 
     /// 重置内部状态（清空缓存、回到初始态），可继续接收新的流。
     fn reset(&mut self) -> PyResult<()> {
-        self.p.reset().map_err(map_codec_err)?;
+        let Some(p) = self.p.as_deref_mut() else {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已被 move（例如被 LineAudioWriter 使用），当前对象不可再用",
+            ));
+        };
+        p.reset().map_err(map_codec_err)?;
         self.sent_eof = false;
         Ok(())
     }
@@ -270,7 +291,12 @@ impl ProcessorPy {
             "interleaved" => false,
             _ => return Err(PyValueError::new_err("layout 仅支持: planar/interleaved")),
         };
-        match self.p.receive_frame() {
+        let Some(p) = self.p.as_deref_mut() else {
+            return Err(PyRuntimeError::new_err(
+                "Processor 已被 move（例如被 LineAudioWriter 使用），当前对象不可再用",
+            ));
+        };
+        match p.receive_frame() {
             Ok(f) => Ok(Some(frame_to_numpy(py, &f, planar)?)),
             Err(CodecError::Again) => Ok(None),
             Err(CodecError::Eof) => Ok(None),
@@ -281,6 +307,18 @@ impl ProcessorPy {
     /// 输出格式（若已知）。
     fn output_format(&self) -> Option<AudioFormat> {
         self.out_format.map(audio_format_from_rs)
+    }
+}
+
+impl ProcessorPy {
+    /// 把内部 Rust `AudioProcessor` 取出（move）。
+    ///
+    /// 用于将 Processor 绑定到其它 Rust 结构（例如 `LineAudioWriter`）。
+    /// 被取出后，这个 Python 对象将不再可用（再调用会报错/无效果）。
+    pub(crate) fn take_rs_processor(&mut self) -> PyResult<Box<dyn AudioProcessor>> {
+        self.p.take().ok_or_else(|| {
+            PyRuntimeError::new_err("Processor is not initialized or already taken by LineAudioWriter")
+        })
     }
 }
 

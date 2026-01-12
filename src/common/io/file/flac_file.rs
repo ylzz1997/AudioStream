@@ -395,6 +395,10 @@ mod ffmpeg_backend {
             }
             if let Some(expected) = self.cfg.encoder.input_format {
                 if in_fmt != expected {
+                    eprintln!(
+                        "FlacWriter input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                        crate::common::audio::audio::audio_format_diff(expected, in_fmt)
+                    );
                     return Err(AudioIOError::Format("FLAC writer input AudioFormat mismatch"));
                 }
             }

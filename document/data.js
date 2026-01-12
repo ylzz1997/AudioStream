@@ -1001,7 +1001,7 @@ if out is not None:
               <div class="hero">
                 <div class="hero__kicker">API · 处理</div>
                 <h1 class="hero__title">Processor</h1>
-                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / compressor；也支持创建 pipeline 节点。推荐使用make_processor_node创建节点，不推荐直接构造Processor对象。</p>
+                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / compressor；也支持创建 pipeline 节点。</p>
               </div>
 
               <section class="section">
@@ -1326,14 +1326,14 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
 
               <section class="section">
                 <h2>ParallelAudioWriter</h2>
-                <pre><code class="language-python">ast.ParallelAudioWriter(writers: list[AudioFileWriter])</code></pre>
+                <pre><code class="language-python">ast.ParallelAudioWriter(writers: list[AudioFileWriter | LineAudioWriter])</code></pre>
                 <p>
                   把多个 <code>AudioFileWriter</code> 绑定成一个 writer，并在每次 <code>push()</code> / <code>finalize()</code> 时并行执行所有 writer。
                   适合“一路处理结果写多份文件”的场景。
                 </p>
                 <ul>
-                  <li><b>writers</b>：要绑定的 <code>AudioFileWriter</code> 列表（会被 move）。</li>
-                  <li><b>bind(writer)</b>：追加绑定一个 <code>AudioFileWriter</code>（同样会被 move）。</li>
+                  <li><b>writers</b>：要绑定的 writer 列表（支持 <code>AudioFileWriter</code>/<code>LineAudioWriter</code>，会被 move）。</li>
+                  <li><b>bind(writer)</b>：追加绑定一个 writer（支持 <code>AudioFileWriter</code>/<code>LineAudioWriter</code>，同样会被 move）。</li>
                   <li><b>push(buf)</b>：Runner 兼容写入（buf 必须是 pcm）。</li>
                   <li><b>finalize()</b>：并行 finalize 所有 writer。</li>
                   <li><b>len</b>：当前绑定数量。</li>
@@ -1355,6 +1355,53 @@ pw = ast.ParallelAudioWriter([w1, w2])
 pcm = np.zeros((2, 960), dtype=np.float32)
 pw.push(ast.NodeBuffer.pcm(pcm, fmt))
 pw.finalize()
+                </code></pre>
+              </section>
+
+              <section class="section">
+                <h2>LineAudioWriter</h2>
+                <pre><code class="language-python">ast.LineAudioWriter(writer: AudioFileWriter, processors: Optional[list[Processor]] = None)</code></pre>
+                <p>
+                  <b>线性链路写端</b>：把多个 <code>Processor(PCM-&gt;PCM)</code> 串起来，最后把结果写入一个 <code>AudioFileWriter</code>。
+                  适合由于使用ParallelAudioWriter时，需要对每个writer进行不同的前处理。比如需要对每个writer进行不同的重采样（因为不同的writer可能需要不同的重采样率和数据格式）。
+                  注意：由于LineAudioWriter是同步的，所以不建议将长处理流程放在LineAudioWriter中，否则会导致阻塞！这种场景请使用AsyncDynPipeline。
+                </p>
+                <ul>
+                  <li><b>writer</b>：最终落地 writer（当前仅支持 <code>AudioFileWriter</code>）。会被 move。</li> 
+                  <li><b>processors</b>：按顺序执行的一组 <code>Processor</code>。会被 move。</li>
+                  <li><b>add_processor(p)</b>：追加一个 processor（同样会 move）。</li>
+                  <li><b>push(buf)</b>：Runner 兼容写入（buf 必须是 pcm）。</li>
+                  <li><b>finalize()</b>：flush processors 并 finalize writer。</li>
+                </ul>
+                <h3>示例：读文件 → 增益 → 并行写文件（由于不同writer需要不同的重采样率和数据格式，所以需要对每个writer进行不同的重采样）</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+import pyaudiostream as ast
+
+src = ast.AudioFileReader("test.wav", "wav")  # 读文件并产出 PCM
+
+out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="i16", planar=True)
+out_fmt_mp3 = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="i16", planar=True) 
+out_fmt_flac = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="i16", planar=False) 
+
+dst = ast.AudioFileWriter("out_2.flac", "flac", compression_level=8, input_format=out_fmt_flac)
+dst_2 = ast.AudioFileWriter("out_2.mp3", "mp3", bitrate=320_000, input_format=out_fmt_mp3)
+
+dst = ast.LineAudioWriter(dst, [ast.Processor.resample(None, out_fmt_flac)])
+dst_2 = ast.LineAudioWriter(dst_2, [ast.Processor.resample(None, out_fmt_mp3)])
+
+pw = ast.ParallelAudioWriter([dst, dst_2])
+
+nodes = [
+    ast.make_processor_node(
+        "gain",
+        ast.GainNodeConfig(
+            gain=1.2,
+        ),
+    )
+]
+
+r = ast.AsyncDynRunner(src, nodes, pw)
+r.run()
                 </code></pre>
               </section>
 

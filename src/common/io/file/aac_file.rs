@@ -146,6 +146,10 @@ impl AacAdtsWriter {
             let actual = frame.format();
             if let Some(expected) = self.cfg.encoder.input_format {
                 if actual != expected {
+                    eprintln!(
+                        "AAC-ADTS writer input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                        crate::common::audio::audio::audio_format_diff(expected, actual)
+                    );
                     return Err(AudioIOError::Format("AAC-ADTS writer input AudioFormat mismatch"));
                 }
             }

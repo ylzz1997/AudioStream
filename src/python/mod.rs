@@ -20,7 +20,7 @@ pub use crate::python::processor::{
 };
 pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
-    DynNodePy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy, make_identity_node, make_python_node,
+    DynNodePy, LineAudioWriterPy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy, make_identity_node, make_python_node,
 };
 
 use pyo3::prelude::*;
@@ -65,6 +65,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioFileReaderPy>()?;
     m.add_class::<AudioFileWriterPy>()?;
     m.add_class::<ParallelAudioWriterPy>()?;
+    m.add_class::<LineAudioWriterPy>()?;
 
     // functions
     m.add_function(wrap_pyfunction!(io::make_identity_node, m)?)?;
@@ -72,6 +73,9 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoder::make_encoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(decoder::make_decoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(io::make_python_node, m)?)?;
+
+    // Backward-compatible alias: LineWriter -> LineAudioWriter
+    m.setattr("LineWriter", m.getattr("LineAudioWriter")?)?;
     Ok(())
 }
 

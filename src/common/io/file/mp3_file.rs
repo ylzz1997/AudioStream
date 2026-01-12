@@ -63,6 +63,10 @@ impl AudioWriter for Mp3Writer {
             }
             if let Some(expected) = self.cfg.encoder.input_format {
                 if actual != expected {
+                    eprintln!(
+                        "MP3 writer input AudioFormat mismatch:\n  input_output_format_diffs: {}",
+                        crate::common::audio::audio::audio_format_diff(expected, actual)
+                    );
                     return Err(AudioIOError::Format("MP3 writer input AudioFormat mismatch"));
                 }
             }
