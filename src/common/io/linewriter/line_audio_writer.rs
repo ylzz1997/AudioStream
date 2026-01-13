@@ -3,6 +3,8 @@ use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::common::audio::audio::{AudioFrame, AudioFrameView};
 use crate::common::io::io::{AudioIOError, AudioIOResult, AudioWriter};
 
+use super::AudioWriterChain;
+
 /// 一条“线性链路”写端：`processors (PCM->PCM)* -> writer`。
 pub struct LineAudioWriter {
     processors: Vec<Box<dyn AudioProcessor>>,
@@ -34,26 +36,23 @@ impl LineAudioWriter {
     ///
     /// 注意：如果已经 `finalize()`，再追加 processor 没有意义；这里直接忽略并保留 API 简洁性。
     pub fn push_processor(&mut self, p: Box<dyn AudioProcessor>) {
-        if self.finalized {
-            return;
-        }
-        self.processors.push(p);
+        <Self as AudioWriterChain>::push_processor(self, p)
     }
 
     pub fn processors(&self) -> &[Box<dyn AudioProcessor>] {
-        &self.processors
+        <Self as AudioWriterChain>::processors(self)
     }
 
     pub fn processors_mut(&mut self) -> &mut [Box<dyn AudioProcessor>] {
-        &mut self.processors
+        <Self as AudioWriterChain>::processors_mut(self)
     }
 
     pub fn writer(&self) -> &dyn AudioWriter {
-        self.writer.as_ref()
+        <Self as AudioWriterChain>::writer(self)
     }
 
     pub fn writer_mut(&mut self) -> &mut dyn AudioWriter {
-        self.writer.as_mut()
+        <Self as AudioWriterChain>::writer_mut(self)
     }
 
     pub fn into_inner(self) -> (Vec<Box<dyn AudioProcessor>>, Box<dyn AudioWriter + Send>) {
@@ -104,6 +103,31 @@ impl LineAudioWriter {
             }
         }
         Ok(())
+    }
+}
+
+impl AudioWriterChain for LineAudioWriter {
+    fn push_processor(&mut self, p: Box<dyn AudioProcessor>) {
+        if self.finalized {
+            return;
+        }
+        self.processors.push(p);
+    }
+
+    fn processors(&self) -> &[Box<dyn AudioProcessor>] {
+        &self.processors
+    }
+
+    fn processors_mut(&mut self) -> &mut [Box<dyn AudioProcessor>] {
+        &mut self.processors
+    }
+
+    fn writer(&self) -> &dyn AudioWriter {
+        self.writer.as_ref()
+    }
+
+    fn writer_mut(&mut self) -> &mut dyn AudioWriter {
+        self.writer.as_mut()
     }
 }
 
