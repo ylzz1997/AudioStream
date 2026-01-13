@@ -67,6 +67,50 @@ impl<P: AudioProcessor> DynNode for ProcessorNode<P> {
     }
 }
 
+/// A `DynNode` wrapper around a boxed `AudioProcessor`.
+///
+/// This is useful for cases where the processor is already type-erased (e.g. Python bindings),
+/// but we still want to insert it into a `Vec<Box<dyn DynNode>>`.
+pub struct BoxedProcessorNode {
+    p: Box<dyn AudioProcessor>,
+}
+
+impl BoxedProcessorNode {
+    pub fn new(p: Box<dyn AudioProcessor>) -> Self {
+        Self { p }
+    }
+}
+
+impl DynNode for BoxedProcessorNode {
+    fn name(&self) -> &'static str {
+        self.p.name()
+    }
+
+    fn input_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Pcm
+    }
+
+    fn output_kind(&self) -> NodeBufferKind {
+        NodeBufferKind::Pcm
+    }
+
+    fn push(&mut self, input: Option<NodeBuffer>) -> CodecResult<()> {
+        match input {
+            None => self.p.send_frame(None),
+            Some(NodeBuffer::Pcm(f)) => self.p.send_frame(Some(&f as &dyn AudioFrameView)),
+            Some(_) => Err(CodecError::InvalidData("processor expects PCM input")),
+        }
+    }
+
+    fn pull(&mut self) -> CodecResult<NodeBuffer> {
+        self.p.receive_frame().map(NodeBuffer::Pcm)
+    }
+
+    fn reset(&mut self) -> CodecResult<()> {
+        self.p.reset()
+    }
+}
+
 
 impl DynNode for IdentityNode {
     fn name(&self) -> &'static str {

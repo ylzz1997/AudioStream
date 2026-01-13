@@ -1407,7 +1407,7 @@ r.run()
 
               <section class="section">
                 <h2>AsyncPipelineAudioSink</h2>
-                <pre><code class="language-python">ast.AsyncPipelineAudioSink(writer: AudioFileWriter, nodes: list[DynNode], queue_capacity: int = 8, handle_capacity: int = 32)</code></pre>
+                <pre><code class="language-python">ast.AsyncPipelineAudioSink(writer: AudioFileWriter, nodes: list[DynNode | Processor], queue_capacity: int = 8, handle_capacity: int = 32)</code></pre>
                 <p>
                   <b>异步 pipeline 写入汇（推荐用于“长链路/重计算”场景）</b>：把多个 <code>Processor/Encoder/Deocder(PCM/Packet-&gt;PCM)</code> 拆成多段并行 stage（pipeline parallel），
                   最终顺序写入一个 <code>AudioFileWriter</code>。
@@ -1426,7 +1426,7 @@ r.run()
                   <li><b>__init__(writer, nodes, queue_capacity=8, handle_capacity=32)</b>
                     <ul>
                       <li><b>writer</b>：最终写入的 <code>AudioFileWriter</code>（会被 move/搬空）。</li>
-                      <li><b>nodes</b>：<code>DynNode</code> 列表（会被 move/搬空）。支持 processor/encoder/decoder 等节点，只要相邻 input_kind/output_kind 匹配即可；最后一个节点必须输出 PCM。</li>
+                      <li><b>nodes</b>：<code>DynNode</code>/<code>Processor</code> 列表（会被 move/搬空）。<code>Processor</code> 会自动包装成 PCM-&gt;PCM 的 DynNode；Encoder/Decoder 请用 <code>make_encoder_node</code>/<code>make_decoder_node</code>。只要相邻 input_kind/output_kind 匹配即可；最后一个节点必须输出 PCM。</li>
                       <li><b>queue_capacity</b>：内部 pipeline stage 之间队列容量（背压）。</li>
                       <li><b>handle_capacity</b>：默认用于 <code>with</code> / <code>__enter__</code> 的 handle 队列容量。</li>
                     </ul>

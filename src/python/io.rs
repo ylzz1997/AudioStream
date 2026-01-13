@@ -16,6 +16,7 @@ use crate::common::io::LineAudioWriter as RsLineAudioWriter;
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
+use crate::pipeline::node::dynamic_node_interface::BoxedProcessorNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 use crate::pipeline::node::node_interface::IdentityNode;
 use crate::pipeline::sink::audio_sink::{AudioSink, AsyncAudioSink};
@@ -669,7 +670,7 @@ impl AsyncPipelineAudioSinkPy {
     fn new(
         py: Python<'_>,
         writer: Py<AudioFileWriterPy>,
-        nodes: Vec<Py<DynNodePy>>,
+        nodes: Vec<PyObject>,
         queue_capacity: usize,
         handle_capacity: usize,
     ) -> PyResult<Self> {
@@ -679,9 +680,24 @@ impl AsyncPipelineAudioSinkPy {
         };
 
         let mut ns: Vec<Box<dyn DynNode>> = Vec::with_capacity(nodes.len());
-        for n in nodes.into_iter() {
-            let mut nb = n.bind(py).borrow_mut();
-            ns.push(nb.take_inner()?);
+        for obj in nodes.into_iter() {
+            let any = obj.bind(py);
+            // 1) DynNode
+            if let Ok(n) = any.extract::<Py<DynNodePy>>() {
+                let mut nb = n.bind(py).borrow_mut();
+                ns.push(nb.take_inner()?);
+                continue;
+            }
+            // 2) Processor -> auto wrap as DynNode (PCM->PCM)
+            if let Ok(p) = any.extract::<Py<ProcessorPy>>() {
+                let mut pp = p.bind(py).borrow_mut();
+                let rs_p = pp.take_rs_processor()?;
+                ns.push(Box::new(BoxedProcessorNode::new(rs_p)));
+                continue;
+            }
+            return Err(PyValueError::new_err(
+                "nodes 仅支持 DynNode 或 Processor（Encoder/Decoder 请使用 make_encoder_node/make_decoder_node）",
+            ));
         }
 
         Ok(Self {

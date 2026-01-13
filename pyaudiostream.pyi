@@ -434,7 +434,7 @@ class AsyncPipelineAudioSink(AudioSink):
     def __init__(
         self,
         writer: AudioFileWriter,
-        nodes: list[DynNode],
+        nodes: list[DynNode | Processor],
         queue_capacity: int = 8,
         handle_capacity: int = 32,
     ) -> None: ...
