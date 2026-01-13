@@ -1364,7 +1364,7 @@ pw.finalize()
                 <p>
                   <b>线性链路写端</b>：把多个 <code>Processor(PCM-&gt;PCM)</code> 串起来，最后把结果写入一个 <code>AudioFileWriter</code>。
                   适合由于使用ParallelAudioWriter时，需要对每个writer进行不同的前处理。比如需要对每个writer进行不同的重采样（因为不同的writer可能需要不同的重采样率和数据格式）。
-                  注意：由于LineAudioWriter是同步的，所以不建议将长处理流程放在LineAudioWriter中，否则会导致阻塞！这种场景请使用AsyncDynPipeline。
+                  注意：由于LineAudioWriter是同步的，所以不建议将长处理流程放在LineAudioWriter中，否则会导致阻塞！这种场景请使用AsyncPipelineAudioSink！
                 </p>
                 <ul>
                   <li><b>writer</b>：最终落地 writer（当前仅支持 <code>AudioFileWriter</code>）。会被 move。</li> 
@@ -1402,6 +1402,133 @@ nodes = [
 
 r = ast.AsyncDynRunner(src, nodes, pw)
 r.run()
+                </code></pre>
+              </section>
+
+              <section class="section">
+                <h2>AsyncPipelineAudioSink</h2>
+                <pre><code class="language-python">ast.AsyncPipelineAudioSink(writer: AudioFileWriter, processors: Optional[list[Processor]] = None, queue_capacity: int = 8, handle_capacity: int = 32)</code></pre>
+                <p>
+                  <b>异步 pipeline 写入汇（推荐用于“长链路/重计算”场景）</b>：把多个 <code>Processor(PCM-&gt;PCM)</code> 拆成多段并行 stage（pipeline parallel），
+                  最终顺序写入一个 <code>AudioFileWriter</code>。
+                  和 <code>LineAudioWriter</code> 不同，它不会在 <code>AsyncDynRunner</code> 的输出侧形成长时间阻塞。
+                </p>
+                <h3>重要说明</h3>
+                <ul>
+                  <li><b>主要用法</b>：作为 <code>AsyncDynRunner(..., sink=...)</code> 的 sink 传入（由 Runner 的 tokio runtime 驱动）。</li>
+                  <li><b>也可以直接 push</b>：用 <code>with ... as h</code> 或显式 <code>h = sink.start()</code> 获取 handle（同步接口 + 背压）。</li>
+                  <li><b>handle_capacity</b>：Python -&gt; 后台线程的有界队列容量。满了会阻塞 <code>h.push()</code>（背压）。</li>
+                  <li><b>queue_capacity</b>：sink 内部 pipeline 各 stage 之间的有界队列容量（背压）。越大吞吐更高但占用更多内存。</li>
+                  <li><b>两者关系</b>：这是两层队列，整体排队/内存/延迟由两者共同决定；一般先调 <code>handle_capacity</code>（吸收调用侧突发），再按吞吐需要调 <code>queue_capacity</code>。</li>
+                </ul>
+                <h3>API（方法与参数）</h3>
+                <ul>
+                  <li><b>__init__(writer, processors=None, queue_capacity=8, handle_capacity=32)</b>
+                    <ul>
+                      <li><b>writer</b>：最终写入的 <code>AudioFileWriter</code>（会被 move/搬空）。</li>
+                      <li><b>processors</b>：<code>Processor</code> 列表（会被 move/搬空）。</li>
+                      <li><b>queue_capacity</b>：内部 pipeline stage 之间队列容量（背压）。</li>
+                      <li><b>handle_capacity</b>：默认用于 <code>with</code> / <code>__enter__</code> 的 handle 队列容量。</li>
+                    </ul>
+                  </li>
+                  <li><b>start(handle_capacity=32) -&gt; AsyncPipelineAudioSinkHandle</b>：启动后台线程 + tokio runtime，返回可直接 push 的 handle。</li>
+                  <li><b>stop() -&gt; None</b>：停止内部 handle（等价于 handle.finalize + join）。</li>
+                  <li><b>__enter__() -&gt; AsyncPipelineAudioSinkHandle</b>：进入 <code>with</code> 时自动 start，并返回 handle。</li>
+                  <li><b>__exit__(exc_type=None, exc=None, tb=None) -&gt; bool</b>：退出 <code>with</code> 时自动 stop（不吞异常）。</li>
+                  <li><b>push(buf) / finalize()</b>：为接口兼容保留，但<b>不建议直接调用</b>（请用 Runner 或 handle）。</li>
+                </ul>
+                <h3>AsyncPipelineAudioSinkHandle（直接调用的 handle）</h3>
+                <ul>
+                  <li><b>push(buf: NodeBuffer) -&gt; None</b>：同步入队；队列满会阻塞（背压）。</li>
+                  <li><b>finalize() -&gt; None</b>：同步等待后台 sink 完成 flush + finalize。</li>
+                </ul>
+                <h3>示例：长处理链路写文件（用 AsyncPipelineAudioSink 避免阻塞）</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+
+src = ast.AudioFileReader("test.wav", "wav")
+out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
+dst = ast.AudioFileWriter("out_async.flac", "flac", compression_level=8, input_format=out_fmt)
+
+# 这里 processors 会被 move
+sink = ast.AsyncPipelineAudioSink(
+    dst,
+    processors=[
+        ast.Processor.resample(None, out_fmt),
+        ast.Processor.gain(None, gain=1.1),
+    ],
+    queue_capacity=8,
+)
+
+nodes = [ast.make_identity_node("pcm")]
+r = ast.AsyncDynRunner(src, nodes, sink)
+r.run()
+                </code></pre>
+                <h3>示例：with 管理（自动 start/stop，返回 handle 可直接 push）</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+
+dst = ast.AudioFileWriter("out_async2.flac", "flac", compression_level=8, input_format=out_fmt)
+with ast.AsyncPipelineAudioSink(dst, processors=[ast.Processor.resample(None, out_fmt)]) as h:
+    h.push(ast.NodeBuffer.pcm(pcm, out_fmt))
+    h.finalize()
+                </code></pre>
+              </section>
+
+              <section class="section">
+                <h2>AsyncParallelAudioSink</h2>
+                <pre><code class="language-python">ast.AsyncParallelAudioSink(sinks: list[AudioSink], handle_capacity: int = 32)</code></pre>
+                <p>
+                  <b>异步并行 fan-out 汇</b>：把每个输入同时发送到多个 sink，并发执行所有 sink 的 <code>push()</code>/<code>finalize()</code>。
+                  适合把同一路输出“异步写多份结果”的场景（尤其当绑定的 sink 本身是异步的，比如 <code>AsyncPipelineAudioSink</code>）。
+                </p>
+                <h3>重要说明</h3>
+                <ul>
+                  <li><b>主要用法</b>：作为 <code>AsyncDynRunner(..., sink=...)</code> 的 sink 传入（由 Runner 的 tokio runtime 驱动）。</li>
+                  <li><b>也可以直接 push</b>：用 <code>with ... as h</code> 或显式 <code>h = sink.start()</code> 获取 handle（同步接口 + 背压）。</li>
+                </ul>
+                <h3>API（方法与参数）</h3>
+                <ul>
+                  <li><b>__init__(sinks, handle_capacity=32)</b>
+                    <ul>
+                      <li><b>sinks</b>：要 fan-out 的 sink 列表（可以混合：<code>AsyncPipelineAudioSink</code> / <code>AsyncParallelAudioSink</code> / 自定义 Python sink）。</li>
+                      <li><b>handle_capacity</b>：默认用于 <code>with</code> / <code>__enter__</code> 的 handle 队列容量。</li>
+                    </ul>
+                  </li>
+                  <li><b>start(handle_capacity=32) -&gt; AsyncParallelAudioSinkHandle</b>：启动后台线程 + tokio runtime，返回可直接 push 的 handle。</li>
+                  <li><b>stop() -&gt; None</b>：停止内部 handle（等价于 handle.finalize + join）。</li>
+                  <li><b>__enter__() -&gt; AsyncParallelAudioSinkHandle</b>：进入 <code>with</code> 时自动 start，并返回 handle。</li>
+                  <li><b>__exit__(exc_type=None, exc=None, tb=None) -&gt; bool</b>：退出 <code>with</code> 时自动 stop（不吞异常）。</li>
+                  <li><b>push(buf) / finalize()</b>：为接口兼容保留，但<b>不建议直接调用</b>（请用 Runner 或 handle）。</li>
+                </ul>
+                <h3>AsyncParallelAudioSinkHandle（直接调用的 handle）</h3>
+                <ul>
+                  <li><b>push(buf: NodeBuffer) -&gt; None</b>：同步入队；队列满会阻塞（背压）。</li>
+                  <li><b>finalize() -&gt; None</b>：同步等待后台 sink 完成并行 fan-out + finalize。</li>
+                </ul>
+                <h3>示例：异步写两份（每份不同的 processors/格式）</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+
+src = ast.AudioFileReader("test.wav", "wav")
+
+fmt1 = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
+fmt2 = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="i16", planar=False)
+
+w1 = ast.AudioFileWriter("a.flac", "flac", compression_level=8, input_format=fmt1)
+w2 = ast.AudioFileWriter("b.mp3", "mp3", bitrate=320_000, input_format=fmt2)
+
+s1 = ast.AsyncPipelineAudioSink(w1, processors=[ast.Processor.resample(None, fmt1)], queue_capacity=8)
+s2 = ast.AsyncPipelineAudioSink(w2, processors=[ast.Processor.resample(None, fmt2)], queue_capacity=8)
+
+sink = ast.AsyncParallelAudioSink([s1, s2])
+r = ast.AsyncDynRunner(src, [ast.make_identity_node("pcm")], sink)
+r.run()
+                </code></pre>
+                <h3>示例：with 管理（自动 start/stop，返回 handle 可直接 push）</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+
+sink = ast.AsyncParallelAudioSink([s1, s2])
+with sink as h:
+    h.push(ast.NodeBuffer.pcm(pcm, out_fmt))
+    h.finalize()
                 </code></pre>
               </section>
 

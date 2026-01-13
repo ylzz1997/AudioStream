@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use tokio::sync::oneshot;
 
 /// node 之间传递的数据类型（运行时版 pipeline 用）。
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum NodeBuffer {
     Pcm(AudioFrame),
     Packet(CodecPacket),

@@ -95,8 +95,8 @@ async fn transcode_ffmpeg(input: &str, output: &str) -> Result<(), Box<dyn std::
     use audiostream::pipeline::node::node_interface::{NodeBufferKind, IdentityNode};
     use audiostream::runner::async_dynamic_runner::AsyncDynRunner;
     use audiostream::runner::async_runner_interface::AsyncRunner;
-    use audiostream::runner::audio_sink::PcmSink;
-    use audiostream::runner::audio_source::{PcmSource, PrependSource};
+    use audiostream::pipeline::sink::audio_sink::PcmSink;
+    use audiostream::pipeline::source::audio_source::{PcmSource, PrependSource};
 
     let in_ext = ext_lower(input).ok_or("missing input extension")?;
     let out_ext = ext_lower(output).ok_or("missing output extension")?;

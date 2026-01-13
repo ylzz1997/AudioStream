@@ -4,6 +4,7 @@ use crate::codec::encoder::aac_encoder::AacEncoderConfig;
 use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
 use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 use crate::codec::error::CodecError;
+use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::codec::packet::{CodecPacket, PacketFlags};
 use crate::common::audio::audio::{AudioFormat as RsAudioFormat, AudioFrameView, AudioFrameViewMut, Rational, SampleType};
 use crate::common::io::file as rs_file;
@@ -11,14 +12,15 @@ use crate::common::io::file::{
     AudioFileReadConfig, AudioFileReader as RsAudioFileReader, AudioFileWriteConfig, AudioFileWriter as RsAudioFileWriter,
 };
 use crate::common::io::boundwriter::{MultiAudioWriter, ParallelAudioWriter as RsParallelAudioWriter};
+use crate::pipeline::sink::{AsyncParallelAudioSink as RsAsyncParallelAudioSink, AsyncPipelineAudioSink as RsAsyncPipelineAudioSink};
 use crate::common::io::LineAudioWriter as RsLineAudioWriter;
 use crate::common::io::io::{AudioReader, AudioWriter};
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 use crate::pipeline::node::node_interface::IdentityNode;
-use crate::runner::audio_sink::AudioSink;
-use crate::runner::audio_source::AudioSource;
+use crate::pipeline::sink::audio_sink::{AudioSink, AsyncAudioSink, AsyncPcmSink};
+use crate::pipeline::source::audio_source::AudioSource;
 use crate::runner::async_auto_runner::AsyncAutoRunner;
 use crate::runner::async_runner_interface::AsyncRunner;
 use crate::runner::error::{RunnerError, RunnerResult};
@@ -26,6 +28,9 @@ use crate::runner::error::{RunnerError, RunnerResult};
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc as std_mpsc;
 use tokio::runtime::{Builder, Runtime};
 
 use crate::python::errors::{map_codec_err, map_file_err, map_runner_err, pyerr_to_codec_err, pyerr_to_runner_err};
@@ -637,11 +642,562 @@ impl AudioSink for PyCallbackSink {
     }
 }
 
+/// Python 侧 AsyncPipelineAudioSink（builder）：`processors (PCM->PCM)* -> writer`，每段 processor 都是并行 stage（tokio + spawn_blocking）。
+///
+/// 注意：
+/// - 该对象本身不提供 `push/finalize` 的直接写入能力；
+/// - 设计为**传入 `AsyncDynRunner` 作为 sink**，Runner 会把它 move 到 Rust runtime 中执行。
+#[pyclass(name = "AsyncPipelineAudioSink", unsendable)]
+pub struct AsyncPipelineAudioSinkPy {
+    parts: Option<AsyncPipelineAudioSinkParts>,
+    handle_capacity: usize,
+    handle: Option<Py<AsyncPipelineAudioSinkHandlePy>>,
+}
+
+struct AsyncPipelineAudioSinkParts {
+    processors: Vec<Box<dyn AudioProcessor>>,
+    writer: Box<dyn AudioWriter + Send>,
+    queue_capacity: usize,
+}
+
+#[pymethods]
+impl AsyncPipelineAudioSinkPy {
+    /// 构造：绑定一个最终 writer，并可选绑定一组 processors（按顺序执行）。
+    ///
+    /// 绑定后传入的 `AudioFileWriter` / `Processor` 会被“搬空”，不可再使用。
+    #[new]
+    #[pyo3(signature = (writer, processors=None, queue_capacity=8, handle_capacity=32))]
+    fn new(
+        py: Python<'_>,
+        writer: Py<AudioFileWriterPy>,
+        processors: Option<Vec<Py<ProcessorPy>>>,
+        queue_capacity: usize,
+        handle_capacity: usize,
+    ) -> PyResult<Self> {
+        let rs_writer = {
+            let mut ww = writer.bind(py).borrow_mut();
+            ww.take_rs_writer()?
+        };
+
+        let mut ps: Vec<Box<dyn crate::codec::processor::processor_interface::AudioProcessor>> = Vec::new();
+        if let Some(procs) = processors {
+            ps.reserve(procs.len());
+            for p in procs {
+                let mut pp = p.bind(py).borrow_mut();
+                ps.push(pp.take_rs_processor()?);
+            }
+        }
+
+        Ok(Self {
+            parts: Some(AsyncPipelineAudioSinkParts {
+                processors: ps,
+                writer: Box::new(rs_writer),
+                queue_capacity,
+            }),
+            handle_capacity: handle_capacity.max(1),
+            handle: None,
+        })
+    }
+
+    /// 启动一个可直接 `push/finalize` 的句柄（内部后台线程运行 tokio runtime）。
+    ///
+    /// - `handle_capacity`: 句柄输入队列容量（>=1）。越大吞吐更高、延迟/内存越大；满了会阻塞 `push()`（背压）。
+    #[pyo3(signature = (handle_capacity=32))]
+    fn start(&mut self, handle_capacity: usize) -> PyResult<AsyncPipelineAudioSinkHandlePy> {
+        let parts = self
+            .parts
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("AsyncPipelineAudioSink is already taken"))?;
+
+        let cap = handle_capacity.max(1);
+        let (tx, rx) = std_mpsc::sync_channel::<SinkHandleCmd>(cap);
+        let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let err2 = err.clone();
+
+        let join = std::thread::spawn(move || {
+            let rt = match Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let mut g = err2.lock().expect("err_store poisoned");
+                    *g = Some(format!("tokio Runtime init failed: {e}"));
+                    return;
+                }
+            };
+            let _guard = rt.enter();
+
+            // Build the real Rust async sink inside a *running* runtime context.
+            // This is required because `AsyncPipelineAudioSink::new` spawns tasks immediately.
+            let mut sink = match rt.block_on(async move {
+                let rs = RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity);
+                Ok::<_, RunnerError>(AsyncPcmSink::new(rs))
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut g = err2.lock().expect("err_store poisoned");
+                    *g = Some(e.to_string());
+                    return;
+                }
+            };
+
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    SinkHandleCmd::Data(buf) => {
+                        if let Err(e) = rt.block_on(sink.push(buf)) {
+                            let mut g = err2.lock().expect("err_store poisoned");
+                            *g = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    SinkHandleCmd::Finalize => {
+                        if let Err(e) = rt.block_on(sink.finalize()) {
+                            let mut g = err2.lock().expect("err_store poisoned");
+                            *g = Some(e.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(AsyncPipelineAudioSinkHandlePy {
+            tx: Some(tx),
+            join: Some(join),
+            err,
+        })
+    }
+
+    /// stop(): 关闭内部 handle（等价 finalize + join）。
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(h) = self.handle.take() else {
+            return Ok(());
+        };
+        let mut hh = h.bind(py).borrow_mut();
+        hh.finalize()
+    }
+
+    /// 支持 `with`：进入时自动 start，返回 handle。
+    fn __enter__(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(h) = &self.handle {
+            return Ok(h.to_object(py));
+        }
+        let h = self.start(self.handle_capacity)?;
+        let h = Py::new(py, h)?;
+        self.handle = Some(h.clone_ref(py));
+        Ok(h.to_object(py))
+    }
+
+    /// 支持 `with`：退出时自动 stop（不吞异常）。
+    #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Option<PyObject>,
+        _exc: Option<PyObject>,
+        _tb: Option<PyObject>,
+    ) -> PyResult<bool> {
+        let _ = self.stop(py);
+        Ok(false)
+    }
+
+    /// 为了类型兼容（AudioSink），这里提供同名方法，但不支持直接调用。
+    fn push(&mut self, _py: Python<'_>, _buf: Py<NodeBufferPy>) -> PyResult<()> {
+        Err(PyRuntimeError::new_err(
+            "AsyncPipelineAudioSink cannot be pushed directly；please pass it to AsyncDynRunner as a sink",
+        ))
+    }
+
+    /// 为了类型兼容（AudioSink），这里提供同名方法，但不支持直接调用。
+    fn finalize(&mut self, _py: Python<'_>) -> PyResult<()> {
+        Err(PyRuntimeError::new_err(
+            "AsyncPipelineAudioSink cannot be finalized directly；please pass it to AsyncDynRunner as a sink",
+        ))
+    }
+}
+
+impl AsyncPipelineAudioSinkPy {
+    /// 仅取出构建参数（move），不在当前线程构建/spawn。
+    ///
+    /// 真实的 Rust async sink 必须在 tokio runtime 上下文中构建（会 spawn stage 任务）。
+    fn take_parts(&mut self) -> PyResult<AsyncPipelineAudioSinkParts> {
+        self.parts
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("AsyncPipelineAudioSink is already taken"))
+    }
+}
+
+enum SinkHandleCmd {
+    Data(NodeBuffer),
+    Finalize,
+}
+
+/// 可直接 `push/finalize` 的句柄：内部用后台线程 + tokio runtime 驱动真正的 async sink。
+#[pyclass(name = "AsyncPipelineAudioSinkHandle", unsendable)]
+pub struct AsyncPipelineAudioSinkHandlePy {
+    tx: Option<std_mpsc::SyncSender<SinkHandleCmd>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    err: Arc<Mutex<Option<String>>>,
+}
+
+#[pymethods]
+impl AsyncPipelineAudioSinkHandlePy {
+    /// push(buf: NodeBuffer)
+    fn push(&mut self, py: Python<'_>, buf: Py<NodeBufferPy>) -> PyResult<()> {
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+
+        let inner_buf = {
+            let mut b = buf.bind(py).borrow_mut();
+            b.take_inner()?
+        };
+
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(PyRuntimeError::new_err("AsyncPipelineAudioSinkHandle is closed"));
+        };
+        tx.send(SinkHandleCmd::Data(inner_buf))
+            .map_err(|_| PyRuntimeError::new_err("AsyncPipelineAudioSinkHandle channel closed"))?;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> PyResult<()> {
+        if self.tx.is_none() && self.join.is_none() {
+            return Ok(());
+        }
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(SinkHandleCmd::Finalize);
+        }
+        if let Some(j) = self.join.take() {
+            j.join()
+                .map_err(|_| PyRuntimeError::new_err("AsyncPipelineAudioSinkHandle worker panicked"))?;
+        }
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncPipelineAudioSinkHandlePy {
+    fn drop(&mut self) {
+        // Best-effort shutdown; ignore errors during GC.
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(SinkHandleCmd::Finalize);
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Python 侧 AsyncParallelAudioSink（builder）：fan-out 多个 sink 并发执行（tokio spawn）。
+///
+/// 注意：
+/// - 该对象本身不提供 `push/finalize` 的直接写入能力；
+/// - 设计为**传入 `AsyncDynRunner` 作为 sink**，Runner 会把它 move 到 Rust runtime 中执行。
+#[pyclass(name = "AsyncParallelAudioSink", unsendable)]
+pub struct AsyncParallelAudioSinkPy {
+    sinks: Option<Vec<PyObject>>,
+    handle_capacity: usize,
+    handle: Option<Py<AsyncParallelAudioSinkHandlePy>>,
+}
+
+#[pymethods]
+impl AsyncParallelAudioSinkPy {
+    #[new]
+    #[pyo3(signature = (sinks, handle_capacity=32))]
+    fn new(sinks: Vec<PyObject>, handle_capacity: usize) -> PyResult<Self> {
+        if sinks.is_empty() {
+            return Err(PyValueError::new_err("sinks 不能为空"));
+        }
+        Ok(Self {
+            sinks: Some(sinks),
+            handle_capacity: handle_capacity.max(1),
+            handle: None,
+        })
+    }
+
+    fn push(&mut self, _py: Python<'_>, _buf: Py<NodeBufferPy>) -> PyResult<()> {
+        Err(PyRuntimeError::new_err(
+            "AsyncParallelAudioSink 不能直接 push；请把它作为 sink 传入 AsyncDynRunner",
+        ))
+    }
+
+    fn finalize(&mut self, _py: Python<'_>) -> PyResult<()> {
+        Err(PyRuntimeError::new_err(
+            "AsyncParallelAudioSink 不能直接 finalize；请把它作为 sink 传入 AsyncDynRunner",
+        ))
+    }
+
+    /// 启动一个可直接 `push/finalize` 的句柄（内部后台线程运行 tokio runtime）。
+    ///
+    /// - `handle_capacity`: 句柄输入队列容量（>=1）。越大吞吐更高、延迟/内存越大；满了会阻塞 `push()`（背压）。
+    #[pyo3(signature = (handle_capacity=32))]
+    fn start(&mut self, py: Python<'_>, handle_capacity: usize) -> PyResult<AsyncParallelAudioSinkHandlePy> {
+        // 在当前线程（持有 GIL）只“取出构建参数/对象引用”，不要在这里构建会 spawn 的 Rust sink。
+        enum SinkSpec {
+            Pipeline(AsyncPipelineAudioSinkParts),
+            Parallel(Vec<SinkSpec>),
+            Py(Py<PyAny>),
+        }
+
+        fn collect_specs(py: Python<'_>, obj: PyObject) -> PyResult<Vec<SinkSpec>> {
+            let any = obj.bind(py);
+
+            // 1) AsyncPipelineAudioSink -> take parts (build later in runtime thread)
+            if let Ok(p) = any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
+                let mut pp = p.bind(py).borrow_mut();
+                let parts = pp.take_parts()?;
+                return Ok(vec![SinkSpec::Pipeline(parts)]);
+            }
+
+            // 2) Nested AsyncParallelAudioSink -> collect nested specs
+            if let Ok(p) = any.extract::<Py<AsyncParallelAudioSinkPy>>() {
+                let mut pp = p.bind(py).borrow_mut();
+                let nested = pp.take_sinks()?;
+                let mut outs: Vec<SinkSpec> = Vec::new();
+                for n in nested {
+                    outs.extend(collect_specs(py, n)?);
+                }
+                return Ok(vec![SinkSpec::Parallel(outs)]);
+            }
+
+            // 3) Fallback: treat as Python callback sink object (push/finalize)
+            let py_obj: Py<PyAny> = obj.extract(py)?;
+            Ok(vec![SinkSpec::Py(py_obj)])
+        }
+
+        let sinks = self.take_sinks()?;
+        let mut specs: Vec<SinkSpec> = Vec::new();
+        for s in sinks {
+            specs.extend(collect_specs(py, s)?);
+        }
+        if specs.is_empty() {
+            return Err(PyValueError::new_err("sinks 不能为空"));
+        }
+
+        let cap = handle_capacity.max(1);
+        let (tx, rx) = std_mpsc::sync_channel::<SinkHandleCmd>(cap);
+        let err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let err2 = err.clone();
+
+        let join = std::thread::spawn(move || {
+            let rt = match Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let mut g = err2.lock().expect("err_store poisoned");
+                    *g = Some(format!("tokio Runtime init failed: {e}"));
+                    return;
+                }
+            };
+            let _guard = rt.enter();
+
+            // Build all sinks inside ONE running runtime context (no nested block_on).
+            let mut par = match rt.block_on(async move {
+                fn build(spec: SinkSpec) -> Result<Box<dyn AsyncAudioSink<In = NodeBuffer> + Send>, RunnerError> {
+                    match spec {
+                        SinkSpec::Pipeline(parts) => {
+                            let rs = RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity);
+                            Ok(Box::new(AsyncPcmSink::new(rs)))
+                        }
+                        SinkSpec::Parallel(children) => {
+                            let mut par = RsAsyncParallelAudioSink::<NodeBuffer>::with_capacity(children.len());
+                            for c in children {
+                                par.bind(build(c)?);
+                            }
+                            Ok(Box::new(par))
+                        }
+                        SinkSpec::Py(obj) => Ok(Box::new(PyCallbackSink { obj })),
+                    }
+                }
+
+                let mut par = RsAsyncParallelAudioSink::<NodeBuffer>::with_capacity(specs.len());
+                for s in specs {
+                    par.bind(build(s)?);
+                }
+                Ok::<_, RunnerError>(par)
+            }) {
+                Ok(v) => v,
+                Err(e) => {
+                    let mut g = err2.lock().expect("err_store poisoned");
+                    *g = Some(e.to_string());
+                    return;
+                }
+            };
+
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    SinkHandleCmd::Data(buf) => {
+                        if let Err(e) = rt.block_on(par.push(buf)) {
+                            let mut g = err2.lock().expect("err_store poisoned");
+                            *g = Some(e.to_string());
+                            break;
+                        }
+                    }
+                    SinkHandleCmd::Finalize => {
+                        if let Err(e) = rt.block_on(par.finalize()) {
+                            let mut g = err2.lock().expect("err_store poisoned");
+                            *g = Some(e.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(AsyncParallelAudioSinkHandlePy {
+            tx: Some(tx),
+            join: Some(join),
+            err,
+        })
+    }
+
+    /// stop(): 关闭内部 handle（等价 finalize + join）。
+    fn stop(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(h) = self.handle.take() else {
+            return Ok(());
+        };
+        let mut hh = h.bind(py).borrow_mut();
+        hh.finalize()
+    }
+
+    /// 支持 `with`：进入时自动 start，返回 handle。
+    fn __enter__(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(h) = &self.handle {
+            return Ok(h.to_object(py));
+        }
+        let h = self.start(py, self.handle_capacity)?;
+        let h = Py::new(py, h)?;
+        self.handle = Some(h.clone_ref(py));
+        Ok(h.to_object(py))
+    }
+
+    /// 支持 `with`：退出时自动 stop（不吞异常）。
+    #[pyo3(signature = (_exc_type=None, _exc=None, _tb=None))]
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Option<PyObject>,
+        _exc: Option<PyObject>,
+        _tb: Option<PyObject>,
+    ) -> PyResult<bool> {
+        let _ = self.stop(py);
+        Ok(false)
+    }
+}
+
+impl AsyncParallelAudioSinkPy {
+    fn take_sinks(&mut self) -> PyResult<Vec<PyObject>> {
+        self.sinks
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("AsyncParallelAudioSink is already taken"))
+    }
+}
+
+/// 可直接 `push/finalize` 的句柄：驱动 `AsyncParallelAudioSink`（后台线程 + tokio runtime）。
+#[pyclass(name = "AsyncParallelAudioSinkHandle", unsendable)]
+pub struct AsyncParallelAudioSinkHandlePy {
+    tx: Option<std_mpsc::SyncSender<SinkHandleCmd>>,
+    join: Option<std::thread::JoinHandle<()>>,
+    err: Arc<Mutex<Option<String>>>,
+}
+
+#[pymethods]
+impl AsyncParallelAudioSinkHandlePy {
+    fn push(&mut self, py: Python<'_>, buf: Py<NodeBufferPy>) -> PyResult<()> {
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+        let inner_buf = {
+            let mut b = buf.bind(py).borrow_mut();
+            b.take_inner()?
+        };
+        let Some(tx) = self.tx.as_ref() else {
+            return Err(PyRuntimeError::new_err("AsyncParallelAudioSinkHandle is closed"));
+        };
+        tx.send(SinkHandleCmd::Data(inner_buf))
+            .map_err(|_| PyRuntimeError::new_err("AsyncParallelAudioSinkHandle channel closed"))?;
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> PyResult<()> {
+        if self.tx.is_none() && self.join.is_none() {
+            return Ok(());
+        }
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(SinkHandleCmd::Finalize);
+        }
+        if let Some(j) = self.join.take() {
+            j.join()
+                .map_err(|_| PyRuntimeError::new_err("AsyncParallelAudioSinkHandle worker panicked"))?;
+        }
+        if let Some(msg) = self.err.lock().ok().and_then(|g| g.clone()) {
+            return Err(PyRuntimeError::new_err(msg));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AsyncParallelAudioSinkHandlePy {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(SinkHandleCmd::Finalize);
+        }
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// `AsyncDynRunnerPy` 内部使用的 sink：
+/// - 默认：调用 Python 回调对象（同步）
+/// - 特判：可直接使用 Rust 的 async sink（例如 `AsyncPipelineAudioSink`），避免 Python 回调开销
+enum AnyNodeBufferAsyncSink {
+    Py(PyCallbackSink),
+    RustAsyncPcm(AsyncPcmSink<RsAsyncPipelineAudioSink>),
+    RustParallel(RsAsyncParallelAudioSink<NodeBuffer>),
+}
+
+#[async_trait]
+impl AsyncAudioSink for AnyNodeBufferAsyncSink {
+    type In = NodeBuffer;
+
+    fn name(&self) -> &'static str {
+        match self {
+            AnyNodeBufferAsyncSink::Py(s) => AudioSink::name(s),
+            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.name(),
+            AnyNodeBufferAsyncSink::RustParallel(s) => s.name(),
+        }
+    }
+
+    async fn push(&mut self, input: Self::In) -> RunnerResult<()> {
+        match self {
+            AnyNodeBufferAsyncSink::Py(s) => AudioSink::push(s, input),
+            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.push(input).await,
+            AnyNodeBufferAsyncSink::RustParallel(s) => s.push(input).await,
+        }
+    }
+
+    async fn finalize(&mut self) -> RunnerResult<()> {
+        match self {
+            AnyNodeBufferAsyncSink::Py(s) => AudioSink::finalize(s),
+            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.finalize().await,
+            AnyNodeBufferAsyncSink::RustParallel(s) => s.finalize().await,
+        }
+    }
+}
+
 /// Python 侧 AsyncDynRunner（动态节点列表 + Python Source/Sink）。
 #[pyclass(name = "AsyncDynRunner")]
 pub struct AsyncDynRunnerPy {
     rt: Runtime,
-    runner: AsyncAutoRunner<AsyncDynPipeline, PyCallbackSource, PyCallbackSink>,
+    runner: AsyncAutoRunner<AsyncDynPipeline, PyCallbackSource, AnyNodeBufferAsyncSink>,
 }
 
 #[pymethods]
@@ -663,12 +1219,77 @@ impl AsyncDynRunnerPy {
             .enable_all()
             .build()
             .map_err(|e| PyRuntimeError::new_err(format!("tokio Runtime init failed: {e}")))?;
-        let _guard = rt.enter();
-        let pipeline = AsyncDynPipeline::new(boxed).map_err(map_codec_err)?;
+        let pipeline = rt
+            .block_on(async { AsyncDynPipeline::new(boxed) })
+            .map_err(map_codec_err)?;
+
+        // sink: 优先识别 Rust 的 AsyncPipelineAudioSink / AsyncParallelAudioSink（可真正 async + 背压）
+        let sink_any = {
+            let any = sink.bind(py);
+            if let Ok(w) = any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
+                let mut ww = w.bind(py).borrow_mut();
+                let parts = ww.take_parts()?;
+                let rs_sink = rt.block_on(async move {
+                    RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
+                });
+                AnyNodeBufferAsyncSink::RustAsyncPcm(AsyncPcmSink::new(rs_sink))
+            } else if let Ok(w) = any.extract::<Py<AsyncParallelAudioSinkPy>>() {
+                let mut ww = w.bind(py).borrow_mut();
+                let inner_sinks = ww.take_sinks()?;
+                let mut par = RsAsyncParallelAudioSink::<NodeBuffer>::with_capacity(inner_sinks.len());
+
+                for s_obj in inner_sinks {
+                    let s_any = s_obj.bind(py);
+
+                    // 1) Rust async pipeline sink
+                    if let Ok(p) = s_any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
+                        let mut pp = p.bind(py).borrow_mut();
+                        let parts = pp.take_parts()?;
+                        let rs = rt.block_on(async move {
+                            RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
+                        });
+                        par.bind(Box::new(AsyncPcmSink::new(rs)));
+                        continue;
+                    }
+
+                    // 2) Nested async-parallel sink
+                    if let Ok(p) = s_any.extract::<Py<AsyncParallelAudioSinkPy>>() {
+                        let mut pp = p.bind(py).borrow_mut();
+                        let nested = pp.take_sinks()?;
+                        let mut nested_par = RsAsyncParallelAudioSink::<NodeBuffer>::with_capacity(nested.len());
+                        for nn in nested {
+                            let nn_any = nn.bind(py);
+                            if let Ok(nn_p) = nn_any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
+                                let mut nnp = nn_p.bind(py).borrow_mut();
+                                let parts = nnp.take_parts()?;
+                                let rs = rt.block_on(async move {
+                                    RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
+                                });
+                                nested_par.bind(Box::new(AsyncPcmSink::new(rs)));
+                            } else {
+                                let nn_py: Py<PyAny> = nn.extract(py)?;
+                                nested_par.bind(Box::new(AnyNodeBufferAsyncSink::Py(PyCallbackSink { obj: nn_py })));
+                            }
+                        }
+                        par.bind(Box::new(nested_par));
+                        continue;
+                    }
+
+                    // 3) Fallback: Python callback sink object
+                    let s_py: Py<PyAny> = s_obj.extract(py)?;
+                    par.bind(Box::new(AnyNodeBufferAsyncSink::Py(PyCallbackSink { obj: s_py })));
+                }
+
+                AnyNodeBufferAsyncSink::RustParallel(par)
+            } else {
+                AnyNodeBufferAsyncSink::Py(PyCallbackSink { obj: sink })
+            }
+        };
+
         let runner = AsyncAutoRunner::new(
             PyCallbackSource { obj: source },
             pipeline,
-            PyCallbackSink { obj: sink },
+            sink_any,
         );
         Ok(Self { rt, runner })
     }

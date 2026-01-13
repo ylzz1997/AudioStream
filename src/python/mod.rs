@@ -20,7 +20,9 @@ pub use crate::python::processor::{
 };
 pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
-    DynNodePy, LineAudioWriterPy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy, make_identity_node, make_python_node,
+    AsyncParallelAudioSinkHandlePy, AsyncParallelAudioSinkPy, AsyncPipelineAudioSinkHandlePy, AsyncPipelineAudioSinkPy,
+    DynNodePy, LineAudioWriterPy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy,
+    make_identity_node, make_python_node,
 };
 
 use pyo3::prelude::*;
@@ -66,6 +68,10 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AudioFileWriterPy>()?;
     m.add_class::<ParallelAudioWriterPy>()?;
     m.add_class::<LineAudioWriterPy>()?;
+    m.add_class::<AsyncPipelineAudioSinkPy>()?;
+    m.add_class::<AsyncPipelineAudioSinkHandlePy>()?;
+    m.add_class::<AsyncParallelAudioSinkPy>()?;
+    m.add_class::<AsyncParallelAudioSinkHandlePy>()?;
 
     // functions
     m.add_function(wrap_pyfunction!(io::make_identity_node, m)?)?;

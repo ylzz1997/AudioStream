@@ -1,7 +1,7 @@
 use crate::pipeline::node::node_interface::{AsyncPipelineConsumer, AsyncPipelineEndpoint, AsyncPipelineProducer};
 use crate::runner::async_runner_interface::AsyncRunner;
-use crate::runner::audio_sink::AsyncAudioSink;
-use crate::runner::audio_source::AsyncAudioSource;
+use crate::pipeline::sink::audio_sink::AsyncAudioSink;
+use crate::pipeline::source::audio_source::AsyncAudioSource;
 use crate::runner::error::{RunnerError, RunnerResult};
 use async_trait::async_trait;
 

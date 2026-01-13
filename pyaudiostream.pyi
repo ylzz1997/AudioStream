@@ -417,6 +417,83 @@ class LineAudioWriter(AudioSink):
     def finalize(self) -> None: ...
 
 
+class AsyncPipelineAudioSink(AudioSink):
+    """
+    异步 pipeline sink：processors(PCM->PCM)* -> writer，每段 processor 在后台并行执行（tokio pipeline parallel）。
+
+    注意：
+    - 该对象既可以作为 `AsyncDynRunner(..., sink=...)` 的 sink 传入；
+    - 也可以通过 `start()` 启动一个可直接 `push/finalize` 的句柄（语义更接近 Pipeline 的 push）。
+    - 构造时传入的 writer 与 processors 会被“move/搬空”，之后不可再使用。
+    """
+
+    def __init__(
+        self,
+        writer: AudioFileWriter,
+        processors: Optional[list[Processor]] = None,
+        queue_capacity: int = 8,
+        handle_capacity: int = 32,
+    ) -> None: ...
+
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+    def start(self, handle_capacity: int = 32) -> AsyncPipelineAudioSinkHandle: ...
+
+    def stop(self) -> None: ...
+
+    def __enter__(self) -> AsyncPipelineAudioSinkHandle: ...
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None: ...
+
+
+class AsyncPipelineAudioSinkHandle(AudioSink):
+    """
+    可直接 push/finalize 的句柄：内部后台线程运行 tokio runtime 驱动真正的 async sink。
+
+    - push 只是把数据放入有界队列；队列满会阻塞（背压）
+    - finalize 会等待后台 sink 完成 flush + finalize
+    """
+
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+
+class AsyncParallelAudioSink(AudioSink):
+    """
+    异步并行 fan-out sink：把每个输入同时发送到多个 sink，并发执行。
+
+    注意：该对象主要用于作为 `AsyncDynRunner(..., sink=...)` 的 sink 传入；
+    也可以直接 push/finalize，但需要先 `start(handle_capacity=32)` 获取句柄。
+    """
+
+    def __init__(self, sinks: list[AudioSink], handle_capacity: int = 32) -> None: ...
+
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+    def start(self, handle_capacity: int = 32) -> AsyncParallelAudioSinkHandle: ...
+
+    def stop(self) -> None: ...
+
+    def __enter__(self) -> AsyncParallelAudioSinkHandle: ...
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None: ...
+
+
+class AsyncParallelAudioSinkHandle(AudioSink):
+    """
+    可直接 push/finalize 的句柄：内部后台线程运行 tokio runtime 驱动真正的 async 并行 fan-out sink。
+    """
+
+    def push(self, buf: NodeBuffer) -> None: ...
+
+    def finalize(self) -> None: ...
+
+
 class Processor:
     name: str
 

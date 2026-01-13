@@ -110,4 +110,42 @@ where
     }
 }
 
+/// 把 `AsyncAudioSink<In = AudioFrame>` 适配为 `AsyncAudioSink<In = NodeBuffer>`（仅支持 PCM）。
+pub struct AsyncPcmSink<S> {
+    inner: S,
+}
+
+impl<S> AsyncPcmSink<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> S {
+        self.inner
+    }
+}
+
+#[async_trait]
+impl<S> AsyncAudioSink for AsyncPcmSink<S>
+where
+    S: AsyncAudioSink<In = AudioFrame> + Send,
+{
+    type In = NodeBuffer;
+
+    fn name(&self) -> &'static str {
+        "async-pcm-sink"
+    }
+
+    async fn push(&mut self, input: Self::In) -> RunnerResult<()> {
+        match input {
+            NodeBuffer::Pcm(f) => self.inner.push(f).await,
+            NodeBuffer::Packet(_) => Err(RunnerError::InvalidData("async pcm sink cannot accept Packet")),
+        }
+    }
+
+    async fn finalize(&mut self) -> RunnerResult<()> {
+        self.inner.finalize().await
+    }
+}
+
 

@@ -1,8 +1,8 @@
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::node_interface::NodeBuffer;
-use crate::runner::audio_sink::AudioSink;
-use crate::runner::audio_source::AudioSource;
+use crate::pipeline::sink::audio_sink::AudioSink;
+use crate::pipeline::source::audio_source::AudioSource;
 use crate::runner::async_runner_interface::AsyncRunner;
 use crate::runner::async_auto_runner::AsyncAutoRunner;
 use crate::runner::error::RunnerResult;
