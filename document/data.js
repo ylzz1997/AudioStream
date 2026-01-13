@@ -1407,9 +1407,9 @@ r.run()
 
               <section class="section">
                 <h2>AsyncPipelineAudioSink</h2>
-                <pre><code class="language-python">ast.AsyncPipelineAudioSink(writer: AudioFileWriter, processors: Optional[list[Processor]] = None, queue_capacity: int = 8, handle_capacity: int = 32)</code></pre>
+                <pre><code class="language-python">ast.AsyncPipelineAudioSink(writer: AudioFileWriter, nodes: list[DynNode], queue_capacity: int = 8, handle_capacity: int = 32)</code></pre>
                 <p>
-                  <b>异步 pipeline 写入汇（推荐用于“长链路/重计算”场景）</b>：把多个 <code>Processor(PCM-&gt;PCM)</code> 拆成多段并行 stage（pipeline parallel），
+                  <b>异步 pipeline 写入汇（推荐用于“长链路/重计算”场景）</b>：把多个 <code>Processor/Encoder/Deocder(PCM/Packet-&gt;PCM)</code> 拆成多段并行 stage（pipeline parallel），
                   最终顺序写入一个 <code>AudioFileWriter</code>。
                   和 <code>LineAudioWriter</code> 不同，它不会在 <code>AsyncDynRunner</code> 的输出侧形成长时间阻塞。
                 </p>
@@ -1423,10 +1423,10 @@ r.run()
                 </ul>
                 <h3>API（方法与参数）</h3>
                 <ul>
-                  <li><b>__init__(writer, processors=None, queue_capacity=8, handle_capacity=32)</b>
+                  <li><b>__init__(writer, nodes, queue_capacity=8, handle_capacity=32)</b>
                     <ul>
                       <li><b>writer</b>：最终写入的 <code>AudioFileWriter</code>（会被 move/搬空）。</li>
-                      <li><b>processors</b>：<code>Processor</code> 列表（会被 move/搬空）。</li>
+                      <li><b>nodes</b>：<code>DynNode</code> 列表（会被 move/搬空）。支持 processor/encoder/decoder 等节点，只要相邻 input_kind/output_kind 匹配即可；最后一个节点必须输出 PCM。</li>
                       <li><b>queue_capacity</b>：内部 pipeline stage 之间队列容量（背压）。</li>
                       <li><b>handle_capacity</b>：默认用于 <code>with</code> / <code>__enter__</code> 的 handle 队列容量。</li>
                     </ul>
@@ -1449,12 +1449,12 @@ src = ast.AudioFileReader("test.wav", "wav")
 out_fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
 dst = ast.AudioFileWriter("out_async.flac", "flac", compression_level=8, input_format=out_fmt)
 
-# 这里 processors 会被 move
+# nodes 会被 move
 sink = ast.AsyncPipelineAudioSink(
     dst,
-    processors=[
-        ast.Processor.resample(None, out_fmt),
-        ast.Processor.gain(None, gain=1.1),
+    nodes=[
+        ast.make_processor_node("resample", ast.ResampleNodeConfig(None, out_fmt, out_chunk_samples=960, pad_final=True)),
+        ast.make_processor_node("gain", ast.GainNodeConfig(out_fmt, gain=1.1)),
     ],
     queue_capacity=8,
 )
@@ -1467,7 +1467,7 @@ r.run()
                 <pre><code class="language-python">import pyaudiostream as ast
 
 dst = ast.AudioFileWriter("out_async2.flac", "flac", compression_level=8, input_format=out_fmt)
-with ast.AsyncPipelineAudioSink(dst, processors=[ast.Processor.resample(None, out_fmt)]) as h:
+with ast.AsyncPipelineAudioSink(dst, [ast.make_processor_node("resample", ast.ResampleNodeConfig(None, out_fmt, out_chunk_samples=960, pad_final=True))]) as h:
     h.push(ast.NodeBuffer.pcm(pcm, out_fmt))
     h.finalize()
                 </code></pre>
@@ -1515,8 +1515,8 @@ fmt2 = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="i16", planar=
 w1 = ast.AudioFileWriter("a.flac", "flac", compression_level=8, input_format=fmt1)
 w2 = ast.AudioFileWriter("b.mp3", "mp3", bitrate=320_000, input_format=fmt2)
 
-s1 = ast.AsyncPipelineAudioSink(w1, processors=[ast.Processor.resample(None, fmt1)], queue_capacity=8)
-s2 = ast.AsyncPipelineAudioSink(w2, processors=[ast.Processor.resample(None, fmt2)], queue_capacity=8)
+s1 = ast.AsyncPipelineAudioSink(w1, [ast.make_processor_node("resample", ast.ResampleNodeConfig(None, fmt1, out_chunk_samples=960, pad_final=True))], queue_capacity=8)
+s2 = ast.AsyncPipelineAudioSink(w2, [ast.make_processor_node("resample", ast.ResampleNodeConfig(None, fmt2, out_chunk_samples=960, pad_final=True))], queue_capacity=8)
 
 sink = ast.AsyncParallelAudioSink([s1, s2])
 r = ast.AsyncDynRunner(src, [ast.make_identity_node("pcm")], sink)

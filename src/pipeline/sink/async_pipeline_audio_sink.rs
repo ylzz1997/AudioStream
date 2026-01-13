@@ -1,20 +1,27 @@
-//! Async "pipeline + sink" implementation:
-//! - Each `AudioProcessor` runs in its own blocking stage (pipeline parallel).
-//! - The final `AudioWriter` is the last stage (single-threaded write).
+//! Async "node pipeline + writer" sink:
+//! - Each `DynNode` runs in its own blocking stage (pipeline parallel).
+//! - The final `AudioWriter` is the last stage (single-threaded write of PCM frames).
 //! - All stage channels are bounded, providing backpressure to upstream.
 //!
-//! This is designed to be used as an `AsyncAudioSink<In=AudioFrame>`.
+//! This sink accepts `NodeBuffer` as input, allowing internal kind transitions:
+//! - PCM -> Packet (encoder)
+//! - Packet -> PCM (decoder)
+//! - etc.
+//!
+//! Guarantees / constraints:
+//! - Adjacent nodes must satisfy: `node[i].output_kind() == node[i+1].input_kind()`.
+//! - The **last** node must output PCM (`NodeBufferKind::Pcm`), because the writer consumes PCM.
+//! - The **first** node input_kind determines what this sink accepts in `push(...)`.
 //!
 //! Notes:
 //! - Stages are implemented with `tokio::task::spawn_blocking` because most codec / IO work is blocking.
-//! - Errors are recorded as strings and surfaced as `CodecError::Other(...)` to avoid `Clone` requirements.
-//! - This module intentionally does NOT implement `reset()` semantics (unlike `AsyncPipeline3`).
-//!   If you need reset, we can extend the message protocol similarly to pipeline nodes.
+//! - This module intentionally does NOT implement `reset()` semantics.
 
 use crate::codec::error::CodecError;
-use crate::codec::processor::processor_interface::AudioProcessor;
-use crate::common::audio::audio::{AudioFrame, AudioFrameView};
+use crate::common::audio::audio::AudioFrameView;
 use crate::common::io::io::AudioWriter;
+use crate::pipeline::node::dynamic_node_interface::DynNode;
+use crate::pipeline::node::node_interface::{NodeBuffer, NodeBufferKind};
 use super::audio_sink::AsyncAudioSink;
 use crate::runner::error::{RunnerError, RunnerResult};
 use async_trait::async_trait;
@@ -22,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 #[derive(Debug)]
-enum Msg<T> {
-    Data(T),
+enum Msg {
+    Data(NodeBuffer),
     Flush,
 }
 
@@ -43,126 +50,64 @@ fn err_or_closed(store: &Arc<Mutex<Option<String>>>) -> RunnerError {
     RunnerError::Codec(CodecError::Other(msg))
 }
 
-fn send_and_drain_processor(
-    p: &mut dyn AudioProcessor,
-    input: Option<AudioFrame>,
-    tx_next: &mpsc::Sender<Msg<AudioFrame>>,
+fn drain_to_next(
+    node: &mut Box<dyn DynNode>,
+    tx_next: &mpsc::Sender<Msg>,
     err_store: &Arc<Mutex<Option<String>>>,
 ) -> Result<(), ()> {
-    // Helper: drain as much output as possible to next stage.
-    fn drain(
-        p: &mut dyn AudioProcessor,
-        tx_next: &mpsc::Sender<Msg<AudioFrame>>,
-        err_store: &Arc<Mutex<Option<String>>>,
-    ) -> Result<(), ()> {
-        loop {
-            match p.receive_frame() {
-                Ok(out) => {
-                    if tx_next.blocking_send(Msg::Data(out)).is_err() {
-                        store_err(err_store, "next stage channel closed".to_string());
-                        return Err(());
-                    }
-                }
-                Err(CodecError::Again) => return Ok(()),
-                Err(CodecError::Eof) => return Ok(()),
-                Err(e) => {
-                    store_err(err_store, format!("processor {} pull error: {e}", p.name()));
-                    return Err(());
-                }
-            }
-        }
-    }
-
-    // Convert owned frame to view for send_frame.
-    let input = input;
     loop {
-        let view: Option<&dyn AudioFrameView> = input.as_ref().map(|f| f as &dyn AudioFrameView);
-        match p.send_frame(view) {
-            Ok(()) => break,
-            Err(CodecError::Again) => {
-                if drain(p, tx_next, err_store).is_err() {
-                    return Err(());
-                }
-                // retry send_frame with the same input
-                continue;
-            }
-            Err(CodecError::Eof) => {
-                // Treat as "no more output from this stage"; still propagate flush downstream.
-                return Ok(());
-            }
-            Err(e) => {
-                store_err(err_store, format!("processor {} push error: {e}", p.name()));
-                return Err(());
-            }
-        }
-    }
-
-    drain(p, tx_next, err_store)
-}
-
-fn flush_processor(
-    p: &mut dyn AudioProcessor,
-    tx_next: &mpsc::Sender<Msg<AudioFrame>>,
-    err_store: &Arc<Mutex<Option<String>>>,
-) -> Result<(), ()> {
-    // flush: send_frame(None) then pull until Eof
-    loop {
-        match p.send_frame(None) {
-            Ok(()) => break,
-            Err(CodecError::Again) => {
-                // Need to drain outputs first
-                if send_and_drain_processor(p, None, tx_next, err_store).is_err() {
-                    return Err(());
-                }
-            }
-            Err(e) => {
-                store_err(err_store, format!("processor {} flush push error: {e}", p.name()));
-                return Err(());
-            }
-        }
-    }
-
-    loop {
-        match p.receive_frame() {
-            Ok(out) => {
-                if tx_next.blocking_send(Msg::Data(out)).is_err() {
+        match node.pull() {
+            Ok(buf) => {
+                if tx_next.blocking_send(Msg::Data(buf)).is_err() {
                     store_err(err_store, "next stage channel closed".to_string());
                     return Err(());
                 }
             }
-            Err(CodecError::Again) => continue,
-            Err(CodecError::Eof) => break,
+            Err(CodecError::Again) | Err(CodecError::Eof) => return Ok(()),
             Err(e) => {
-                store_err(err_store, format!("processor {} flush pull error: {e}", p.name()));
+                store_err(err_store, format!("node {} pull error: {e}", node.name()));
                 return Err(());
             }
         }
     }
-    Ok(())
 }
 
-fn spawn_processor_stage(
-    mut p: Box<dyn AudioProcessor>,
-    mut rx: mpsc::Receiver<Msg<AudioFrame>>,
-    tx_next: mpsc::Sender<Msg<AudioFrame>>,
+fn spawn_node_stage(
+    mut node: Box<dyn DynNode>,
+    mut rx: mpsc::Receiver<Msg>,
+    tx_next: mpsc::Sender<Msg>,
     err_store: Arc<Mutex<Option<String>>>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut flushed = false;
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                Msg::Data(frame) => {
+                Msg::Data(buf) => {
                     if flushed {
-                        store_err(&err_store, format!("processor {} received data after flush", p.name()));
+                        store_err(&err_store, format!("node {} received data after flush", node.name()));
                         break;
                     }
-                    if send_and_drain_processor(p.as_mut(), Some(frame), &tx_next, &err_store).is_err() {
-                        break;
+                    match node.push(Some(buf)) {
+                        Ok(()) | Err(CodecError::Again) => {
+                            if drain_to_next(&mut node, &tx_next, &err_store).is_err() {
+                                break;
+                            }
+                        }
+                        Err(CodecError::Eof) => {
+                            let _ = tx_next.blocking_send(Msg::Flush);
+                            break;
+                        }
+                        Err(e) => {
+                            store_err(&err_store, format!("node {} push error: {e}", node.name()));
+                            let _ = tx_next.blocking_send(Msg::Flush);
+                            break;
+                        }
                     }
                 }
                 Msg::Flush => {
                     flushed = true;
-                    let _ = flush_processor(p.as_mut(), &tx_next, &err_store);
+                    let _ = node.push(None);
+                    let _ = drain_to_next(&mut node, &tx_next, &err_store);
                     let _ = tx_next.blocking_send(Msg::Flush);
                     break;
                 }
@@ -171,39 +116,78 @@ fn spawn_processor_stage(
 
         // Upstream closed without explicit flush: treat as flush once.
         if !flushed {
-            let _ = flush_processor(p.as_mut(), &tx_next, &err_store);
+            let _ = node.push(None);
+            let _ = drain_to_next(&mut node, &tx_next, &err_store);
             let _ = tx_next.blocking_send(Msg::Flush);
         }
     });
 }
 
-fn spawn_writer_stage(
+fn spawn_last_stage(
+    mut node: Box<dyn DynNode>,
     mut w: Box<dyn AudioWriter + Send>,
-    mut rx: mpsc::Receiver<Msg<AudioFrame>>,
+    mut rx: mpsc::Receiver<Msg>,
     err_store: Arc<Mutex<Option<String>>>,
 ) -> tokio::task::JoinHandle<RunnerResult<()>> {
     tokio::task::spawn_blocking(move || {
-        let mut flushed = false;
         while let Some(msg) = rx.blocking_recv() {
             match msg {
-                Msg::Data(frame) => {
-                    if flushed {
-                        store_err(&err_store, "writer received data after flush".to_string());
-                        break;
+                Msg::Data(buf) => {
+                    match node.push(Some(buf)) {
+                        Ok(()) | Err(CodecError::Again) => {}
+                        Err(CodecError::Eof) => {
+                            break;
+                        }
+                        Err(e) => {
+                            store_err(&err_store, format!("node {} push error: {e}", node.name()));
+                            break;
+                        }
                     }
-                    w.write_frame(&frame as &dyn AudioFrameView)
-                        .map_err(RunnerError::from)?;
+
+                    loop {
+                        match node.pull() {
+                            Ok(NodeBuffer::Pcm(f)) => {
+                                w.write_frame(&f as &dyn AudioFrameView).map_err(RunnerError::from)?;
+                            }
+                            Ok(NodeBuffer::Packet(_)) => {
+                                store_err(&err_store, "AsyncPipelineAudioSink requires last node output PCM".to_string());
+                                break;
+                            }
+                            Err(CodecError::Again) => break,
+                            Err(CodecError::Eof) => {
+                                break;
+                            }
+                            Err(e) => {
+                                store_err(&err_store, format!("node {} pull error: {e}", node.name()));
+                                break;
+                            }
+                        }
+                    }
                 }
                 Msg::Flush => {
-                    flushed = true;
                     break;
                 }
             }
         }
 
-        // Either got Flush, or upstream closed: finalize once.
-        if !flushed {
-            // upstream closed without an explicit flush
+        // Flush last node and drain outputs to writer
+        let _ = node.push(None);
+        loop {
+            match node.pull() {
+                Ok(NodeBuffer::Pcm(f)) => {
+                    w.write_frame(&f as &dyn AudioFrameView).map_err(RunnerError::from)?;
+                }
+                Ok(NodeBuffer::Packet(_)) => {
+                    store_err(&err_store, "AsyncPipelineAudioSink requires last node output PCM".to_string());
+                    break;
+                }
+                Err(CodecError::Again) => continue,
+                Err(CodecError::Eof) => break,
+                Err(e) => {
+                    store_err(&err_store, format!("node {} flush pull error: {e}", node.name()));
+                    break;
+                }
+            }
         }
         w.finalize().map_err(RunnerError::from)?;
         Ok(())
@@ -215,55 +199,77 @@ fn spawn_writer_stage(
 /// - 输入：`AudioFrame`
 /// - 背压：所有 stage channel 都是 bounded；当末端写入慢时，上游 `push().await` 会被阻塞（理想的 backpressure）。
 pub struct AsyncPipelineAudioSink {
-    in_tx: mpsc::Sender<Msg<AudioFrame>>,
+    in_tx: mpsc::Sender<Msg>,
     join: Option<tokio::task::JoinHandle<RunnerResult<()>>>,
     err_store: Arc<Mutex<Option<String>>>,
     finalized: bool,
+    input_kind: NodeBufferKind,
 }
 
 impl AsyncPipelineAudioSink {
-    /// 构造一个 pipeline sink。
+    /// 构造一个 node pipeline sink。
     ///
-    /// - `queue_capacity`: 每个 stage 之间的有界队列容量（>=1）。越大吞吐越高、延迟/内存越大。
+    /// - `nodes`: 运行时节点链（允许 PCM/Packet 在内部切换）
+    /// - `writer`: 最终写入端（只写 PCM）
+    /// - `queue_capacity`: 每个 stage 之间的有界队列容量（>=1）
     pub fn new(
-        processors: Vec<Box<dyn AudioProcessor>>,
+        mut nodes: Vec<Box<dyn DynNode>>,
         writer: Box<dyn AudioWriter + Send>,
         queue_capacity: usize,
-    ) -> Self {
+    ) -> RunnerResult<Self> {
         let cap = queue_capacity.max(1);
         let err_store = Arc::new(Mutex::new(None));
 
-        // Build stage channels
-        let (in_tx, in_rx) = mpsc::channel::<Msg<AudioFrame>>(cap);
-        let mut prev_rx = in_rx;
+        if nodes.is_empty() {
+            return Err(RunnerError::InvalidData("AsyncPipelineAudioSink requires at least 1 node"));
+        }
 
-        // For each processor, create a new stage.
-        for p in processors.into_iter() {
-            let (tx_next, rx_next) = mpsc::channel::<Msg<AudioFrame>>(cap);
+        // Validate adjacency kind match
+        for i in 0..(nodes.len() - 1) {
+            if nodes[i].output_kind() != nodes[i + 1].input_kind() {
+                return Err(RunnerError::InvalidData("pipeline node kind mismatch"));
+            }
+        }
+        // Require last output PCM (writer consumes PCM)
+        if nodes.last().unwrap().output_kind() != NodeBufferKind::Pcm {
+            return Err(RunnerError::InvalidData("AsyncPipelineAudioSink requires last node output PCM"));
+        }
+
+        let input_kind = nodes[0].input_kind();
+
+        // Build stage channels
+        let (in_tx, mut prev_rx) = mpsc::channel::<Msg>(cap);
+
+        // Spawn node stages 0..n-2
+        while nodes.len() > 1 {
+            let node = nodes.remove(0);
+            let (tx_next, rx_next) = mpsc::channel::<Msg>(cap);
             let rx = prev_rx;
-            spawn_processor_stage(p, rx, tx_next, err_store.clone());
+            spawn_node_stage(node, rx, tx_next, err_store.clone());
             prev_rx = rx_next;
         }
 
-        // Last stage: writer
-        let join = spawn_writer_stage(writer, prev_rx, err_store.clone());
+        // Last stage: last node + writer
+        let last = nodes.remove(0);
+        let join = spawn_last_stage(last, writer, prev_rx, err_store.clone());
 
-        Self {
+        Ok(Self {
             in_tx,
             join: Some(join),
             err_store,
             finalized: false,
-        }
+            input_kind,
+        })
     }
 
-    pub fn with_default_capacity(processors: Vec<Box<dyn AudioProcessor>>, writer: Box<dyn AudioWriter + Send>) -> Self {
-        Self::new(processors, writer, 8)
+    pub fn with_default_capacity(nodes: Vec<Box<dyn DynNode>>, writer: Box<dyn AudioWriter + Send>) -> RunnerResult<Self> {
+        Self::new(nodes, writer, 8)
     }
 }
 
 #[async_trait]
 impl AsyncAudioSink for AsyncPipelineAudioSink {
-    type In = AudioFrame;
+    type In = NodeBuffer;
 
     fn name(&self) -> &'static str {
         "async-pipeline-audio-sink"
@@ -274,6 +280,9 @@ impl AsyncAudioSink for AsyncPipelineAudioSink {
             return Err(RunnerError::Codec(CodecError::InvalidState(
                 "async pipeline audio sink already finalized",
             )));
+        }
+        if input.kind() != self.input_kind {
+            return Err(RunnerError::InvalidData("async pipeline audio sink input kind mismatch"));
         }
         self.in_tx
             .send(Msg::Data(input))

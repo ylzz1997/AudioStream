@@ -419,18 +419,22 @@ class LineAudioWriter(AudioSink):
 
 class AsyncPipelineAudioSink(AudioSink):
     """
-    异步 pipeline sink：processors(PCM->PCM)* -> writer，每段 processor 在后台并行执行（tokio pipeline parallel）。
+    异步 pipeline sink：nodes(NodeBuffer)->...->PCM->writer。
+
+    - 支持在链路内部插入 encoder/decoder（允许 PCM <-> Packet），只要相邻节点 input_kind/output_kind 匹配即可
+    - 要求最后一个节点输出为 PCM（因为 writer 只能写 PCM）
+    - 第一个节点的 input_kind 决定该 sink 接受的输入 kind
 
     注意：
     - 该对象既可以作为 `AsyncDynRunner(..., sink=...)` 的 sink 传入；
     - 也可以通过 `start()` 启动一个可直接 `push/finalize` 的句柄（语义更接近 Pipeline 的 push）。
-    - 构造时传入的 writer 与 processors 会被“move/搬空”，之后不可再使用。
+    - 构造时传入的 writer 与 nodes 会被“move/搬空”，之后不可再使用。
     """
 
     def __init__(
         self,
         writer: AudioFileWriter,
-        processors: Optional[list[Processor]] = None,
+        nodes: list[DynNode],
         queue_capacity: int = 8,
         handle_capacity: int = 32,
     ) -> None: ...

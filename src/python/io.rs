@@ -4,7 +4,6 @@ use crate::codec::encoder::aac_encoder::AacEncoderConfig;
 use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
 use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 use crate::codec::error::CodecError;
-use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::codec::packet::{CodecPacket, PacketFlags};
 use crate::common::audio::audio::{AudioFormat as RsAudioFormat, AudioFrameView, AudioFrameViewMut, Rational, SampleType};
 use crate::common::io::file as rs_file;
@@ -19,7 +18,7 @@ use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 use crate::pipeline::node::node_interface::IdentityNode;
-use crate::pipeline::sink::audio_sink::{AudioSink, AsyncAudioSink, AsyncPcmSink};
+use crate::pipeline::sink::audio_sink::{AudioSink, AsyncAudioSink};
 use crate::pipeline::source::audio_source::AudioSource;
 use crate::runner::async_auto_runner::AsyncAutoRunner;
 use crate::runner::async_runner_interface::AsyncRunner;
@@ -655,7 +654,7 @@ pub struct AsyncPipelineAudioSinkPy {
 }
 
 struct AsyncPipelineAudioSinkParts {
-    processors: Vec<Box<dyn AudioProcessor>>,
+    nodes: Vec<Box<dyn DynNode>>,
     writer: Box<dyn AudioWriter + Send>,
     queue_capacity: usize,
 }
@@ -666,11 +665,11 @@ impl AsyncPipelineAudioSinkPy {
     ///
     /// 绑定后传入的 `AudioFileWriter` / `Processor` 会被“搬空”，不可再使用。
     #[new]
-    #[pyo3(signature = (writer, processors=None, queue_capacity=8, handle_capacity=32))]
+    #[pyo3(signature = (writer, nodes, queue_capacity=8, handle_capacity=32))]
     fn new(
         py: Python<'_>,
         writer: Py<AudioFileWriterPy>,
-        processors: Option<Vec<Py<ProcessorPy>>>,
+        nodes: Vec<Py<DynNodePy>>,
         queue_capacity: usize,
         handle_capacity: usize,
     ) -> PyResult<Self> {
@@ -679,18 +678,15 @@ impl AsyncPipelineAudioSinkPy {
             ww.take_rs_writer()?
         };
 
-        let mut ps: Vec<Box<dyn crate::codec::processor::processor_interface::AudioProcessor>> = Vec::new();
-        if let Some(procs) = processors {
-            ps.reserve(procs.len());
-            for p in procs {
-                let mut pp = p.bind(py).borrow_mut();
-                ps.push(pp.take_rs_processor()?);
-            }
+        let mut ns: Vec<Box<dyn DynNode>> = Vec::with_capacity(nodes.len());
+        for n in nodes.into_iter() {
+            let mut nb = n.bind(py).borrow_mut();
+            ns.push(nb.take_inner()?);
         }
 
         Ok(Self {
             parts: Some(AsyncPipelineAudioSinkParts {
-                processors: ps,
+                nodes: ns,
                 writer: Box::new(rs_writer),
                 queue_capacity,
             }),
@@ -728,8 +724,7 @@ impl AsyncPipelineAudioSinkPy {
             // Build the real Rust async sink inside a *running* runtime context.
             // This is required because `AsyncPipelineAudioSink::new` spawns tasks immediately.
             let mut sink = match rt.block_on(async move {
-                let rs = RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity);
-                Ok::<_, RunnerError>(AsyncPcmSink::new(rs))
+                RsAsyncPipelineAudioSink::new(parts.nodes, parts.writer, parts.queue_capacity)
             }) {
                 Ok(v) => v,
                 Err(e) => {
@@ -1000,8 +995,8 @@ impl AsyncParallelAudioSinkPy {
                 fn build(spec: SinkSpec) -> Result<Box<dyn AsyncAudioSink<In = NodeBuffer> + Send>, RunnerError> {
                     match spec {
                         SinkSpec::Pipeline(parts) => {
-                            let rs = RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity);
-                            Ok(Box::new(AsyncPcmSink::new(rs)))
+                            let rs = RsAsyncPipelineAudioSink::new(parts.nodes, parts.writer, parts.queue_capacity)?;
+                            Ok(Box::new(rs))
                         }
                         SinkSpec::Parallel(children) => {
                             let mut par = RsAsyncParallelAudioSink::<NodeBuffer>::with_capacity(children.len());
@@ -1160,7 +1155,7 @@ impl Drop for AsyncParallelAudioSinkHandlePy {
 /// - 特判：可直接使用 Rust 的 async sink（例如 `AsyncPipelineAudioSink`），避免 Python 回调开销
 enum AnyNodeBufferAsyncSink {
     Py(PyCallbackSink),
-    RustAsyncPcm(AsyncPcmSink<RsAsyncPipelineAudioSink>),
+    RustPipeline(RsAsyncPipelineAudioSink),
     RustParallel(RsAsyncParallelAudioSink<NodeBuffer>),
 }
 
@@ -1171,7 +1166,7 @@ impl AsyncAudioSink for AnyNodeBufferAsyncSink {
     fn name(&self) -> &'static str {
         match self {
             AnyNodeBufferAsyncSink::Py(s) => AudioSink::name(s),
-            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.name(),
+            AnyNodeBufferAsyncSink::RustPipeline(s) => s.name(),
             AnyNodeBufferAsyncSink::RustParallel(s) => s.name(),
         }
     }
@@ -1179,7 +1174,7 @@ impl AsyncAudioSink for AnyNodeBufferAsyncSink {
     async fn push(&mut self, input: Self::In) -> RunnerResult<()> {
         match self {
             AnyNodeBufferAsyncSink::Py(s) => AudioSink::push(s, input),
-            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.push(input).await,
+            AnyNodeBufferAsyncSink::RustPipeline(s) => s.push(input).await,
             AnyNodeBufferAsyncSink::RustParallel(s) => s.push(input).await,
         }
     }
@@ -1187,7 +1182,7 @@ impl AsyncAudioSink for AnyNodeBufferAsyncSink {
     async fn finalize(&mut self) -> RunnerResult<()> {
         match self {
             AnyNodeBufferAsyncSink::Py(s) => AudioSink::finalize(s),
-            AnyNodeBufferAsyncSink::RustAsyncPcm(s) => s.finalize().await,
+            AnyNodeBufferAsyncSink::RustPipeline(s) => s.finalize().await,
             AnyNodeBufferAsyncSink::RustParallel(s) => s.finalize().await,
         }
     }
@@ -1229,10 +1224,10 @@ impl AsyncDynRunnerPy {
             if let Ok(w) = any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
                 let mut ww = w.bind(py).borrow_mut();
                 let parts = ww.take_parts()?;
-                let rs_sink = rt.block_on(async move {
-                    RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
-                });
-                AnyNodeBufferAsyncSink::RustAsyncPcm(AsyncPcmSink::new(rs_sink))
+                let rs_sink = rt
+                    .block_on(async move { RsAsyncPipelineAudioSink::new(parts.nodes, parts.writer, parts.queue_capacity) })
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                AnyNodeBufferAsyncSink::RustPipeline(rs_sink)
             } else if let Ok(w) = any.extract::<Py<AsyncParallelAudioSinkPy>>() {
                 let mut ww = w.bind(py).borrow_mut();
                 let inner_sinks = ww.take_sinks()?;
@@ -1245,10 +1240,10 @@ impl AsyncDynRunnerPy {
                     if let Ok(p) = s_any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
                         let mut pp = p.bind(py).borrow_mut();
                         let parts = pp.take_parts()?;
-                        let rs = rt.block_on(async move {
-                            RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
-                        });
-                        par.bind(Box::new(AsyncPcmSink::new(rs)));
+                        let rs = rt
+                            .block_on(async move { RsAsyncPipelineAudioSink::new(parts.nodes, parts.writer, parts.queue_capacity) })
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        par.bind(Box::new(rs));
                         continue;
                     }
 
@@ -1262,10 +1257,10 @@ impl AsyncDynRunnerPy {
                             if let Ok(nn_p) = nn_any.extract::<Py<AsyncPipelineAudioSinkPy>>() {
                                 let mut nnp = nn_p.bind(py).borrow_mut();
                                 let parts = nnp.take_parts()?;
-                                let rs = rt.block_on(async move {
-                                    RsAsyncPipelineAudioSink::new(parts.processors, parts.writer, parts.queue_capacity)
-                                });
-                                nested_par.bind(Box::new(AsyncPcmSink::new(rs)));
+                                let rs = rt
+                                    .block_on(async move { RsAsyncPipelineAudioSink::new(parts.nodes, parts.writer, parts.queue_capacity) })
+                                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                                nested_par.bind(Box::new(rs));
                             } else {
                                 let nn_py: Py<PyAny> = nn.extract(py)?;
                                 nested_par.bind(Box::new(AnyNodeBufferAsyncSink::Py(PyCallbackSink { obj: nn_py })));
