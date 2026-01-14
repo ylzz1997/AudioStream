@@ -6,7 +6,7 @@ use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
 use crate::common::audio::audio::{
-    AudioFormat as RsAudioFormat, AudioFrame, AudioFrameView, AudioFrameViewMut, Rational, SampleFormat, SampleType,
+    AudioFormat as RsAudioFormat, AudioFrame, AudioFrameView, AudioFrameViewMut, Rational, SampleType,
 };
 use crate::common::io::file as rs_file;
 use crate::common::io::file::{
@@ -23,6 +23,7 @@ use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::dynamic_node_interface::BoxedProcessorNode;
 use crate::pipeline::node::node_interface::{AsyncPipeline, NodeBuffer, NodeBufferKind};
 use crate::pipeline::node::node_interface::IdentityNode;
+use crate::pipeline::node::tap_node::TapNode as RsTapNode;
 use crate::pipeline::sink::audio_sink::{AudioSink, AsyncAudioSink};
 use crate::pipeline::source::audio_source::AudioSource;
 use crate::runner::async_auto_runner::AsyncAutoRunner;
@@ -323,9 +324,91 @@ fn pcm_validate_same(items: &[AudioFrame]) -> crate::codec::error::CodecResult<(
     Ok((f0, n0, tb0, pts0))
 }
 
-fn reduce_pcm_f32_sum(frames: &[AudioFrame], weight: Option<&[f32]>) -> crate::codec::error::CodecResult<AudioFrame> {
+fn pcm_validate_same_for_concat(items: &[AudioFrame]) -> crate::codec::error::CodecResult<(RsAudioFormat, Rational, Option<i64>)> {
+    let f0 = items[0].format();
+    let tb0 = items[0].time_base();
+    let pts0 = items[0].pts();
+    for f in items.iter().skip(1) {
+        if f.format() != f0 {
+            return Err(CodecError::InvalidData("PCM concat requires same AudioFormat across branches"));
+        }
+        if f.time_base() != tb0 {
+            return Err(CodecError::InvalidData("PCM concat requires same time_base across branches"));
+        }
+    }
+    Ok((f0, tb0, pts0))
+}
+
+#[inline]
+fn pcm_sample_to_f64(sample_type: SampleType, bytes: &[u8]) -> f64 {
+    match sample_type {
+        SampleType::U8 => (bytes[0] as f64 - 128.0) / 128.0,
+        SampleType::I16 => {
+            let v = i16::from_ne_bytes([bytes[0], bytes[1]]) as f64;
+            v / 32768.0
+        }
+        SampleType::I32 => {
+            let v = i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64;
+            v / 2147483648.0
+        }
+        SampleType::I64 => {
+            let v = i64::from_ne_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]) as f64;
+            v / 9223372036854775808.0
+        }
+        SampleType::F32 => {
+            let v = f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            v as f64
+        }
+        SampleType::F64 => f64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+    }
+}
+
+#[inline]
+fn pcm_write_sample_from_f64(sample_type: SampleType, v: f64, out: &mut [u8]) {
+    match sample_type {
+        SampleType::U8 => {
+            let x = (v.clamp(-1.0, 1.0) * 128.0 + 128.0).round();
+            let x = x.clamp(0.0, 255.0) as u8;
+            out[0] = x;
+        }
+        SampleType::I16 => {
+            let x = (v.clamp(-1.0, 1.0) * 32768.0).round();
+            let x = x.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+            out.copy_from_slice(&x.to_ne_bytes());
+        }
+        SampleType::I32 => {
+            let x = (v.clamp(-1.0, 1.0) * 2147483648.0).round();
+            let x = x.clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+            out.copy_from_slice(&x.to_ne_bytes());
+        }
+        SampleType::I64 => {
+            let x = (v.clamp(-1.0, 1.0) * 9223372036854775808.0).round();
+            let x = x.clamp(i64::MIN as f64, i64::MAX as f64) as i64;
+            out.copy_from_slice(&x.to_ne_bytes());
+        }
+        SampleType::F32 => {
+            let x = v as f32;
+            out.copy_from_slice(&x.to_ne_bytes());
+        }
+        SampleType::F64 => out.copy_from_slice(&v.to_ne_bytes()),
+    }
+}
+
+fn reduce_pcm_any_sum(frames: &[AudioFrame], weight: Option<&[f64]>) -> crate::codec::error::CodecResult<AudioFrame> {
     let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
     let plane_count = frames[0].plane_count();
+    let bps = fmt.sample_format.bytes_per_sample();
+    let st = fmt.sample_format.sample_type();
+
+    if let Some(ws) = weight {
+        if ws.len() != frames.len() {
+            return Err(CodecError::InvalidData("weight length mismatch"));
+        }
+    }
 
     let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
     out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
@@ -335,25 +418,32 @@ fn reduce_pcm_f32_sum(frames: &[AudioFrame], weight: Option<&[f32]>) -> crate::c
         let out_plane = out
             .plane_mut(pi)
             .ok_or(CodecError::InvalidState("invalid plane index"))?;
-        // 逐 sample 求和（f32，按 native endian）
-        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
-            let mut acc: f32 = 0.0;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(bps).enumerate() {
+            let base = si * bps;
+            let mut acc: f64 = 0.0;
             for (bi, f) in frames.iter().enumerate() {
                 let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
-                let base = si * 4;
-                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                let v = pcm_sample_to_f64(st, &p[base..base + bps]);
                 let w = weight.map(|ws| ws[bi]).unwrap_or(1.0);
                 acc += v * w;
             }
-            out_chunk.copy_from_slice(&acc.to_ne_bytes());
+            pcm_write_sample_from_f64(st, acc, out_chunk);
         }
     }
     Ok(out)
 }
 
-fn reduce_pcm_f32_product(frames: &[AudioFrame], weight: Option<&[f32]>) -> crate::codec::error::CodecResult<AudioFrame> {
+fn reduce_pcm_any_product(frames: &[AudioFrame], weight: Option<&[f64]>) -> crate::codec::error::CodecResult<AudioFrame> {
     let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
     let plane_count = frames[0].plane_count();
+    let bps = fmt.sample_format.bytes_per_sample();
+    let st = fmt.sample_format.sample_type();
+
+    if let Some(ws) = weight {
+        if ws.len() != frames.len() {
+            return Err(CodecError::InvalidData("weight length mismatch"));
+        }
+    }
 
     let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
     out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
@@ -363,40 +453,27 @@ fn reduce_pcm_f32_product(frames: &[AudioFrame], weight: Option<&[f32]>) -> crat
         let out_plane = out
             .plane_mut(pi)
             .ok_or(CodecError::InvalidState("invalid plane index"))?;
-        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
-            let mut acc: f32 = 1.0;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(bps).enumerate() {
+            let base = si * bps;
+            let mut acc: f64 = 1.0;
             for (bi, f) in frames.iter().enumerate() {
                 let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
-                let base = si * 4;
-                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                let v = pcm_sample_to_f64(st, &p[base..base + bps]);
                 let w = weight.map(|ws| ws[bi]).unwrap_or(1.0);
                 acc *= v * w;
             }
-            out_chunk.copy_from_slice(&acc.to_ne_bytes());
+            pcm_write_sample_from_f64(st, acc, out_chunk);
         }
     }
     Ok(out)
 }
 
-fn reduce_pcm_f32_mean(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
-    let n = frames.len() as f32;
-    reduce_pcm_f32_sum(frames, None).map(|mut out| {
-        // out /= n
-        for pi in 0..out.plane_count() {
-            let plane = out.plane_mut(pi).expect("plane exists");
-            for out_chunk in plane.chunks_exact_mut(4) {
-                let v = f32::from_ne_bytes([out_chunk[0], out_chunk[1], out_chunk[2], out_chunk[3]]);
-                let m = v / n;
-                out_chunk.copy_from_slice(&m.to_ne_bytes());
-            }
-        }
-        out
-    })
-}
-
-fn reduce_pcm_f32_max(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+fn reduce_pcm_any_mean(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    let n = frames.len() as f64;
     let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
     let plane_count = frames[0].plane_count();
+    let bps = fmt.sample_format.bytes_per_sample();
+    let st = fmt.sample_format.sample_type();
 
     let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
     out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
@@ -406,25 +483,54 @@ fn reduce_pcm_f32_max(frames: &[AudioFrame]) -> crate::codec::error::CodecResult
         let out_plane = out
             .plane_mut(pi)
             .ok_or(CodecError::InvalidState("invalid plane index"))?;
-        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
-            let mut best: f32 = f32::NEG_INFINITY;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(bps).enumerate() {
+            let base = si * bps;
+            let mut acc: f64 = 0.0;
             for f in frames.iter() {
                 let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
-                let base = si * 4;
-                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                acc += pcm_sample_to_f64(st, &p[base..base + bps]);
+            }
+            pcm_write_sample_from_f64(st, acc / n, out_chunk);
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_pcm_any_max(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
+    let plane_count = frames[0].plane_count();
+    let bps = fmt.sample_format.bytes_per_sample();
+    let st = fmt.sample_format.sample_type();
+
+    let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(bps).enumerate() {
+            let base = si * bps;
+            let mut best: f64 = f64::NEG_INFINITY;
+            for f in frames.iter() {
+                let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+                let v = pcm_sample_to_f64(st, &p[base..base + bps]);
                 if v > best {
                     best = v;
                 }
             }
-            out_chunk.copy_from_slice(&best.to_ne_bytes());
+            pcm_write_sample_from_f64(st, best, out_chunk);
         }
     }
     Ok(out)
 }
 
-fn reduce_pcm_f32_min(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+fn reduce_pcm_any_min(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
     let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
     let plane_count = frames[0].plane_count();
+    let bps = fmt.sample_format.bytes_per_sample();
+    let st = fmt.sample_format.sample_type();
 
     let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
     out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
@@ -434,17 +540,43 @@ fn reduce_pcm_f32_min(frames: &[AudioFrame]) -> crate::codec::error::CodecResult
         let out_plane = out
             .plane_mut(pi)
             .ok_or(CodecError::InvalidState("invalid plane index"))?;
-        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
-            let mut best: f32 = f32::INFINITY;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(bps).enumerate() {
+            let base = si * bps;
+            let mut best: f64 = f64::INFINITY;
             for f in frames.iter() {
                 let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
-                let base = si * 4;
-                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                let v = pcm_sample_to_f64(st, &p[base..base + bps]);
                 if v < best {
                     best = v;
                 }
             }
-            out_chunk.copy_from_slice(&best.to_ne_bytes());
+            pcm_write_sample_from_f64(st, best, out_chunk);
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_pcm_any_concat(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    if frames.is_empty() {
+        return Err(CodecError::InvalidData("concat reduce expects non-empty items"));
+    }
+    let (fmt, tb, pts) = pcm_validate_same_for_concat(frames)?;
+    let plane_count = frames[0].plane_count();
+    let total_nb_samples: usize = frames.iter().map(|f| f.nb_samples()).sum();
+
+    let mut out = AudioFrame::new_alloc(fmt, total_nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        let mut cursor: usize = 0;
+        for f in frames.iter() {
+            let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+            out_plane[cursor..cursor + p.len()].copy_from_slice(p);
+            cursor += p.len();
         }
     }
     Ok(out)
@@ -464,35 +596,43 @@ fn reduce_nodebuffer_pcm(
         }
     }
 
-    let fmt = frames[0].format();
-    match fmt.sample_format {
-        SampleFormat::F32 { .. } => {
-            let w = if let Some(ws) = weight_f64 {
-                if ws.len() != frames.len() {
-                    return Err(CodecError::InvalidData("weight length mismatch"));
-                }
-                let mut v = Vec::with_capacity(ws.len());
-                for &x in ws {
-                    v.push(x as f32);
-                }
-                Some(v)
-            } else {
-                None
-            };
-            let out = match op {
-                "sum" => reduce_pcm_f32_sum(&frames, w.as_deref())?,
-                "product" => reduce_pcm_f32_product(&frames, w.as_deref())?,
-                "mean" => reduce_pcm_f32_mean(&frames)?,
-                "max" => reduce_pcm_f32_max(&frames)?,
-                "min" => reduce_pcm_f32_min(&frames)?,
-                _ => return Err(CodecError::Unsupported("unsupported pcm reduce op")),
-            };
-            Ok(NodeBuffer::Pcm(out))
+    let out = match op {
+        "sum" => reduce_pcm_any_sum(&frames, weight_f64)?,
+        "product" => reduce_pcm_any_product(&frames, weight_f64)?,
+        "mean" => {
+            if weight_f64.is_some() {
+                return Err(CodecError::InvalidData("mean reduce does not support weight"));
+            }
+            reduce_pcm_any_mean(&frames)?
         }
-        _ => Err(CodecError::Unsupported(
-            "built-in PCM reduce currently supports sample_format=f32 only",
-        )),
+        "max" => {
+            if weight_f64.is_some() {
+                return Err(CodecError::InvalidData("max reduce does not support weight"));
+            }
+            reduce_pcm_any_max(&frames)?
+        }
+        "min" => {
+            if weight_f64.is_some() {
+                return Err(CodecError::InvalidData("min reduce does not support weight"));
+            }
+            reduce_pcm_any_min(&frames)?
+        }
+        _ => return Err(CodecError::Unsupported("unsupported pcm reduce op")),
+    };
+    Ok(NodeBuffer::Pcm(out))
+}
+
+fn reduce_nodebuffer_pcm_concat(items: &[NodeBuffer]) -> crate::codec::error::CodecResult<NodeBuffer> {
+    ensure_non_empty_items(items, "concat")?;
+    let mut frames: Vec<AudioFrame> = Vec::with_capacity(items.len());
+    for b in items {
+        match b {
+            NodeBuffer::Pcm(f) => frames.push(f.clone()),
+            _ => return Err(CodecError::InvalidData("concat reduce expects NodeBuffer(pcm)")),
+        }
     }
+    let out = reduce_pcm_any_concat(&frames)?;
+    Ok(NodeBuffer::Pcm(out))
 }
 
 fn reduce_nodebuffer_packet_concat(items: &[NodeBuffer]) -> crate::codec::error::CodecResult<NodeBuffer> {
@@ -676,7 +816,12 @@ impl ReduceConcatPy {
             let mut b = it.bind(py).borrow_mut();
             rs_items.push(b.take_inner()?);
         }
-        let out = reduce_nodebuffer_packet_concat(&rs_items).map_err(map_codec_err)?;
+        // concat 同时支持 packet 与 pcm（要求 items 的 kind 一致）
+        let out = match rs_items.first() {
+            Some(NodeBuffer::Packet(_)) => reduce_nodebuffer_packet_concat(&rs_items).map_err(map_codec_err)?,
+            Some(NodeBuffer::Pcm(_)) => reduce_nodebuffer_pcm_concat(&rs_items).map_err(map_codec_err)?,
+            None => return Err(PyValueError::new_err("reduce_concat expects non-empty items")),
+        };
         Ok(NodeBufferPy { inner: Some(out) })
     }
 }
@@ -892,6 +1037,18 @@ impl AudioSinkBase {
 pub fn make_identity_node(kind: &str) -> PyResult<DynNodePy> {
     let k = node_kind_from_str(kind).ok_or_else(|| PyValueError::new_err("kind 仅支持: pcm/packet"))?;
     Ok(DynNodePy::new_boxed(Box::new(IdentityNode::new(k))))
+}
+
+/// 创建一个 Tap 节点（tee）：把输入 **透传给下游** 的同时，**复制一份** 交给一个 Python sink 处理。
+///
+/// - `sink`：需要实现 `push(buf: NodeBuffer)` + `finalize()` 的对象（与 Runner 的 sink 约定一致）
+/// - `kind`：tap 的输入/输出 kind（必须与相邻节点匹配），仅支持 "pcm"/"packet"
+#[pyfunction]
+#[pyo3(signature = (sink, kind="pcm"))]
+pub fn make_tap_node(sink: Py<PyAny>, kind: &str) -> PyResult<DynNodePy> {
+    let k = node_kind_from_str(kind).ok_or_else(|| PyValueError::new_err("kind 仅支持: pcm/packet"))?;
+    let s = PyCallbackSink { obj: sink };
+    Ok(DynNodePy::new_boxed(Box::new(RsTapNode::new(k, s))))
 }
 
 /// 创建一个 Python 自定义节点（DynNode），可用于 `AsyncDynPipeline`/`AsyncDynRunner` 的 nodes 列表。

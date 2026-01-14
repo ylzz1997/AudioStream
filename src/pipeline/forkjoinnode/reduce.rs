@@ -6,13 +6,13 @@ use core::ops::{Add, BitXor, Div, Mul};
 /// 约定：
 /// - `items.len() == branches`（由 ForkJoinNode 保证）
 /// - reduce 失败返回 `CodecError`
-pub trait Reduce<T>: Send + Sync + 'static {
+pub trait Reduce<T>: Send{
     fn reduce(&self, items: &[T]) -> CodecResult<T>;
 }
 
 impl<T, F> Reduce<T> for F
 where
-    F: Fn(&[T]) -> CodecResult<T> + Send + Sync + 'static,
+    F: Fn(&[T]) -> CodecResult<T> + Send,
 {
     fn reduce(&self, items: &[T]) -> CodecResult<T> {
         (self)(items)

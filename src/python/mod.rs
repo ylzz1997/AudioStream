@@ -23,7 +23,7 @@ pub use crate::python::io::{
     AsyncParallelAudioSinkHandlePy, AsyncParallelAudioSinkPy, AsyncPipelineAudioSinkHandlePy, AsyncPipelineAudioSinkPy,
     DynNodePy, LineAudioWriterPy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy,
     ReduceConcatPy, ReduceMaxPy, ReduceMeanPy, ReduceMinPy, ReduceProductPy, ReduceSumPy, ReduceXorPy,
-    make_async_fork_join_node, make_identity_node, make_python_node,
+    make_async_fork_join_node, make_identity_node, make_python_node, make_tap_node,
 };
 
 use pyo3::prelude::*;
@@ -88,6 +88,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoder::make_encoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(decoder::make_decoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(io::make_python_node, m)?)?;
+    m.add_function(wrap_pyfunction!(io::make_tap_node, m)?)?;
     m.add_function(wrap_pyfunction!(io::make_async_fork_join_node, m)?)?;
 
     // Backward-compatible alias: LineWriter -> LineAudioWriter

@@ -744,7 +744,7 @@ dst.finalize()
                   <li><b>编码</b>：<a href="#python/py-api-encode">Encoder / *EncoderConfig / make_encoder_node</a></li>
                   <li><b>解码</b>：<a href="#python/py-api-decode">Decoder / *DecoderConfig / make_decoder_node</a></li>
                   <li><b>处理</b>：<a href="#python/py-api-process">Processor / *NodeConfig / make_processor_node</a></li>
-                  <li><b>Pipeline / IO</b>：<a href="#python/py-api-pipeline-io">Packet / NodeBuffer / DynNode / AsyncDynPipeline / AsyncDynRunner / AudioFileReader / AudioFileWriter / ParallelAudioWriter / make_identity_node / make_python_node</a></li>
+                  <li><b>Pipeline / IO</b>：<a href="#python/py-api-pipeline-io">Packet / NodeBuffer / DynNode / AsyncDynPipeline / AsyncDynRunner / AudioFileReader / AudioFileWriter / ParallelAudioWriter / make_identity_node / make_tap_node / make_python_node</a></li>
                 </ul>
               </section>
 
@@ -1220,6 +1220,95 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
               </section>
 
               <section class="section">
+                <h2>make_tap_node（Tap / Tee：旁路复制 + 透传）</h2>
+                <p>
+                  TapNode 的作用是在 pipeline 中“分叉一份数据”给某个 <b>AudioSink</b>（旁路），同时把原始 frame <b>原样透传</b>给下游节点。
+                  典型用途：在中间节点插一个“监控/统计/写盘/抓包”旁路，而不改变主链路行为。
+                </p>
+
+                <pre><code class="language-python">ast.make_tap_node(sink, kind: str = "pcm") -&gt; DynNode</code></pre>
+
+                <h3>参数介绍</h3>
+                <ul>
+                  <li>
+                    <b>sink</b>：一个 Python 对象（通常继承 <code>ast.AudioSink</code> 仅用于类型提示即可），需要实现：
+                    <ul>
+                      <li><b>push(buf: ast.NodeBuffer) -&gt; None</b>：接收旁路数据。</li>
+                      <li><b>finalize() -&gt; None</b>：在 stream 结束（flush）时调用一次。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>kind</b>：tap 的输入/输出 kind（必须与相邻节点匹配），仅支持：
+                    <ul>
+                      <li><code>"pcm"</code>：旁路与主链路传递 PCM。</li>
+                      <li><code>"packet"</code>：旁路与主链路传递 Packet。</li>
+                    </ul>
+                  </li>
+                </ul>
+
+                <h3>返回值</h3>
+                <ul>
+                  <li><b>DynNode</b>：可直接插入 <code>AsyncDynPipeline(nodes=[...])</code>/<code>AsyncDynRunner(...)</code> 的 nodes 列表。</li>
+                </ul>
+
+                <h3>行为说明</h3>
+                <ul>
+                  <li><b>透传</b>：每个输入的 <code>NodeBuffer</code> 会被原样传给下游（pull 输出与输入一致）。</li>
+                  <li><b>旁路复制</b>：同时会对该 <code>NodeBuffer</code> 做一次 <code>clone</code> 并调用 <code>sink.push(clone)</code>。</li>
+                  <li><b>flush/finalize</b>：当 pipeline/runner flush（输入结束）时，TapNode 会调用一次 <code>sink.finalize()</code>。</li>
+                </ul>
+
+                <h3>重要注意事项</h3>
+                <ul>
+                  <li><b>性能/阻塞</b>：TapNode 调用的是同步 <code>sink.push()</code>。如果你的 sink 很慢（例如 Python 写文件/网络），会拖慢主链路。建议把旁路 sink 做成“内部有队列/后台线程”的实现。</li>
+                  <li><b>move 语义</b>：返回的 DynNode 在构建 Pipeline/Runner 时会被 move（同一个 DynNode 不能复用）。</li>
+                  <li><b>重复 finalize</b>：如果你在别处也手动调用了同一个 sink 的 <code>finalize()</code>，可能出现重复 finalize；建议让 TapNode 统一负责 finalize。</li>
+                </ul>
+
+                <h3>示例：旁路收集 + 主链路继续处理</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+import numpy as np
+
+fmt = ast.AudioFormat(sample_rate=48000, channels=1, sample_type="f32", planar=True)
+
+class Src:
+    def __init__(self, n=5):
+        self.i = 0
+        self.n = n
+    def pull(self):
+        if self.i &gt;= self.n:
+            return None
+        self.i += 1
+        pcm = np.zeros((1, 960), dtype=np.float32)
+        return ast.NodeBuffer.pcm(pcm, fmt)
+
+class TapSink(ast.AudioSink):
+    def __init__(self):
+        self.count = 0
+    def push(self, buf: ast.NodeBuffer):
+        # buf 是旁路复制出来的 NodeBuffer
+        if buf.as_pcm() is not None:
+            self.count += 1
+    def finalize(self):
+        print("tap saw", self.count, "frames")
+
+class Dst(ast.AudioSink):
+    def push(self, buf: ast.NodeBuffer):
+        # 主链路末端 sink
+        pass
+    def finalize(self):
+        pass
+
+nodes = [
+    ast.make_tap_node(TapSink(), kind="pcm"),
+    ast.make_processor_node("gain", ast.GainNodeConfig(fmt, gain=1.1)),
+]
+
+r = ast.AsyncDynRunner(Src(), nodes, Dst())
+r.run()</code></pre>
+              </section>
+
+              <section class="section">
                 <h2>make_python_node</h2>
                 <pre><code class="language-python">ast.make_python_node(obj, input_kind: str, output_kind: str, name: str = "py-node") -&gt; DynNode</code></pre>
                 <h3>参数说明</h3>
@@ -1301,7 +1390,8 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                     <ul>
                       <li><b>作用</b>：对 PCM 做<b>按样本加权求和</b>：<code>out = sum(items[i] * weight[i])</code>。</li>
                       <li><b>weight</b>：None 表示全 1；否则长度必须等于分支数。</li>
-                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>AudioFormat.sample_type="f32"</code>。</li>
+                      <li><b>支持</b>：<code>NodeBuffer.pcm</code>（支持 <code>"u8"|"i16"|"i32"|"i64"|"f32"|"f64"</code>，planar/interleaved 均可）。</li>
+                      <li><b>约束</b>：要求各分支 PCM 的 <code>AudioFormat</code> / <code>nb_samples</code> / <code>time_base</code> 一致。</li>
                     </ul>
                   </li>
                   <li>
@@ -1309,29 +1399,35 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
                     <ul>
                       <li><b>作用</b>：对 PCM 做<b>按样本加权求积</b>：<code>out = Π (items[i] * weight[i])</code>。</li>
                       <li><b>weight</b>：None 表示全 1；否则长度必须等于分支数。</li>
-                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                      <li><b>支持</b>：<code>NodeBuffer.pcm</code>（支持 <code>"u8"|"i16"|"i32"|"i64"|"f32"|"f64"</code>，planar/interleaved 均可）。</li>
+                      <li><b>约束</b>：要求各分支 PCM 的 <code>AudioFormat</code> / <code>nb_samples</code> / <code>time_base</code> 一致。</li>
                     </ul>
                   </li>
                   <li>
                     <b>ast.ReduceMean()</b>
                     <ul>
                       <li><b>作用</b>：对 PCM 做<b>按样本平均</b>：<code>out = (items[0]+...+items[N-1]) / N</code>。</li>
-                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                      <li><b>支持</b>：<code>NodeBuffer.pcm</code>（支持 <code>"u8"|"i16"|"i32"|"i64"|"f32"|"f64"</code>，planar/interleaved 均可）。</li>
+                      <li><b>约束</b>：要求各分支 PCM 的 <code>AudioFormat</code> / <code>nb_samples</code> / <code>time_base</code> 一致。</li>
                     </ul>
                   </li>
                   <li>
                     <b>ast.ReduceMax()</b> / <b>ast.ReduceMin()</b>
                     <ul>
                       <li><b>作用</b>：对 PCM 做<b>按样本取最大/最小</b>（跨分支）。</li>
-                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                      <li><b>支持</b>：<code>NodeBuffer.pcm</code>（支持 <code>"u8"|"i16"|"i32"|"i64"|"f32"|"f64"</code>，planar/interleaved 均可）。</li>
+                      <li><b>约束</b>：要求各分支 PCM 的 <code>AudioFormat</code> / <code>nb_samples</code> / <code>time_base</code> 一致。</li>
                     </ul>
                   </li>
                   <li>
                     <b>ast.ReduceConcat()</b>
                     <ul>
-                      <li><b>作用</b>：对 Packet 做<b>拼接</b>：把各分支的 <code>packet.data</code> 顺序拼到一起。</li>
-                      <li><b>限制</b>：仅支持 <code>NodeBuffer.packet</code>；并要求各 packet 的 <code>time_base</code> 一致。</li>
-                      <li><b>注意</b>：输出 packet 的时间戳/flags 等元数据不会自动合并（当前实现只保留 time_base，并生成新的 data）。</li>
+                      <li><b>作用</b>：拼接（concat）。支持两种载荷：</li>
+                      <li><b>Packet concat</b>：把各分支的 <code>packet.data</code> 顺序拼到一起。</li>
+                      <li><b>PCM concat</b>：把各分支的 PCM 按“时间轴/样本”顺序拼接成更长的一帧（等价于 numpy 沿 samples 维度拼接）。</li>
+                      <li><b>约束（Packet）</b>：仅支持 <code>NodeBuffer.packet</code>；并要求各 packet 的 <code>time_base</code> 一致。</li>
+                      <li><b>约束（PCM）</b>：仅支持 <code>NodeBuffer.pcm</code>；要求各分支 PCM 的 <code>AudioFormat</code> / <code>time_base</code> 一致（<code>nb_samples</code> 可不同）。</li>
+                      <li><b>注意</b>：Packet 输出的时间戳/flags 等元数据不会自动合并（当前实现只保留 time_base，并生成新的 data）。PCM 输出的 pts/time_base 取第一帧作为基准。</li>
                     </ul>
                   </li>
                   <li>
