@@ -1244,6 +1244,133 @@ ast.NodeBuffer.packet(pkt: Packet)</code></pre>
               </section>
 
               <section class="section">
+                <h2>make_async_fork_join_node（Fork/Join + Python Reduce）</h2>
+                <p>
+                  这是一个<b>并行分支</b>节点：把同一份输入 <b>fork</b> 到多条分支 pipeline（每条分支是一组 DynNode），
+                  然后在末端把各分支的输出 <b>join</b> 并调用你提供的 <b>Python reduce</b> 回调合并为一个输出。
+                  返回值是一个 <code>DynNode</code>，可直接插入 <code>AsyncDynPipeline(nodes=[...])</code>/<code>AsyncDynRunner(...)</code>。
+                </p>
+                <pre><code class="language-python">ast.make_async_fork_join_node(
+    pipelines: list[list[DynNode]],
+    reduce: Callable[[list[NodeBuffer]], NodeBuffer],
+    name: str = "async-fork-join",
+) -&gt; DynNode</code></pre>
+
+                <h3>参数介绍</h3>
+                <ul>
+                  <li>
+                    <b>pipelines</b>：分支列表。每个分支是一条 <code>DynNode</code> 链（<code>list[DynNode]</code>），至少包含 1 个节点。
+                    <ul>
+                      <li><b>分支内连接校验</b>：会校验每条分支内部相邻节点的 <code>output_kind</code> 与下一个节点的 <code>input_kind</code> 一致。</li>
+                      <li><b>分支间一致性校验</b>：会校验所有分支的入口 <code>input_kind</code> 一致、出口 <code>output_kind</code> 一致。</li>
+                      <li><b>move 语义</b>：这里传入的 DynNode 会被 move 到 Rust 内部；<b>同一个 DynNode 不能在多个地方复用</b>。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>reduce</b>：合并函数（callable）。签名为 <code>reduce(items: list[NodeBuffer]) -&gt; NodeBuffer</code>。
+                    <ul>
+                      <li><b>items</b>：长度=分支数；每次从每条分支各取 1 个输出，组成 items 后调用一次 reduce。</li>
+                      <li><b>返回值</b>：必须返回 NodeBuffer（不能是 None），且 kind 必须与各分支 <code>output_kind</code> 一致。</li>
+                      <li><b>来源</b>：可以是你自定义的 Python 函数/闭包；也可以是下面列出的 Rust 内置 reduce（它们同样是 callable）。</li>
+                    </ul>
+                  </li>
+                  <li><b>name</b>：节点名称（调试/日志用）。默认 <code>"async-fork-join"</code>。</li>
+                </ul>
+                <h3>重要约束</h3>
+                <ul>
+                  <li><b>分支一致性</b>：所有分支的 <code>input_kind</code> 必须一致，<code>output_kind</code> 也必须一致。</li>
+                  <li><b>对齐 join</b>：每次输出会从每条分支各取 1 个输出，凑成 <code>items</code> 后调用一次 reduce，产出 1 个输出。</li>
+                  <li><b>reduce 返回值</b>：必须返回 <code>NodeBuffer</code>（不能是 None），并且 kind 必须与分支 <code>output_kind</code> 一致。</li>
+                  <li><b>运行环境</b>：该节点需要在 tokio runtime 内运行（也就是把它用于 <code>AsyncDynPipeline/AsyncDynRunner</code>）。</li>
+                  <li><b>move 语义</b>：<code>pipelines</code> 里的 DynNode 会被 move；同一个 DynNode 不能复用到别处。</li>
+                  <li><b>内置 reduce 的限制</b>：见下方 “内置 reduce（Rust 预制）”。</li>
+                </ul>
+
+                <h3>reduce 回调签名</h3>
+                <ul>
+                  <li><b>reduce(items)</b>：<code>items: list[NodeBuffer]</code>，长度=分支数；返回一个新的 <code>NodeBuffer</code>。</li>
+                  <li><b>建议</b>：不要“原地复用”输入的 NodeBuffer；建议从 <code>items[i]</code> 中提取数据后构造新的 <code>NodeBuffer.pcm(...)</code>/<code>NodeBuffer.packet(...)</code> 作为输出。</li>
+                  <li><b>也可以直接用 Rust 内置 reduce</b>：例如 <code>ast.ReduceSum(weight=[...])</code> / <code>ast.ReduceMean()</code> / <code>ast.ReduceConcat()</code> 等（它们本质上也是可调用对象）。</li>
+                </ul>
+
+                <h3>内置 reduce（Rust 预制）</h3>
+                <p>以下 reduce 都是 Python 可直接调用的对象（callable），可以直接传给 <code>make_async_fork_join_node(..., reduce=...)</code>。</p>
+                <ul>
+                  <li>
+                    <b>ast.ReduceSum(weight: Optional[list[float]]=None)</b>
+                    <ul>
+                      <li><b>作用</b>：对 PCM 做<b>按样本加权求和</b>：<code>out = sum(items[i] * weight[i])</code>。</li>
+                      <li><b>weight</b>：None 表示全 1；否则长度必须等于分支数。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>AudioFormat.sample_type="f32"</code>。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>ast.ReduceProduct(weight: Optional[list[float]]=None)</b>
+                    <ul>
+                      <li><b>作用</b>：对 PCM 做<b>按样本加权求积</b>：<code>out = Π (items[i] * weight[i])</code>。</li>
+                      <li><b>weight</b>：None 表示全 1；否则长度必须等于分支数。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>ast.ReduceMean()</b>
+                    <ul>
+                      <li><b>作用</b>：对 PCM 做<b>按样本平均</b>：<code>out = (items[0]+...+items[N-1]) / N</code>。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>ast.ReduceMax()</b> / <b>ast.ReduceMin()</b>
+                    <ul>
+                      <li><b>作用</b>：对 PCM 做<b>按样本取最大/最小</b>（跨分支）。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.pcm</code> 且 <code>sample_type="f32"</code>。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>ast.ReduceConcat()</b>
+                    <ul>
+                      <li><b>作用</b>：对 Packet 做<b>拼接</b>：把各分支的 <code>packet.data</code> 顺序拼到一起。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.packet</code>；并要求各 packet 的 <code>time_base</code> 一致。</li>
+                      <li><b>注意</b>：输出 packet 的时间戳/flags 等元数据不会自动合并（当前实现只保留 time_base，并生成新的 data）。</li>
+                    </ul>
+                  </li>
+                  <li>
+                    <b>ast.ReduceXor()</b>
+                    <ul>
+                      <li><b>作用</b>：对 Packet 做<b>按字节异或</b>：<code>out[i] = pkt0[i] ^ pkt1[i] ^ ...</code>。</li>
+                      <li><b>限制</b>：仅支持 <code>NodeBuffer.packet</code>；要求各 packet 的 <code>time_base</code> 一致，且 <code>data</code> 长度一致。</li>
+                      <li><b>注意</b>：输出 packet 的时间戳/flags 等元数据不会自动合并（当前实现只保留 time_base，并生成新的 data）。</li>
+                    </ul>
+                  </li>
+                </ul>
+
+                <h3>示例：两分支 Packet → Python reduce 合并</h3>
+                <pre><code class="language-python">import pyaudiostream as ast
+
+# 两条分支：这里只用 identity 做示例（真实场景可放 encoder/decoder/processor 等）
+b1 = [ast.make_identity_node("packet")]
+b2 = [ast.make_identity_node("packet")]
+
+def my_reduce(items: list[ast.NodeBuffer]) -&gt; ast.NodeBuffer:
+    # items[0], items[1] 都是 packet
+    p1 = items[0].as_packet()
+    p2 = items[1].as_packet()
+    if p1 is None or p2 is None:
+        raise ValueError("expects packet")
+
+    # 示例：把两个 packet 的首字节相加，输出一个新 packet
+    s = (p1.data[0] + p2.data[0]) &amp; 0xFF
+    out = ast.Packet(data=bytes([s]), time_base_num=p1.time_base_num, time_base_den=p1.time_base_den,
+                     pts=p1.pts, dts=p1.dts, duration=p1.duration, flags=p1.flags)
+    return ast.NodeBuffer.packet(out)
+
+fj = ast.make_async_fork_join_node([b1, b2], my_reduce, name="fj")
+
+# fj 本身是 DynNode，可直接插入 pipeline
+p = ast.AsyncDynPipeline([fj])</code></pre>
+              </section>
+
+              <section class="section">
                 <h2>AsyncDynPipeline</h2>
                 <pre><code class="language-python">ast.AsyncDynPipeline(nodes: list[DynNode])</code></pre>
                 <ul>

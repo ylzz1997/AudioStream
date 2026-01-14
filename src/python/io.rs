@@ -5,7 +5,9 @@ use crate::codec::encoder::flac_encoder::FlacEncoderConfig;
 use crate::codec::encoder::opus_encoder::OpusEncoderConfig;
 use crate::codec::error::CodecError;
 use crate::codec::packet::{CodecPacket, PacketFlags};
-use crate::common::audio::audio::{AudioFormat as RsAudioFormat, AudioFrameView, AudioFrameViewMut, Rational, SampleType};
+use crate::common::audio::audio::{
+    AudioFormat as RsAudioFormat, AudioFrame, AudioFrameView, AudioFrameViewMut, Rational, SampleFormat, SampleType,
+};
 use crate::common::io::file as rs_file;
 use crate::common::io::file::{
     AudioFileReadConfig, AudioFileReader as RsAudioFileReader, AudioFileWriteConfig, AudioFileWriter as RsAudioFileWriter,
@@ -14,6 +16,8 @@ use crate::common::io::boundwriter::{MultiAudioWriter, ParallelAudioWriter as Rs
 use crate::pipeline::sink::{AsyncParallelAudioSink as RsAsyncParallelAudioSink, AsyncPipelineAudioSink as RsAsyncPipelineAudioSink};
 use crate::common::io::LineAudioWriter as RsLineAudioWriter;
 use crate::common::io::io::{AudioReader, AudioWriter};
+use crate::pipeline::forkjoinnode::AsyncForkJoinNode as RsAsyncForkJoinNode;
+use crate::pipeline::forkjoinnode::Reduce as RsReduce;
 use crate::pipeline::node::async_dynamic_node_interface::AsyncDynPipeline;
 use crate::pipeline::node::dynamic_node_interface::DynNode;
 use crate::pipeline::node::dynamic_node_interface::BoxedProcessorNode;
@@ -27,7 +31,7 @@ use crate::runner::error::{RunnerError, RunnerResult};
 
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyList};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc as std_mpsc;
@@ -56,6 +60,10 @@ fn node_kind_from_str(s: &str) -> Option<NodeBufferKind> {
         "packet" => Some(NodeBufferKind::Packet),
         _ => None,
     }
+}
+
+fn map_audio_err_to_codec_err(e: crate::common::audio::audio::AudioError) -> CodecError {
+    CodecError::Other(e.to_string())
 }
 
 #[pyclass(name = "Packet")]
@@ -275,6 +283,426 @@ impl NodeBufferPy {
     }
 }
 
+// ---------------------------
+// Rust 预置 Reduce（Python 可用）
+// ---------------------------
+
+fn ensure_non_empty_items(items: &[NodeBuffer], name: &'static str) -> crate::codec::error::CodecResult<()> {
+    if items.is_empty() {
+        return Err(CodecError::InvalidData(match name {
+            "sum" => "reduce_sum expects non-empty items",
+            "product" => "reduce_product expects non-empty items",
+            "mean" => "reduce_mean expects non-empty items",
+            "max" => "reduce_max expects non-empty items",
+            "min" => "reduce_min expects non-empty items",
+            "concat" => "reduce_concat expects non-empty items",
+            "xor" => "reduce_xor expects non-empty items",
+            _ => "reduce expects non-empty items",
+        }));
+    }
+    Ok(())
+}
+
+fn pcm_validate_same(items: &[AudioFrame]) -> crate::codec::error::CodecResult<(RsAudioFormat, usize, Rational, Option<i64>)> {
+    let f0 = items[0].format();
+    let n0 = items[0].nb_samples();
+    let tb0 = items[0].time_base();
+    let pts0 = items[0].pts();
+
+    for f in items.iter().skip(1) {
+        if f.format() != f0 {
+            return Err(CodecError::InvalidData("PCM reduce requires same AudioFormat across branches"));
+        }
+        if f.nb_samples() != n0 {
+            return Err(CodecError::InvalidData("PCM reduce requires same nb_samples across branches"));
+        }
+        if f.time_base() != tb0 {
+            return Err(CodecError::InvalidData("PCM reduce requires same time_base across branches"));
+        }
+    }
+    Ok((f0, n0, tb0, pts0))
+}
+
+fn reduce_pcm_f32_sum(frames: &[AudioFrame], weight: Option<&[f32]>) -> crate::codec::error::CodecResult<AudioFrame> {
+    let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
+    let plane_count = frames[0].plane_count();
+
+    let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        // 逐 sample 求和（f32，按 native endian）
+        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
+            let mut acc: f32 = 0.0;
+            for (bi, f) in frames.iter().enumerate() {
+                let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+                let base = si * 4;
+                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                let w = weight.map(|ws| ws[bi]).unwrap_or(1.0);
+                acc += v * w;
+            }
+            out_chunk.copy_from_slice(&acc.to_ne_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_pcm_f32_product(frames: &[AudioFrame], weight: Option<&[f32]>) -> crate::codec::error::CodecResult<AudioFrame> {
+    let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
+    let plane_count = frames[0].plane_count();
+
+    let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
+            let mut acc: f32 = 1.0;
+            for (bi, f) in frames.iter().enumerate() {
+                let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+                let base = si * 4;
+                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                let w = weight.map(|ws| ws[bi]).unwrap_or(1.0);
+                acc *= v * w;
+            }
+            out_chunk.copy_from_slice(&acc.to_ne_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_pcm_f32_mean(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    let n = frames.len() as f32;
+    reduce_pcm_f32_sum(frames, None).map(|mut out| {
+        // out /= n
+        for pi in 0..out.plane_count() {
+            let plane = out.plane_mut(pi).expect("plane exists");
+            for out_chunk in plane.chunks_exact_mut(4) {
+                let v = f32::from_ne_bytes([out_chunk[0], out_chunk[1], out_chunk[2], out_chunk[3]]);
+                let m = v / n;
+                out_chunk.copy_from_slice(&m.to_ne_bytes());
+            }
+        }
+        out
+    })
+}
+
+fn reduce_pcm_f32_max(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
+    let plane_count = frames[0].plane_count();
+
+    let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
+            let mut best: f32 = f32::NEG_INFINITY;
+            for f in frames.iter() {
+                let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+                let base = si * 4;
+                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                if v > best {
+                    best = v;
+                }
+            }
+            out_chunk.copy_from_slice(&best.to_ne_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_pcm_f32_min(frames: &[AudioFrame]) -> crate::codec::error::CodecResult<AudioFrame> {
+    let (fmt, nb_samples, tb, pts) = pcm_validate_same(frames)?;
+    let plane_count = frames[0].plane_count();
+
+    let mut out = AudioFrame::new_alloc(fmt, nb_samples).map_err(map_audio_err_to_codec_err)?;
+    out.set_time_base(tb).map_err(map_audio_err_to_codec_err)?;
+    out.set_pts(pts);
+
+    for pi in 0..plane_count {
+        let out_plane = out
+            .plane_mut(pi)
+            .ok_or(CodecError::InvalidState("invalid plane index"))?;
+        for (si, out_chunk) in out_plane.chunks_exact_mut(4).enumerate() {
+            let mut best: f32 = f32::INFINITY;
+            for f in frames.iter() {
+                let p = f.plane(pi).ok_or(CodecError::InvalidState("invalid plane index"))?;
+                let base = si * 4;
+                let v = f32::from_ne_bytes([p[base], p[base + 1], p[base + 2], p[base + 3]]);
+                if v < best {
+                    best = v;
+                }
+            }
+            out_chunk.copy_from_slice(&best.to_ne_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn reduce_nodebuffer_pcm(
+    items: &[NodeBuffer],
+    op: &'static str,
+    weight_f64: Option<&[f64]>,
+) -> crate::codec::error::CodecResult<NodeBuffer> {
+    ensure_non_empty_items(items, op)?;
+    let mut frames: Vec<AudioFrame> = Vec::with_capacity(items.len());
+    for b in items {
+        match b {
+            NodeBuffer::Pcm(f) => frames.push(f.clone()),
+            _ => return Err(CodecError::InvalidData("PCM reduce expects NodeBuffer(pcm)")),
+        }
+    }
+
+    let fmt = frames[0].format();
+    match fmt.sample_format {
+        SampleFormat::F32 { .. } => {
+            let w = if let Some(ws) = weight_f64 {
+                if ws.len() != frames.len() {
+                    return Err(CodecError::InvalidData("weight length mismatch"));
+                }
+                let mut v = Vec::with_capacity(ws.len());
+                for &x in ws {
+                    v.push(x as f32);
+                }
+                Some(v)
+            } else {
+                None
+            };
+            let out = match op {
+                "sum" => reduce_pcm_f32_sum(&frames, w.as_deref())?,
+                "product" => reduce_pcm_f32_product(&frames, w.as_deref())?,
+                "mean" => reduce_pcm_f32_mean(&frames)?,
+                "max" => reduce_pcm_f32_max(&frames)?,
+                "min" => reduce_pcm_f32_min(&frames)?,
+                _ => return Err(CodecError::Unsupported("unsupported pcm reduce op")),
+            };
+            Ok(NodeBuffer::Pcm(out))
+        }
+        _ => Err(CodecError::Unsupported(
+            "built-in PCM reduce currently supports sample_format=f32 only",
+        )),
+    }
+}
+
+fn reduce_nodebuffer_packet_concat(items: &[NodeBuffer]) -> crate::codec::error::CodecResult<NodeBuffer> {
+    ensure_non_empty_items(items, "concat")?;
+    let mut packets: Vec<CodecPacket> = Vec::with_capacity(items.len());
+    for b in items {
+        match b {
+            NodeBuffer::Packet(p) => packets.push(p.clone()),
+            _ => return Err(CodecError::InvalidData("concat reduce expects NodeBuffer(packet)")),
+        }
+    }
+    let tb = packets[0].time_base;
+    let mut data: Vec<u8> = Vec::new();
+    for p in packets.iter() {
+        if p.time_base != tb {
+            return Err(CodecError::InvalidData("concat reduce requires same packet time_base"));
+        }
+        data.extend_from_slice(&p.data);
+    }
+    Ok(NodeBuffer::Packet(CodecPacket::new(data, tb)))
+}
+
+fn reduce_nodebuffer_packet_xor(items: &[NodeBuffer]) -> crate::codec::error::CodecResult<NodeBuffer> {
+    ensure_non_empty_items(items, "xor")?;
+    let mut packets: Vec<CodecPacket> = Vec::with_capacity(items.len());
+    for b in items {
+        match b {
+            NodeBuffer::Packet(p) => packets.push(p.clone()),
+            _ => return Err(CodecError::InvalidData("xor reduce expects NodeBuffer(packet)")),
+        }
+    }
+    let tb = packets[0].time_base;
+    let len = packets[0].data.len();
+    for p in packets.iter() {
+        if p.time_base != tb {
+            return Err(CodecError::InvalidData("xor reduce requires same packet time_base"));
+        }
+        if p.data.len() != len {
+            return Err(CodecError::InvalidData("xor reduce requires same packet length"));
+        }
+    }
+    let mut out = vec![0u8; len];
+    for p in packets.iter() {
+        for i in 0..len {
+            out[i] ^= p.data[i];
+        }
+    }
+    Ok(NodeBuffer::Packet(CodecPacket::new(out, tb)))
+}
+
+#[pyclass(name = "ReduceSum")]
+#[derive(Default)]
+pub struct ReduceSumPy {
+    weight: Option<Vec<f64>>,
+}
+
+#[pymethods]
+impl ReduceSumPy {
+    #[new]
+    #[pyo3(signature = (weight=None))]
+    fn new(weight: Option<Vec<f64>>) -> Self {
+        Self { weight }
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_pcm(&rs_items, "sum", self.weight.as_deref()).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceProduct")]
+#[derive(Default)]
+pub struct ReduceProductPy {
+    weight: Option<Vec<f64>>,
+}
+
+#[pymethods]
+impl ReduceProductPy {
+    #[new]
+    #[pyo3(signature = (weight=None))]
+    fn new(weight: Option<Vec<f64>>) -> Self {
+        Self { weight }
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_pcm(&rs_items, "product", self.weight.as_deref()).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceMean")]
+#[derive(Default)]
+pub struct ReduceMeanPy;
+
+#[pymethods]
+impl ReduceMeanPy {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_pcm(&rs_items, "mean", None).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceMax")]
+#[derive(Default)]
+pub struct ReduceMaxPy;
+
+#[pymethods]
+impl ReduceMaxPy {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_pcm(&rs_items, "max", None).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceMin")]
+#[derive(Default)]
+pub struct ReduceMinPy;
+
+#[pymethods]
+impl ReduceMinPy {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_pcm(&rs_items, "min", None).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceConcat")]
+#[derive(Default)]
+pub struct ReduceConcatPy;
+
+#[pymethods]
+impl ReduceConcatPy {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_packet_concat(&rs_items).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
+#[pyclass(name = "ReduceXor")]
+#[derive(Default)]
+pub struct ReduceXorPy;
+
+#[pymethods]
+impl ReduceXorPy {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+
+    fn __call__(&self, py: Python<'_>, items: Vec<Py<NodeBufferPy>>) -> PyResult<NodeBufferPy> {
+        let mut rs_items: Vec<NodeBuffer> = Vec::with_capacity(items.len());
+        for it in items {
+            let mut b = it.bind(py).borrow_mut();
+            rs_items.push(b.take_inner()?);
+        }
+        let out = reduce_nodebuffer_packet_xor(&rs_items).map_err(map_codec_err)?;
+        Ok(NodeBufferPy { inner: Some(out) })
+    }
+}
+
 #[pyclass(name = "DynNode")]
 pub struct DynNodePy {
     inner: Option<Box<dyn DynNode>>,
@@ -473,6 +901,217 @@ pub fn make_python_node(obj: Py<PyAny>, input_kind: &str, output_kind: &str, nam
     let in_k = node_kind_from_str(input_kind).ok_or_else(|| PyValueError::new_err("input_kind 仅支持: pcm/packet"))?;
     let out_k = node_kind_from_str(output_kind).ok_or_else(|| PyValueError::new_err("output_kind 仅支持: pcm/packet"))?;
     Ok(DynNodePy::new_boxed(Box::new(PyCallbackNode::new(obj, in_k, out_k, name))))
+}
+
+/// Python 侧 reduce 回调：`reduce(items: list[NodeBuffer]) -> NodeBuffer`
+struct PyReduceFn {
+    obj: Py<PyAny>,
+    out_kind: NodeBufferKind,
+}
+
+impl PyReduceFn {
+    fn new(obj: Py<PyAny>, out_kind: NodeBufferKind) -> Self {
+        Self { obj, out_kind }
+    }
+}
+
+impl RsReduce<NodeBuffer> for PyReduceFn {
+    fn reduce(&self, items: &[NodeBuffer]) -> crate::codec::error::CodecResult<NodeBuffer> {
+        Python::with_gil(|py| {
+            let f = self.obj.bind(py);
+            let mut py_items: Vec<Py<NodeBufferPy>> = Vec::with_capacity(items.len());
+            for v in items.iter() {
+                // items 只借用，构造 Python 侧 NodeBuffer 需 clone
+                let nb = Py::new(py, NodeBufferPy { inner: Some(v.clone()) }).map_err(pyerr_to_codec_err)?;
+                py_items.push(nb);
+            }
+            let list = PyList::new_bound(py, py_items);
+            let ret = f.call1((list,)).map_err(pyerr_to_codec_err)?;
+            if ret.is_none() {
+                return Err(CodecError::InvalidData("Python reduce() 必须返回 NodeBuffer（不可为 None）"));
+            }
+            let nb_py: Py<NodeBufferPy> = ret
+                .extract()
+                .map_err(|_| CodecError::InvalidData("Python reduce() 必须返回 NodeBuffer"))?;
+            let mut nb = nb_py.bind(py).borrow_mut();
+            let inner = nb.take_inner().map_err(|_| CodecError::InvalidState("Python reduce() 返回的 NodeBuffer 已被移动（不可再次使用）"))?;
+            if inner.kind() != self.out_kind {
+                return Err(CodecError::InvalidData("Python reduce() 返回的 NodeBuffer kind 与分支 output_kind 不匹配"));
+            }
+            Ok(inner)
+        })
+    }
+}
+
+/// 延迟初始化的 async fork-join 节点：等真正运行在 tokio runtime 内时再构建分支 `AsyncDynPipeline`。
+struct LazyAsyncForkJoinNode {
+    name: &'static str,
+    in_kind: NodeBufferKind,
+    out_kind: NodeBufferKind,
+    branches: Option<Vec<Vec<Box<dyn DynNode>>>>,
+    reducer: Option<PyReduceFn>,
+    inner: Option<RsAsyncForkJoinNode<PyReduceFn>>,
+}
+
+impl LazyAsyncForkJoinNode {
+    fn new(
+        name: String,
+        in_kind: NodeBufferKind,
+        out_kind: NodeBufferKind,
+        branches: Vec<Vec<Box<dyn DynNode>>>,
+        reducer: PyReduceFn,
+    ) -> Self {
+        let leaked: &'static str = Box::leak(name.into_boxed_str());
+        Self {
+            name: leaked,
+            in_kind,
+            out_kind,
+            branches: Some(branches),
+            reducer: Some(reducer),
+            inner: None,
+        }
+    }
+
+    fn ensure_init(&mut self) -> crate::codec::error::CodecResult<()> {
+        if self.inner.is_some() {
+            return Ok(());
+        }
+        // 必须在 tokio runtime 上下文中运行（AsyncDynPipeline::new 会 spawn_blocking）
+        tokio::runtime::Handle::try_current()
+            .map_err(|_| CodecError::InvalidState("AsyncForkJoinNode 需要在 tokio runtime 内运行（请将该节点用于 AsyncDynPipeline/AsyncDynRunner）"))?;
+
+        let branches = self
+            .branches
+            .take()
+            .ok_or(CodecError::InvalidState("fork-join branches already moved"))?;
+
+        let mut ps = Vec::with_capacity(branches.len());
+        for nodes in branches {
+            let p = AsyncDynPipeline::new(nodes)?;
+            ps.push(p);
+        }
+        let reducer = self
+            .reducer
+            .take()
+            .ok_or(CodecError::InvalidState("fork-join reducer already moved"))?;
+        let node = RsAsyncForkJoinNode::new(ps, reducer)?;
+        self.inner = Some(node);
+        Ok(())
+    }
+}
+
+impl DynNode for LazyAsyncForkJoinNode {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn input_kind(&self) -> NodeBufferKind {
+        self.in_kind
+    }
+    fn output_kind(&self) -> NodeBufferKind {
+        self.out_kind
+    }
+
+    fn push(&mut self, input: Option<NodeBuffer>) -> crate::codec::error::CodecResult<()> {
+        self.ensure_init()?;
+        self.inner
+            .as_mut()
+            .ok_or(CodecError::InvalidState("fork-join not initialized"))?
+            .push(input)
+    }
+
+    fn pull(&mut self) -> crate::codec::error::CodecResult<NodeBuffer> {
+        self.ensure_init()?;
+        self.inner
+            .as_mut()
+            .ok_or(CodecError::InvalidState("fork-join not initialized"))?
+            .pull()
+    }
+
+    fn reset(&mut self) -> crate::codec::error::CodecResult<()> {
+        // 若还没初始化（从未运行过），直接恢复初始状态即可
+        if self.inner.is_none() {
+            return Ok(());
+        }
+        self.inner
+            .as_mut()
+            .ok_or(CodecError::InvalidState("fork-join not initialized"))?
+            .reset()
+    }
+}
+
+/// 构造一个可用于 `AsyncDynPipeline(nodes=[...])` 的 async fork-join 节点。
+///
+/// - `pipelines`: 多条分支，每条是 `DynNode` 列表（会被 move/搬空）
+/// - `reduce`: Python 回调 `reduce(items: list[NodeBuffer]) -> NodeBuffer`
+#[pyfunction]
+#[pyo3(signature = (pipelines, reduce, name="async-fork-join".to_string()))]
+pub fn make_async_fork_join_node(
+    py: Python<'_>,
+    pipelines: Vec<Vec<Py<DynNodePy>>>,
+    reduce: Py<PyAny>,
+    name: String,
+) -> PyResult<DynNodePy> {
+    if pipelines.is_empty() {
+        return Err(PyValueError::new_err("pipelines 不能为空"));
+    }
+    if !reduce.bind(py).is_callable() {
+        return Err(PyValueError::new_err("reduce 必须是可调用对象（callable）"));
+    }
+
+    let mut branches: Vec<Vec<Box<dyn DynNode>>> = Vec::with_capacity(pipelines.len());
+    let mut in_kind: Option<NodeBufferKind> = None;
+    let mut out_kind: Option<NodeBufferKind> = None;
+
+    for (bi, nodes) in pipelines.into_iter().enumerate() {
+        if nodes.is_empty() {
+            return Err(PyValueError::new_err("pipelines 中每个分支都必须至少包含 1 个 DynNode"));
+        }
+        let nlen = nodes.len();
+        let mut branch: Vec<Box<dyn DynNode>> = Vec::with_capacity(nodes.len());
+        for (i, n) in nodes.into_iter().enumerate() {
+            let mut nb = n.bind(py).borrow_mut();
+            let node_in = nb.in_kind;
+            let node_out = nb.out_kind;
+
+            // 记录/校验分支内 kind 连接：相邻节点 out == next in
+            if i > 0 {
+                let prev_out = branch
+                    .last()
+                    .expect("i>0 implies non-empty")
+                    .output_kind();
+                if prev_out != node_in {
+                    return Err(PyValueError::new_err("分支 pipeline 内相邻节点 kind 不匹配"));
+                }
+            }
+
+            // 记录/校验所有分支的入口/出口 kind 一致
+            if i == 0 {
+                if bi == 0 {
+                    in_kind = Some(node_in);
+                } else if in_kind != Some(node_in) {
+                    return Err(PyValueError::new_err("各分支 pipeline 的 input_kind 必须一致"));
+                }
+            }
+            if i == nlen - 1 {
+                if bi == 0 {
+                    out_kind = Some(node_out);
+                } else if out_kind != Some(node_out) {
+                    return Err(PyValueError::new_err("各分支 pipeline 的 output_kind 必须一致"));
+                }
+            }
+
+            branch.push(nb.take_inner()?);
+        }
+        branches.push(branch);
+    }
+
+    let in_kind = in_kind.ok_or_else(|| PyValueError::new_err("pipelines 不能为空"))?;
+    let out_kind = out_kind.ok_or_else(|| PyValueError::new_err("pipelines 不能为空"))?;
+    let reducer = PyReduceFn::new(reduce, out_kind);
+
+    Ok(DynNodePy::new_boxed(Box::new(LazyAsyncForkJoinNode::new(
+        name, in_kind, out_kind, branches, reducer,
+    ))))
 }
 
 /// Python 侧 AsyncDynPipeline（动态节点列表）。
@@ -1490,7 +2129,7 @@ impl AudioFileWriterPy {
                     self.sample_type = Some(st);
                 } else if let Some(expected) = self.input_format {
                     if *f.format_ref() != expected {
-                        return Err(PyValueError::new_err("PCM format 与 writer 首帧推断/配置的 input_format 不一致"));
+                        return Err(PyRuntimeError::new_err("PCM format is not consistent with the input_format of the writer"));
                     }
                 }
 

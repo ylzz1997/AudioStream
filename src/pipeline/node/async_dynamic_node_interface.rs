@@ -203,6 +203,8 @@ pub struct AsyncDynPipeline {
     in_tx: mpsc::UnboundedSender<Msg>,
     out_rx: mpsc::UnboundedReceiver<Result<NodeBuffer, CodecError>>,
     err_store: Arc<Mutex<Option<CodecError>>>,
+    input_kind: crate::pipeline::node::node_interface::NodeBufferKind,
+    output_kind: crate::pipeline::node::node_interface::NodeBufferKind,
 }
 
 pub struct AsyncDynPipelineProducer {
@@ -281,6 +283,15 @@ impl AsyncDynPipeline {
             }
         }
 
+        let input_kind = nodes
+            .first()
+            .ok_or(CodecError::InvalidState("pipeline requires at least 1 node"))?
+            .input_kind();
+        let output_kind = nodes
+            .last()
+            .ok_or(CodecError::InvalidState("pipeline requires at least 1 node"))?
+            .output_kind();
+
         let (in_tx, mut rx) = mpsc::unbounded_channel::<Msg>();
         let err_store: Arc<Mutex<Option<CodecError>>> = Arc::new(Mutex::new(None));
 
@@ -303,6 +314,8 @@ impl AsyncDynPipeline {
             in_tx,
             out_rx,
             err_store,
+            input_kind,
+            output_kind,
         })
     }
 
@@ -331,6 +344,14 @@ impl AsyncDynPipeline {
             },
             AsyncDynPipelineConsumer { rx: self.out_rx },
         )
+    }
+
+    pub fn input_kind(&self) -> crate::pipeline::node::node_interface::NodeBufferKind {
+        self.input_kind
+    }
+
+    pub fn output_kind(&self) -> crate::pipeline::node::node_interface::NodeBufferKind {
+        self.output_kind
     }
 }
 

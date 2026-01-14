@@ -22,7 +22,8 @@ pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
     AsyncParallelAudioSinkHandlePy, AsyncParallelAudioSinkPy, AsyncPipelineAudioSinkHandlePy, AsyncPipelineAudioSinkPy,
     DynNodePy, LineAudioWriterPy, NodeBase, NodeBufferPy, PacketPy, ParallelAudioWriterPy,
-    make_identity_node, make_python_node,
+    ReduceConcatPy, ReduceMaxPy, ReduceMeanPy, ReduceMinPy, ReduceProductPy, ReduceSumPy, ReduceXorPy,
+    make_async_fork_join_node, make_identity_node, make_python_node,
 };
 
 use pyo3::prelude::*;
@@ -59,6 +60,14 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PacketPy>()?;
     m.add_class::<NodeBufferPy>()?;
     m.add_class::<DynNodePy>()?;
+    // built-in reduce callables
+    m.add_class::<ReduceSumPy>()?;
+    m.add_class::<ReduceProductPy>()?;
+    m.add_class::<ReduceMeanPy>()?;
+    m.add_class::<ReduceMaxPy>()?;
+    m.add_class::<ReduceMinPy>()?;
+    m.add_class::<ReduceConcatPy>()?;
+    m.add_class::<ReduceXorPy>()?;
     m.add_class::<NodeBase>()?;
     m.add_class::<AudioSourceBase>()?;
     m.add_class::<AudioSinkBase>()?;
@@ -79,6 +88,7 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encoder::make_encoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(decoder::make_decoder_node, m)?)?;
     m.add_function(wrap_pyfunction!(io::make_python_node, m)?)?;
+    m.add_function(wrap_pyfunction!(io::make_async_fork_join_node, m)?)?;
 
     // Backward-compatible alias: LineWriter -> LineAudioWriter
     m.setattr("LineWriter", m.getattr("LineAudioWriter")?)?;

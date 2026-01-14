@@ -265,6 +265,20 @@ impl DynPipeline {
         })
     }
 
+    pub fn input_kind(&self) -> NodeBufferKind {
+        self.nodes
+            .first()
+            .expect("pipeline requires at least 1 node")
+            .input_kind()
+    }
+
+    pub fn output_kind(&self) -> NodeBufferKind {
+        self.nodes
+            .last()
+            .expect("pipeline requires at least 1 node")
+            .output_kind()
+    }
+
     /// 推入一个输入（或 flush），并尽可能把数据跑到末端，返回末端所有可用输出。
     pub fn push_and_drain(&mut self, input: Option<NodeBuffer>) -> CodecResult<Vec<NodeBuffer>> {
         match self.nodes[0].push(input) {
