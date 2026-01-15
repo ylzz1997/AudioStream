@@ -3,5 +3,6 @@ pub mod identity_processor;
 pub mod resample_processor;
 pub mod gain_processor;
 pub mod compressor_processor;
+pub mod delay_processor;
 
 

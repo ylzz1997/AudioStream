@@ -279,6 +279,12 @@ class GainNodeConfig:
 
     def __init__(self, format: Optional[AudioFormat] = None, gain: float = ...) -> None: ...
 
+class DelayNodeConfig:
+    format: Optional[AudioFormat]
+    delay_ms: float
+
+    def __init__(self, format: Optional[AudioFormat] = None, delay_ms: float = ...) -> None: ...
+
 class CompressorNodeConfig:
     format: Optional[AudioFormat]
     sample_rate: Optional[float]
@@ -306,8 +312,8 @@ class CompressorNodeConfig:
     ) -> None: ...
 
 def make_processor_node(
-    kind: Literal["identity", "resample", "gain", "compressor"],
-    config: IdentityNodeConfig | ResampleNodeConfig | GainNodeConfig | CompressorNodeConfig,
+    kind: Literal["identity", "resample", "gain", "delay", "compressor"],
+    config: IdentityNodeConfig | ResampleNodeConfig | GainNodeConfig | DelayNodeConfig | CompressorNodeConfig,
 ) -> DynNode: ...
 
 
@@ -550,6 +556,12 @@ class Processor:
     def gain(
         format: Optional[AudioFormat] = None,
         gain: float = ...,
+    ) -> Processor: ...
+
+    @staticmethod
+    def delay(
+        format: Optional[AudioFormat] = None,
+        delay_ms: float = ...,
     ) -> Processor: ...
 
     @staticmethod

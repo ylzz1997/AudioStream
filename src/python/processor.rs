@@ -2,6 +2,7 @@
 
 use crate::codec::error::CodecError;
 use crate::codec::processor::compressor_processor::CompressorProcessor;
+use crate::codec::processor::delay_processor::DelayProcessor;
 use crate::codec::processor::gain_processor::GainProcessor;
 use crate::codec::processor::identity_processor::IdentityProcessor;
 use crate::codec::processor::processor_interface::AudioProcessor;
@@ -23,7 +24,7 @@ use crate::python::format::{
 };
 use crate::python::io::DynNodePy;
 
-/// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor / GainProcessor / CompressorProcessor。
+/// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor / GainProcessor / CompressorProcessor / DelayProcessor。
 #[pyclass(name = "Processor")]
 pub struct ProcessorPy {
     // NOTE: Processor 可能会被 move 进其它 Rust 组件（例如 LineAudioWriter）。
@@ -103,6 +104,27 @@ impl ProcessorPy {
             GainProcessor::new_with_format(fmt.to_rs()?, gain).map_err(map_codec_err)?
         } else {
             GainProcessor::new(gain).map_err(map_codec_err)?
+        };
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p: Some(Box::new(p)),
+            in_format,
+            out_format,
+            in_sample_type,
+            sent_eof: false,
+        })
+    }
+
+    /// 创建 delay processor（在开头插入静音，单位：毫秒）。
+    #[staticmethod]
+    #[pyo3(signature = (format=None, delay_ms))]
+    fn delay(format: Option<AudioFormat>, delay_ms: f64) -> PyResult<Self> {
+        let p = if let Some(fmt) = format {
+            DelayProcessor::new_with_format(fmt.to_rs()?, delay_ms).map_err(map_codec_err)?
+        } else {
+            DelayProcessor::new(delay_ms).map_err(map_codec_err)?
         };
         let in_format = p.input_format();
         let out_format = p.output_format();
@@ -394,6 +416,25 @@ impl GainNodeConfigPy {
     }
 }
 
+/// pipeline 节点：DelayProcessorNode 的 config
+#[pyclass(name = "DelayNodeConfig")]
+#[derive(Clone)]
+pub struct DelayNodeConfigPy {
+    #[pyo3(get, set)]
+    pub format: Option<AudioFormat>,
+    #[pyo3(get, set)]
+    pub delay_ms: f64,
+}
+
+#[pymethods]
+impl DelayNodeConfigPy {
+    #[new]
+    #[pyo3(signature = (format=None, delay_ms))]
+    fn new(format: Option<AudioFormat>, delay_ms: f64) -> Self {
+        Self { format, delay_ms }
+    }
+}
+
 /// pipeline 节点：CompressorProcessorNode 的 config
 #[pyclass(name = "CompressorNodeConfig")]
 #[derive(Clone)]
@@ -494,6 +535,15 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
             };
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
+        "delay" => {
+            let cfg = config.extract::<DelayNodeConfigPy>()?;
+            let p = if let Some(fmt) = cfg.format {
+                DelayProcessor::new_with_format(fmt.to_rs()?, cfg.delay_ms).map_err(map_codec_err)?
+            } else {
+                DelayProcessor::new(cfg.delay_ms).map_err(map_codec_err)?
+            };
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
+        }
         "compressor" => {
             let cfg = config.extract::<CompressorNodeConfigPy>()?;
             let sample_rate = match (cfg.sample_rate, cfg.format.as_ref()) {
@@ -523,7 +573,9 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
             };
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
-        _ => Err(PyValueError::new_err("kind only support: identity/resample/gain/compressor")),
+        _ => Err(PyValueError::new_err(
+            "kind only support: identity/resample/gain/delay/compressor",
+        )),
     }
 }
 
