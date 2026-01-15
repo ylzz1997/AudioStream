@@ -3,8 +3,10 @@
 use crate::codec::error::CodecError;
 use crate::codec::processor::compressor_processor::CompressorProcessor;
 use crate::codec::processor::delay_processor::DelayProcessor;
+use crate::codec::processor::fir_processor::FirProcessor;
 use crate::codec::processor::gain_processor::GainProcessor;
 use crate::codec::processor::identity_processor::IdentityProcessor;
+use crate::codec::processor::iir_processor::IirProcessor;
 use crate::codec::processor::processor_interface::AudioProcessor;
 use crate::codec::processor::resample_processor::ResampleProcessor;
 use crate::common::audio::audio::{AudioFrameView, AudioFrameViewMut, SampleType};
@@ -24,7 +26,7 @@ use crate::python::format::{
 };
 use crate::python::io::DynNodePy;
 
-/// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor / GainProcessor / CompressorProcessor / DelayProcessor。
+/// Python 侧 Processor（PCM->PCM）：目前包含 IdentityProcessor / ResampleProcessor / GainProcessor / CompressorProcessor / DelayProcessor / FirProcessor / IirProcessor。
 #[pyclass(name = "Processor")]
 pub struct ProcessorPy {
     // NOTE: Processor 可能会被 move 进其它 Rust 组件（例如 LineAudioWriter）。
@@ -125,6 +127,48 @@ impl ProcessorPy {
             DelayProcessor::new_with_format(fmt.to_rs()?, delay_ms).map_err(map_codec_err)?
         } else {
             DelayProcessor::new(delay_ms).map_err(map_codec_err)?
+        };
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p: Some(Box::new(p)),
+            in_format,
+            out_format,
+            in_sample_type,
+            sent_eof: false,
+        })
+    }
+
+    /// 创建 FIR processor（taps 为滤波器系数，h[0] 对应当前样本）。
+    #[staticmethod]
+    #[pyo3(signature = (format=None, taps))]
+    fn fir(format: Option<AudioFormat>, taps: Vec<f32>) -> PyResult<Self> {
+        let p = if let Some(fmt) = format {
+            FirProcessor::new_with_format(fmt.to_rs()?, taps).map_err(map_codec_err)?
+        } else {
+            FirProcessor::new(taps).map_err(map_codec_err)?
+        };
+        let in_format = p.input_format();
+        let out_format = p.output_format();
+        let in_sample_type = in_format.map(|f| f.sample_format.sample_type());
+        Ok(Self {
+            p: Some(Box::new(p)),
+            in_format,
+            out_format,
+            in_sample_type,
+            sent_eof: false,
+        })
+    }
+
+    /// 创建 IIR processor（b 为前向系数，a 为反馈系数；a[0] 会被归一化为 1）。
+    #[staticmethod]
+    #[pyo3(signature = (format=None, b, a))]
+    fn iir(format: Option<AudioFormat>, b: Vec<f32>, a: Vec<f32>) -> PyResult<Self> {
+        let p = if let Some(fmt) = format {
+            IirProcessor::new_with_format(fmt.to_rs()?, b, a).map_err(map_codec_err)?
+        } else {
+            IirProcessor::new(b, a).map_err(map_codec_err)?
         };
         let in_format = p.input_format();
         let out_format = p.output_format();
@@ -435,6 +479,46 @@ impl DelayNodeConfigPy {
     }
 }
 
+/// pipeline 节点：FirProcessorNode 的 config
+#[pyclass(name = "FirNodeConfig")]
+#[derive(Clone)]
+pub struct FirNodeConfigPy {
+    #[pyo3(get, set)]
+    pub format: Option<AudioFormat>,
+    #[pyo3(get, set)]
+    pub taps: Vec<f32>,
+}
+
+#[pymethods]
+impl FirNodeConfigPy {
+    #[new]
+    #[pyo3(signature = (format=None, taps))]
+    fn new(format: Option<AudioFormat>, taps: Vec<f32>) -> Self {
+        Self { format, taps }
+    }
+}
+
+/// pipeline 节点：IirProcessorNode 的 config
+#[pyclass(name = "IirNodeConfig")]
+#[derive(Clone)]
+pub struct IirNodeConfigPy {
+    #[pyo3(get, set)]
+    pub format: Option<AudioFormat>,
+    #[pyo3(get, set)]
+    pub b: Vec<f32>,
+    #[pyo3(get, set)]
+    pub a: Vec<f32>,
+}
+
+#[pymethods]
+impl IirNodeConfigPy {
+    #[new]
+    #[pyo3(signature = (format=None, b, a))]
+    fn new(format: Option<AudioFormat>, b: Vec<f32>, a: Vec<f32>) -> Self {
+        Self { format, b, a }
+    }
+}
+
 /// pipeline 节点：CompressorProcessorNode 的 config
 #[pyclass(name = "CompressorNodeConfig")]
 #[derive(Clone)]
@@ -544,6 +628,24 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
             };
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
+        "fir" => {
+            let cfg = config.extract::<FirNodeConfigPy>()?;
+            let p = if let Some(fmt) = cfg.format {
+                FirProcessor::new_with_format(fmt.to_rs()?, cfg.taps).map_err(map_codec_err)?
+            } else {
+                FirProcessor::new(cfg.taps).map_err(map_codec_err)?
+            };
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
+        }
+        "iir" => {
+            let cfg = config.extract::<IirNodeConfigPy>()?;
+            let p = if let Some(fmt) = cfg.format {
+                IirProcessor::new_with_format(fmt.to_rs()?, cfg.b, cfg.a).map_err(map_codec_err)?
+            } else {
+                IirProcessor::new(cfg.b, cfg.a).map_err(map_codec_err)?
+            };
+            Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
+        }
         "compressor" => {
             let cfg = config.extract::<CompressorNodeConfigPy>()?;
             let sample_rate = match (cfg.sample_rate, cfg.format.as_ref()) {
@@ -574,7 +676,7 @@ pub fn make_processor_node(kind: &str, config: &Bound<'_, PyAny>) -> PyResult<Dy
             Ok(DynNodePy::new_boxed(Box::new(ProcessorNode::new(p))))
         }
         _ => Err(PyValueError::new_err(
-            "kind only support: identity/resample/gain/delay/compressor",
+            "kind only support: identity/resample/gain/delay/fir/iir/compressor",
         )),
     }
 }

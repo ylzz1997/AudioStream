@@ -355,6 +355,37 @@ print("frames:", len(out))</code></pre>
               </section>
 
               <section class="section">
+                <h2>示例：FIR 滤波（滑动平均低通）</h2>
+                <pre><code>import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(48000, 1, "f32", planar=True)
+taps = [1.0 / 5] * 5
+p = ast.Processor.fir(fmt, taps=taps)
+
+p.put_frame(np.random.randn(1, 960).astype(np.float32))
+out = p.get_frame()
+print(out.shape)</code></pre>
+              </section>
+
+              <section class="section">
+                <h2>示例：IIR 滤波（简单一阶低通）</h2>
+                <pre><code>import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(48000, 1, "f32", planar=True)
+# y[n] = (1-alpha) * x[n] + alpha * y[n-1]
+alpha = 0.9
+b = [1.0 - alpha]
+a = [1.0, -alpha]
+p = ast.Processor.iir(fmt, b=b, a=a)
+
+p.put_frame(np.random.randn(1, 960).astype(np.float32))
+out = p.get_frame()
+print(out.shape)</code></pre>
+              </section>
+
+              <section class="section">
                 <h2>Processor 的格式自动推断</h2>
                 <p>
                   多数 Processor 都支持把输入格式参数设为 <code>None</code>，表示：<b>首帧推断输入 AudioFormat</b>。
@@ -1020,12 +1051,12 @@ if out is not None:
               <div class="hero">
                 <div class="hero__kicker">API · 处理</div>
                 <h1 class="hero__title">Processor</h1>
-                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / delay / compressor；也支持创建 pipeline 节点。</p>
+                <p class="hero__desc">PCM -&gt; PCM：identity / resample / gain / delay / fir / iir / compressor；也支持创建 pipeline 节点。</p>
               </div>
 
               <section class="section">
                 <h2>Processor（通用）</h2>
-                <p>Processor 用于 <b>PCM -&gt; PCM</b> 处理。你可以用下面 5 个构造函数创建不同处理器。</p>
+                <p>Processor 用于 <b>PCM -&gt; PCM</b> 处理。你可以用下面 7 个构造函数创建不同处理器。</p>
                 <h3>通用方法</h3>
                 <ul>
                   <li><b>put_frame(pcm, pts=None, format=None)</b>：输入一帧 PCM。若输入格式未知，第一次必须提供 <code>format</code>。</li>
@@ -1047,7 +1078,7 @@ if out is not None:
               <section class="section">
                 <h2>make_processor_node</h2>
                 <pre><code class="language-python">ast.make_processor_node(kind: str, config: Any) -&gt; DynNode</code></pre>
-                <p><b>kind</b>：<code>identity</code>/<code>resample</code>/<code>gain</code>/<code>delay</code>/<code>compressor</code></p>
+                <p><b>kind</b>：<code>identity</code>/<code>resample</code>/<code>gain</code>/<code>delay</code>/<code>fir</code>/<code>iir</code>/<code>compressor</code></p>
                 <ul>
                   <li><b>kind</b>：节点类型字符串（见上）。</li>
                   <li><b>config</b>：对应的 *NodeConfig。</li>
@@ -1081,6 +1112,19 @@ if out is not None:
                 <ul>
                   <li><b>format</b>：输入格式；None=首帧推断。</li>
                   <li><b>delay_ms</b>：延迟毫秒数（在开头插入静音）。</li>
+                </ul>
+                <h3>FirNodeConfig</h3>
+                <pre><code class="language-python">ast.FirNodeConfig(format: Optional[AudioFormat]=None, taps: list[float])</code></pre>
+                <ul>
+                  <li><b>format</b>：输入格式；None=首帧推断。</li>
+                  <li><b>taps</b>：FIR 系数，h[0] 对应当前样本。</li>
+                </ul>
+                <h3>IirNodeConfig</h3>
+                <pre><code class="language-python">ast.IirNodeConfig(format: Optional[AudioFormat]=None, b: list[float], a: list[float])</code></pre>
+                <ul>
+                  <li><b>format</b>：输入格式；None=首帧推断。</li>
+                  <li><b>b</b>：前向系数（FIR 部分）。</li>
+                  <li><b>a</b>：反馈系数（a[0] 会归一化为 1）。</li>
                 </ul>
                 <h3>CompressorNodeConfig</h3>
                 <pre><code class="language-python">ast.CompressorNodeConfig(
@@ -1165,6 +1209,37 @@ if out is not None:
                 <ul>
                   <li><b>作用</b>：在音频开头插入静音，实现整体延迟。</li>
                 </ul>
+              </section>
+
+              <section class="section">
+                <h2>构造：fir</h2>
+                <pre><code class="language-python">ast.Processor.fir(format: Optional[AudioFormat] = None, taps: list[float])</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
+                  <li><b>taps</b>：FIR 系数，h[0] 对应当前样本。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：对 PCM 做 FIR 滤波（流式处理，按声道维持状态）。</li>
+                </ul>
+                <p><b>公式</b>：y[n] = sum_{k=0}^{M-1} taps[k] * x[n-k]</p>
+              </section>
+
+              <section class="section">
+                <h2>构造：iir</h2>
+                <pre><code class="language-python">ast.Processor.iir(format: Optional[AudioFormat] = None, b: list[float], a: list[float])</code></pre>
+                <h3>参数</h3>
+                <ul>
+                  <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
+                  <li><b>b</b>：前向系数（FIR 部分）。</li>
+                  <li><b>a</b>：反馈系数（a[0] 会归一化为 1）。</li>
+                </ul>
+                <h3>行为</h3>
+                <ul>
+                  <li><b>作用</b>：对 PCM 做 IIR 滤波（流式处理，按声道维持状态）。</li>
+                </ul>
+                <p><b>公式</b>：y[n] = sum_{k=0}^{M-1} b[k] * x[n-k] - sum_{k=1}^{N-1} a[k] * y[n-k]</p>
               </section>
 
               <section class="section">

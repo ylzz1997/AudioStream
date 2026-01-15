@@ -285,6 +285,19 @@ class DelayNodeConfig:
 
     def __init__(self, format: Optional[AudioFormat] = None, delay_ms: float = ...) -> None: ...
 
+class FirNodeConfig:
+    format: Optional[AudioFormat]
+    taps: list[float]
+
+    def __init__(self, format: Optional[AudioFormat] = None, taps: list[float] = ...) -> None: ...
+
+class IirNodeConfig:
+    format: Optional[AudioFormat]
+    b: list[float]
+    a: list[float]
+
+    def __init__(self, format: Optional[AudioFormat] = None, b: list[float] = ..., a: list[float] = ...) -> None: ...
+
 class CompressorNodeConfig:
     format: Optional[AudioFormat]
     sample_rate: Optional[float]
@@ -312,8 +325,8 @@ class CompressorNodeConfig:
     ) -> None: ...
 
 def make_processor_node(
-    kind: Literal["identity", "resample", "gain", "delay", "compressor"],
-    config: IdentityNodeConfig | ResampleNodeConfig | GainNodeConfig | DelayNodeConfig | CompressorNodeConfig,
+    kind: Literal["identity", "resample", "gain", "delay", "fir", "iir", "compressor"],
+    config: IdentityNodeConfig | ResampleNodeConfig | GainNodeConfig | DelayNodeConfig | FirNodeConfig | IirNodeConfig | CompressorNodeConfig,
 ) -> DynNode: ...
 
 
@@ -562,6 +575,19 @@ class Processor:
     def delay(
         format: Optional[AudioFormat] = None,
         delay_ms: float = ...,
+    ) -> Processor: ...
+
+    @staticmethod
+    def fir(
+        format: Optional[AudioFormat] = None,
+        taps: list[float] = ...,
+    ) -> Processor: ...
+
+    @staticmethod
+    def iir(
+        format: Optional[AudioFormat] = None,
+        b: list[float] = ...,
+        a: list[float] = ...,
     ) -> Processor: ...
 
     @staticmethod

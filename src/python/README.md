@@ -77,6 +77,9 @@ dec = ast.Decoder("opus", cfg)
 - `Processor.identity(format=None|AudioFormat)`
 - `Processor.resample(in_format, out_format, out_chunk_samples=None, pad_final=True)`
 - `Processor.gain(format, gain)`
+- `Processor.delay(format, delay_ms)`
+- `Processor.fir(format, taps)`
+- `Processor.iir(format, b, a)`
 - `Processor.compressor(format, sample_rate, threshold_db, knee_width_db, ratio, expansion_ratio, expansion_threshold_db, attack_time, release_time, master_gain_db)`
 
 ```python

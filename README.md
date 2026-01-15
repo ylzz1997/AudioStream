@@ -58,6 +58,25 @@ import pyaudiostream as ast
 
 ## Python API Quick Start
 
+### Processor (PCM → PCM)
+
+Available processors: `identity`, `resample`, `gain`, `delay`, `compressor`, `fir`, `iir`.
+
+```python
+import numpy as np
+import pyaudiostream as ast
+
+fmt = ast.AudioFormat(sample_rate=48000, channels=2, sample_type="f32", planar=True)
+
+# Simple low-pass FIR example (moving average)
+taps = [1.0 / 5] * 5
+fir = ast.Processor.fir(format=fmt, taps=taps)
+
+pcm = np.random.randn(2, 480).astype(np.float32)
+fir.put_frame(pcm)
+out = fir.get_frame()
+```
+
 ### Encoder (PCM → Encoded Frame bytes)
 
 ```python
