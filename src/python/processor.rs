@@ -121,8 +121,8 @@ impl ProcessorPy {
 
     /// 创建 delay processor（在开头插入静音，单位：毫秒）。
     #[staticmethod]
-    #[pyo3(signature = (format=None, delay_ms))]
-    fn delay(format: Option<AudioFormat>, delay_ms: f64) -> PyResult<Self> {
+    #[pyo3(signature = (delay_ms, format=None))]
+    fn delay(delay_ms: f64, format: Option<AudioFormat>) -> PyResult<Self> {
         let p = if let Some(fmt) = format {
             DelayProcessor::new_with_format(fmt.to_rs()?, delay_ms).map_err(map_codec_err)?
         } else {
@@ -142,8 +142,8 @@ impl ProcessorPy {
 
     /// 创建 FIR processor（taps 为滤波器系数，h[0] 对应当前样本）。
     #[staticmethod]
-    #[pyo3(signature = (format=None, taps))]
-    fn fir(format: Option<AudioFormat>, taps: Vec<f32>) -> PyResult<Self> {
+    #[pyo3(signature = (taps, format=None))]
+    fn fir(taps: Vec<f32>, format: Option<AudioFormat>) -> PyResult<Self> {
         let p = if let Some(fmt) = format {
             FirProcessor::new_with_format(fmt.to_rs()?, taps).map_err(map_codec_err)?
         } else {
@@ -163,8 +163,8 @@ impl ProcessorPy {
 
     /// 创建 IIR processor（b 为前向系数，a 为反馈系数；a[0] 会被归一化为 1）。
     #[staticmethod]
-    #[pyo3(signature = (format=None, b, a))]
-    fn iir(format: Option<AudioFormat>, b: Vec<f32>, a: Vec<f32>) -> PyResult<Self> {
+    #[pyo3(signature = (b, a, format=None))]
+    fn iir(b: Vec<f32>, a: Vec<f32>, format: Option<AudioFormat>) -> PyResult<Self> {
         let p = if let Some(fmt) = format {
             IirProcessor::new_with_format(fmt.to_rs()?, b, a).map_err(map_codec_err)?
         } else {
@@ -473,8 +473,8 @@ pub struct DelayNodeConfigPy {
 #[pymethods]
 impl DelayNodeConfigPy {
     #[new]
-    #[pyo3(signature = (format=None, delay_ms))]
-    fn new(format: Option<AudioFormat>, delay_ms: f64) -> Self {
+    #[pyo3(signature = (delay_ms, format=None))]
+    fn new(delay_ms: f64, format: Option<AudioFormat>) -> Self {
         Self { format, delay_ms }
     }
 }
@@ -492,8 +492,8 @@ pub struct FirNodeConfigPy {
 #[pymethods]
 impl FirNodeConfigPy {
     #[new]
-    #[pyo3(signature = (format=None, taps))]
-    fn new(format: Option<AudioFormat>, taps: Vec<f32>) -> Self {
+    #[pyo3(signature = (taps, format=None))]
+    fn new(taps: Vec<f32>, format: Option<AudioFormat>) -> Self {
         Self { format, taps }
     }
 }
@@ -513,8 +513,8 @@ pub struct IirNodeConfigPy {
 #[pymethods]
 impl IirNodeConfigPy {
     #[new]
-    #[pyo3(signature = (format=None, b, a))]
-    fn new(format: Option<AudioFormat>, b: Vec<f32>, a: Vec<f32>) -> Self {
+    #[pyo3(signature = (b, a, format=None))]
+    fn new(b: Vec<f32>, a: Vec<f32>, format: Option<AudioFormat>) -> Self {
         Self { format, b, a }
     }
 }

@@ -144,21 +144,51 @@ impl DelayProcessor {
     }
 
     fn flush_remaining(&mut self) -> CodecResult<()> {
-        let Some(fifo) = self.fifo.as_mut() else {
+        if self.fifo.is_none() {
             return Ok(());
-        };
-        if !self.out_sizes.is_empty() {
-            self.try_pop_output()?;
+        }
+        loop {
+            let n = match self.out_sizes.front().copied() {
+                Some(n) => n,
+                None => break,
+            };
+            let available = self
+                .fifo
+                .as_ref()
+                .map(|fifo| fifo.available_samples())
+                .unwrap_or(0);
+            if available < n {
+                break;
+            }
+            let f = self
+                .fifo
+                .as_mut()
+                .expect("fifo should be present")
+                .pop_frame(n)
+                .map_err(|e| CodecError::Other(format!("AudioFifo pop failed: {e}")))?;
+            if let Some(frame) = f {
+                self.out_q.push_back(frame);
+                self.out_sizes.pop_front();
+            } else {
+                break;
+            }
         }
         if !self.out_sizes.is_empty() {
             // 仍有未满足的输出请求，留给后续 receive_frame 推进
             return Ok(());
         }
-        let remaining = fifo.available_samples();
+        let remaining = self
+            .fifo
+            .as_ref()
+            .map(|fifo| fifo.available_samples())
+            .unwrap_or(0);
         if remaining == 0 {
             return Ok(());
         }
-        let f = fifo
+        let f = self
+            .fifo
+            .as_mut()
+            .expect("fifo should be present")
             .pop_frame(remaining)
             .map_err(|e| CodecError::Other(format!("AudioFifo pop failed: {e}")))?;
         if let Some(frame) = f {
@@ -208,9 +238,11 @@ impl AudioProcessor for DelayProcessor {
         self.ensure_format(frame)?;
         self.insert_initial_silence(frame)?;
 
-        let fifo = self.fifo.as_mut().ok_or(CodecError::InvalidState("fifo not initialized"))?;
-        fifo.push_frame(frame)
-            .map_err(|e| CodecError::Other(format!("AudioFifo push failed: {e}")))?;
+        {
+            let fifo = self.fifo.as_mut().ok_or(CodecError::InvalidState("fifo not initialized"))?;
+            fifo.push_frame(frame)
+                .map_err(|e| CodecError::Other(format!("AudioFifo push failed: {e}")))?;
+        }
         self.out_sizes.push_back(frame.nb_samples());
 
         self.try_pop_output()?;

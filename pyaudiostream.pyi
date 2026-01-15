@@ -283,20 +283,20 @@ class DelayNodeConfig:
     format: Optional[AudioFormat]
     delay_ms: float
 
-    def __init__(self, format: Optional[AudioFormat] = None, delay_ms: float = ...) -> None: ...
+    def __init__(self, delay_ms: float, format: Optional[AudioFormat] = None) -> None: ...
 
 class FirNodeConfig:
     format: Optional[AudioFormat]
     taps: list[float]
 
-    def __init__(self, format: Optional[AudioFormat] = None, taps: list[float] = ...) -> None: ...
+    def __init__(self, taps: list[float], format: Optional[AudioFormat] = None) -> None: ...
 
 class IirNodeConfig:
     format: Optional[AudioFormat]
     b: list[float]
     a: list[float]
 
-    def __init__(self, format: Optional[AudioFormat] = None, b: list[float] = ..., a: list[float] = ...) -> None: ...
+    def __init__(self, b: list[float], a: list[float], format: Optional[AudioFormat] = None) -> None: ...
 
 class CompressorNodeConfig:
     format: Optional[AudioFormat]
@@ -573,21 +573,21 @@ class Processor:
 
     @staticmethod
     def delay(
+        delay_ms: float,
         format: Optional[AudioFormat] = None,
-        delay_ms: float = ...,
     ) -> Processor: ...
 
     @staticmethod
     def fir(
+        taps: list[float],
         format: Optional[AudioFormat] = None,
-        taps: list[float] = ...,
     ) -> Processor: ...
 
     @staticmethod
     def iir(
+        b: list[float],
+        a: list[float],
         format: Optional[AudioFormat] = None,
-        b: list[float] = ...,
-        a: list[float] = ...,
     ) -> Processor: ...
 
     @staticmethod

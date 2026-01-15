@@ -16,8 +16,8 @@ pub use crate::python::decoder::{
     make_decoder_node,
 };
 pub use crate::python::processor::{
-    CompressorNodeConfigPy, DelayNodeConfigPy, GainNodeConfigPy, IdentityNodeConfigPy, ProcessorPy, ResampleNodeConfigPy,
-    make_processor_node,
+    CompressorNodeConfigPy, DelayNodeConfigPy, FirNodeConfigPy, GainNodeConfigPy, IdentityNodeConfigPy,
+    IirNodeConfigPy, ProcessorPy, ResampleNodeConfigPy, make_processor_node,
 };
 pub use crate::python::io::{
     AsyncDynPipelinePy, AsyncDynRunnerPy, AudioFileReaderPy, AudioFileWriterPy, AudioSinkBase, AudioSourceBase,
@@ -56,6 +56,8 @@ fn pyaudiostream(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ResampleNodeConfigPy>()?;
     m.add_class::<GainNodeConfigPy>()?;
     m.add_class::<DelayNodeConfigPy>()?;
+    m.add_class::<FirNodeConfigPy>()?;
+    m.add_class::<IirNodeConfigPy>()?;
     m.add_class::<CompressorNodeConfigPy>()?;
 
     // io/pipeline

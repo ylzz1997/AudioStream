@@ -341,7 +341,7 @@ print(out.shape, out.max())
 import pyaudiostream as ast
 
 fmt = ast.AudioFormat(48000, 1, "f32", planar=True)
-p = ast.Processor.delay(fmt, delay_ms=200.0)
+p = ast.Processor.delay(200.0, format=fmt)
 p.put_frame(np.ones((1, 960), dtype=np.float32))
 p.flush()
 
@@ -361,7 +361,7 @@ import pyaudiostream as ast
 
 fmt = ast.AudioFormat(48000, 1, "f32", planar=True)
 taps = [1.0 / 5] * 5
-p = ast.Processor.fir(fmt, taps=taps)
+p = ast.Processor.fir(taps, format=fmt)
 
 p.put_frame(np.random.randn(1, 960).astype(np.float32))
 out = p.get_frame()
@@ -378,7 +378,7 @@ fmt = ast.AudioFormat(48000, 1, "f32", planar=True)
 alpha = 0.9
 b = [1.0 - alpha]
 a = [1.0, -alpha]
-p = ast.Processor.iir(fmt, b=b, a=a)
+p = ast.Processor.iir(b, a, format=fmt)
 
 p.put_frame(np.random.randn(1, 960).astype(np.float32))
 out = p.get_frame()
@@ -1108,19 +1108,19 @@ if out is not None:
                   <li><b>gain</b>：线性增益倍率。</li>
                 </ul>
                 <h3>DelayNodeConfig</h3>
-                <pre><code class="language-python">ast.DelayNodeConfig(format: Optional[AudioFormat]=None, delay_ms: float=0.0)</code></pre>
+                <pre><code class="language-python">ast.DelayNodeConfig(delay_ms: float=0.0, format: Optional[AudioFormat]=None)</code></pre>
                 <ul>
                   <li><b>format</b>：输入格式；None=首帧推断。</li>
                   <li><b>delay_ms</b>：延迟毫秒数（在开头插入静音）。</li>
                 </ul>
                 <h3>FirNodeConfig</h3>
-                <pre><code class="language-python">ast.FirNodeConfig(format: Optional[AudioFormat]=None, taps: list[float])</code></pre>
+                <pre><code class="language-python">ast.FirNodeConfig(taps: list[float], format: Optional[AudioFormat]=None)</code></pre>
                 <ul>
                   <li><b>format</b>：输入格式；None=首帧推断。</li>
                   <li><b>taps</b>：FIR 系数，h[0] 对应当前样本。</li>
                 </ul>
                 <h3>IirNodeConfig</h3>
-                <pre><code class="language-python">ast.IirNodeConfig(format: Optional[AudioFormat]=None, b: list[float], a: list[float])</code></pre>
+                <pre><code class="language-python">ast.IirNodeConfig(b: list[float], a: list[float], format: Optional[AudioFormat]=None)</code></pre>
                 <ul>
                   <li><b>format</b>：输入格式；None=首帧推断。</li>
                   <li><b>b</b>：前向系数（FIR 部分）。</li>
@@ -1199,7 +1199,7 @@ if out is not None:
 
               <section class="section">
                 <h2>构造：delay</h2>
-                <pre><code class="language-python">ast.Processor.delay(format: Optional[AudioFormat] = None, delay_ms: float = 0.0)</code></pre>
+                <pre><code class="language-python">ast.Processor.delay(delay_ms: float = 0.0, format: Optional[AudioFormat] = None)</code></pre>
                 <h3>参数</h3>
                 <ul>
                   <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
@@ -1213,7 +1213,7 @@ if out is not None:
 
               <section class="section">
                 <h2>构造：fir</h2>
-                <pre><code class="language-python">ast.Processor.fir(format: Optional[AudioFormat] = None, taps: list[float])</code></pre>
+                <pre><code class="language-python">ast.Processor.fir(taps: list[float], format: Optional[AudioFormat] = None)</code></pre>
                 <h3>参数</h3>
                 <ul>
                   <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
@@ -1228,7 +1228,7 @@ if out is not None:
 
               <section class="section">
                 <h2>构造：iir</h2>
-                <pre><code class="language-python">ast.Processor.iir(format: Optional[AudioFormat] = None, b: list[float], a: list[float])</code></pre>
+                <pre><code class="language-python">ast.Processor.iir(b: list[float], a: list[float], format: Optional[AudioFormat] = None)</code></pre>
                 <h3>参数</h3>
                 <ul>
                   <li><b>format</b>：输入格式；None 表示首帧推断并锁定。</li>
