@@ -20,11 +20,14 @@ wasm-bindgen = { version = "0.2", optional = true }
 js-sys = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 async-trait = "0.1"
+rustfft = { version = "6.4.1", optional = true }
+wide = { version = "1.1.1", optional = true }
 
 [features]
-default = ["ffmpeg"]
+default = ["ffmpeg","rustfft", "wide"]
 ffmpeg = ["dep:ffmpeg-sys-next"]
 python = ["dep:pyo3", "dep:numpy"]
 wasm = ["dep:wasm-bindgen", "dep:js-sys"]
-
+rustfft = ["dep:rustfft"]
+wide = ["dep:wide"]
 
