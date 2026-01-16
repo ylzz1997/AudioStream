@@ -507,6 +507,7 @@ fn next_pow2(mut n: usize) -> usize {
     n + 1
 }
 
+#[cfg(not(feature = "wide"))]
 #[inline]
 fn dot_ring(taps_tail: &[f64], state: &[f64], pos: usize) -> f64 {
     if state.is_empty() {
